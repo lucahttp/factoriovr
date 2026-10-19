@@ -366,6 +366,17 @@ pub unsafe extern "C" fn xfactorvr_craft_item(
 
     if let Ok(mut world) = game_bridge::get_simulation_world().write() {
         match item_id {
+            // Horno de piedra: 5 piedras
+            game_bridge::ITEM_FURNACE => {
+                let required = count * 5;
+                let stone = world.player_inventory.entry(game_bridge::ITEM_STONE).or_insert(0);
+                if *stone >= required {
+                    *stone -= required;
+                    let furnaces = world.player_inventory.entry(game_bridge::ITEM_FURNACE).or_insert(0);
+                    *furnaces += count;
+                    return true;
+                }
+            }
             // Engranaje de hierro: cuesta 2 planchas de hierro
             game_bridge::ITEM_IRON_GEAR => {
                 let required = count * 2;
@@ -374,6 +385,20 @@ pub unsafe extern "C" fn xfactorvr_craft_item(
                     *plates -= required;
                     let gears = world.player_inventory.entry(game_bridge::ITEM_IRON_GEAR).or_insert(0);
                     *gears += count;
+                    return true;
+                }
+            }
+            // Circuito electrónico: 1 plancha de hierro + 3 planchas de cobre
+            game_bridge::ITEM_ELECTRONIC_CIRCUIT => {
+                let required_iron = count;
+                let required_copper = count * 3;
+                let iron = *world.player_inventory.get(&game_bridge::ITEM_IRON_PLATE).unwrap_or(&0);
+                let copper = *world.player_inventory.get(&game_bridge::ITEM_COPPER_PLATE).unwrap_or(&0);
+                if iron >= required_iron && copper >= required_copper {
+                    *world.player_inventory.get_mut(&game_bridge::ITEM_IRON_PLATE).unwrap() -= required_iron;
+                    *world.player_inventory.get_mut(&game_bridge::ITEM_COPPER_PLATE).unwrap() -= required_copper;
+                    let circuits = world.player_inventory.entry(game_bridge::ITEM_ELECTRONIC_CIRCUIT).or_insert(0);
+                    *circuits += count;
                     return true;
                 }
             }
@@ -391,21 +416,86 @@ pub unsafe extern "C" fn xfactorvr_craft_item(
                     return true;
                 }
             }
-            // Minera eléctrica: 10 planchas + 5 engranajes + 3 circuitos
+            // Minera eléctrica / quemador: 9 planchas + 5 engranajes + 5 piedra
             game_bridge::ITEM_MINING_DRILL => {
-                let required_plates = count * 10;
+                let required_plates = count * 9;
                 let required_gears = count * 5;
+                let required_stone = count * 5;
                 let plates = *world.player_inventory.get(&game_bridge::ITEM_IRON_PLATE).unwrap_or(&0);
                 let gears = *world.player_inventory.get(&game_bridge::ITEM_IRON_GEAR).unwrap_or(&0);
-                if plates >= required_plates && gears >= required_gears {
+                let stone = *world.player_inventory.get(&game_bridge::ITEM_STONE).unwrap_or(&0);
+                if plates >= required_plates && gears >= required_gears && stone >= required_stone {
                     *world.player_inventory.get_mut(&game_bridge::ITEM_IRON_PLATE).unwrap() -= required_plates;
                     *world.player_inventory.get_mut(&game_bridge::ITEM_IRON_GEAR).unwrap() -= required_gears;
+                    *world.player_inventory.get_mut(&game_bridge::ITEM_STONE).unwrap() -= required_stone;
                     let drills = world.player_inventory.entry(game_bridge::ITEM_MINING_DRILL).or_insert(0);
                     *drills += count;
                     return true;
                 }
             }
             _ => {}
+        }
+    }
+    false
+}
+
+/// Minado manual con pico sobre yacimientos de mineral o rocas
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn xfactorvr_manual_mine(tile_x: f32, tile_y: f32) -> u32 {
+    if let Ok(mut world) = game_bridge::get_simulation_world().write() {
+        world.manual_mine(tile_x, tile_y)
+    } else {
+        0
+    }
+}
+
+/// Interactúa con una máquina (recoge planchas/mineral y suministra combustible/mineral)
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn xfactorvr_interact_machine(tile_x: f32, tile_y: f32) -> u32 {
+    if let Ok(mut world) = game_bridge::get_simulation_world().write() {
+        world.interact_machine(tile_x, tile_y)
+    } else {
+        0
+    }
+}
+
+/// Reinicia el mundo de simulación al estado inicial auténtico
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn xfactorvr_reset_world(fresh_start: bool) -> bool {
+    let lock = get_live_entities_lock();
+    if let Ok(mut entities) = lock.write() {
+        if fresh_start {
+            entities.clear();
+        }
+    }
+    if let Ok(mut world) = game_bridge::get_simulation_world().write() {
+        world.reset_world();
+        true
+    } else {
+        false
+    }
+}
+
+/// Obtiene información de estado de una máquina para el HUD / GUI
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn xfactorvr_get_machine_info(
+    tile_x: f32,
+    tile_y: f32,
+    out_fuel: *mut f32,
+    out_progress: *mut f32,
+    out_input_ore: *mut u32,
+    out_output_plates: *mut u32,
+) -> bool {
+    if out_fuel.is_null() || out_progress.is_null() || out_input_ore.is_null() || out_output_plates.is_null() {
+        return false;
+    }
+    if let Ok(world) = game_bridge::get_simulation_world().read() {
+        if let Some((fuel, prog, in_ore, out_plates)) = world.get_machine_info(tile_x, tile_y) {
+            *out_fuel = fuel;
+            *out_progress = prog;
+            *out_input_ore = in_ore;
+            *out_output_plates = out_plates;
+            return true;
         }
     }
     false
@@ -607,6 +697,53 @@ mod tests {
         // Limpiar
         unsafe {
             xfactorvr_mine_entity(5.0, 5.0);
+        }
+    }
+
+    #[test]
+    fn test_early_game_progression_ffi() {
+        unsafe {
+            // 1. Resetear mundo
+            assert!(xfactorvr_reset_world(true));
+
+            let mut inv_buf = [PlayerItemFfi { item_id: 0, count: 0 }; 16];
+            let mut inv_count = 0;
+            assert!(xfactorvr_get_player_inventory(inv_buf.as_mut_ptr(), 16, &mut inv_count));
+            assert!(inv_count >= 4);
+
+            // 2. Minar manualmente 5 piedras
+            for _ in 0..5 {
+                let mined = xfactorvr_manual_mine(-6.0, -4.0);
+                assert_eq!(mined, game_bridge::ITEM_STONE);
+            }
+
+            // 3. Fabricar el primer Horno de Piedra
+            let crafted = xfactorvr_craft_item(game_bridge::ITEM_FURNACE, 1);
+            assert!(crafted, "Debe poder fabricar el horno con las 5 piedras minadas");
+
+            // 4. Colocar la perforadora sobre la veta de hierro y el horno justo enfrente
+            assert!(xfactorvr_place_or_update_entity(tabletop::ENTITY_MINING_DRILL, -6.0, 4.0, 0.0));
+            assert!(xfactorvr_place_or_update_entity(tabletop::ENTITY_FURNACE, -6.0, 3.0, 0.0));
+
+            // Suministrar carbón inicial interactuando con el horno
+            xfactorvr_interact_machine(-6.0, 3.0);
+
+            // 5. Avanzar la simulación durante 8 segundos
+            for _ in 0..16 {
+                xfactorvr_update_simulation(0.5);
+            }
+
+            // 6. Consultar estado del horno y recoger las planchas de hierro fundidas
+            let mut fuel = 0.0f32;
+            let mut progress = 0.0f32;
+            let mut in_ore = 0u32;
+            let mut out_plates = 0u32;
+            let has_info = xfactorvr_get_machine_info(-6.0, 3.0, &mut fuel, &mut progress, &mut in_ore, &mut out_plates);
+            assert!(has_info);
+            assert!(out_plates >= 1, "El horno debe haber producido al menos 1 plancha de hierro");
+
+            let looted = xfactorvr_interact_machine(-6.0, 3.0);
+            assert!(looted >= 1, "Debe recoger las planchas fundidas del horno");
         }
     }
 }

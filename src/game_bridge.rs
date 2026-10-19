@@ -77,20 +77,11 @@ pub struct SimulationWorld {
 impl SimulationWorld {
     pub fn new() -> Self {
         let mut inv = HashMap::new();
-        // Pack inicial estándar de Factorio
-        inv.insert(ITEM_IRON_PLATE, 40);
-        inv.insert(ITEM_COPPER_PLATE, 20);
-        inv.insert(ITEM_COAL, 30);
-        inv.insert(ITEM_MINING_DRILL, 2);
-        inv.insert(ITEM_FURNACE, 2);
-        inv.insert(ITEM_TRANSPORT_BELT, 30);
-        inv.insert(ITEM_INSERTER, 6);
-        inv.insert(ITEM_ASSEMBLING_MACHINE, 2);
-        inv.insert(ITEM_POWER_POLE, 10);
-        inv.insert(ITEM_TURRET, 1);
-        inv.insert(ITEM_RADAR, 1);
-        inv.insert(ITEM_ROBOPORT, 1);
-        inv.insert(ITEM_CHEST, 4);
+        // Pack inicial auténtico de Factorio (Crash Site / Level 1 start)
+        inv.insert(ITEM_IRON_PLATE, 8);
+        inv.insert(ITEM_MINING_DRILL, 1);
+        inv.insert(ITEM_FURNACE, 1);
+        inv.insert(ITEM_COAL, 1);
 
         let patches = vec![
             ResourcePatch {
@@ -131,6 +122,86 @@ impl SimulationWorld {
         }
     }
 
+    /// Reinicia el mundo de simulación al estado inicial de nivel
+    pub fn reset_world(&mut self) {
+        let mut inv = HashMap::new();
+        inv.insert(ITEM_IRON_PLATE, 8);
+        inv.insert(ITEM_MINING_DRILL, 1);
+        inv.insert(ITEM_FURNACE, 1);
+        inv.insert(ITEM_COAL, 1);
+
+        self.player_inventory = inv;
+        self.machine_states.clear();
+    }
+
+    /// Minado manual con pico sobre yacimientos de mineral o rocas
+    pub fn manual_mine(&mut self, tile_x: f32, tile_y: f32) -> u32 {
+        if let Some(ore_type) = Self::get_resource_in_patches(&self.patches, tile_x, tile_y) {
+            for patch in self.patches.iter_mut() {
+                let dx = tile_x - patch.tile_x;
+                let dy = tile_y - patch.tile_y;
+                if dx * dx + dy * dy <= patch.radius * patch.radius && patch.remaining > 0 {
+                    patch.remaining = patch.remaining.saturating_sub(1);
+                    break;
+                }
+            }
+            let cnt = self.player_inventory.entry(ore_type).or_insert(0);
+            *cnt += 1;
+            ore_type
+        } else {
+            0
+        }
+    }
+
+    /// Interactúa con una máquina (recoge planchas/mineral y suministra combustible/mineral)
+    pub fn interact_machine(&mut self, tile_x: f32, tile_y: f32) -> u32 {
+        let key = (tile_x.round() as i32, tile_y.round() as i32);
+        let mut total_looted = 0;
+        if let Some(state) = self.machine_states.get_mut(&key) {
+            // 1. Recoger productos terminados de output_buffer
+            for (&item_id, &qty) in &state.output_buffer {
+                if qty > 0 {
+                    *self.player_inventory.entry(item_id).or_insert(0) += qty;
+                    total_looted += qty;
+                }
+            }
+            state.output_buffer.clear();
+
+            // 2. Abastecer de carbón si está bajo de combustible
+            if state.fuel_remaining < 50.0 {
+                if let Some(coal_cnt) = self.player_inventory.get_mut(&ITEM_COAL) {
+                    if *coal_cnt > 0 {
+                        let transfer = (*coal_cnt).min(5);
+                        *coal_cnt -= transfer;
+                        state.fuel_remaining += transfer as f32 * 100.0;
+                    }
+                }
+            }
+
+            // 3. Si es un horno y el jugador tiene mineral en inventario, cargar hasta 5 unidades
+            if let Some(iron_cnt) = self.player_inventory.get_mut(&ITEM_IRON_ORE) {
+                if *iron_cnt > 0 {
+                    let transfer = (*iron_cnt).min(5);
+                    *iron_cnt -= transfer;
+                    *state.input_buffer.entry(ITEM_IRON_ORE).or_insert(0) += transfer;
+                }
+            }
+        }
+        total_looted
+    }
+
+    /// Obtiene información de estado de una máquina para el HUD / GUI
+    pub fn get_machine_info(&self, tile_x: f32, tile_y: f32) -> Option<(f32, f32, u32, u32)> {
+        let key = (tile_x.round() as i32, tile_y.round() as i32);
+        self.machine_states.get(&key).map(|s| {
+            let input_ore = *s.input_buffer.get(&ITEM_IRON_ORE).unwrap_or(&0) +
+                            *s.input_buffer.get(&ITEM_COPPER_ORE).unwrap_or(&0);
+            let output_plates = *s.output_buffer.get(&ITEM_IRON_PLATE).unwrap_or(&0) +
+                                *s.output_buffer.get(&ITEM_COPPER_PLATE).unwrap_or(&0);
+            (s.fuel_remaining, s.work_progress, input_ore, output_plates)
+        })
+    }
+
     /// Comprueba si una posición está sobre un yacimiento de mineral
     pub fn get_resource_in_patches(patches: &[ResourcePatch], x: f32, y: f32) -> Option<u32> {
         for patch in patches {
@@ -147,23 +218,39 @@ impl SimulationWorld {
         Self::get_resource_in_patches(&self.patches, x, y)
     }
 
-    /// Avanza un tick de la simulación de todas las máquinas en el mundo
+    /// Avanza la simulación por pasos discretos estables
     pub fn tick(&mut self, entities: &mut [LiveEntity], dt: f32) {
+        let mut rem = dt;
+        while rem > 0.0001 {
+            let step = rem.min(0.2);
+            self.tick_step(entities, step);
+            rem -= step;
+        }
+    }
+
+    fn tick_step(&mut self, entities: &mut [LiveEntity], dt: f32) {
+        // Encontrar máquinas adyacentes a las perforadoras para transferencia directa
+        let mut pending_transfers: Vec<((i32, i32), u32)> = Vec::new();
+
         for entity in entities.iter_mut() {
             let key = (entity.tile_x.round() as i32, entity.tile_y.round() as i32);
             let ore_at_loc = Self::get_resource_in_patches(&self.patches, entity.tile_x, entity.tile_y);
             let state = self.machine_states.entry(key).or_default();
 
             match entity.entity_type {
-                // Minera Eléctrica: Extrae mineral si está sobre un yacimiento
+                // Minera Eléctrica / a vapor: Extrae mineral si está sobre un yacimiento
                 2 => {
                     if let Some(ore_type) = ore_at_loc {
                         entity.status = 1; // Trabajando
                         state.work_progress += dt * 0.5; // 1 ciclo cada 2s
                         if state.work_progress >= 1.0 {
                             state.work_progress = 0.0;
-                            let out_count = state.output_buffer.entry(ore_type).or_insert(0);
-                            *out_count += 1;
+
+                            // Calcular casilla frontal de caída (drop target) según orientación
+                            let f_dx = (entity.orientation.sin()).round() as i32;
+                            let f_dy = (-entity.orientation.cos()).round() as i32;
+                            let target_tile = (key.0 + f_dx, key.1 + f_dy);
+                            pending_transfers.push((target_tile, ore_type));
                         }
                         entity.animation_progress = state.work_progress;
                     } else {
@@ -171,23 +258,48 @@ impl SimulationWorld {
                         entity.animation_progress = 0.0;
                     }
                 }
-                // Horno: Funde mineral con carbón
+                // Horno de piedra: Funde mineral con carbón
                 3 => {
-                    // Si el horno tiene mineral de hierro, funde en planchas
-                    let iron_ore_count = state.input_buffer.entry(ITEM_IRON_ORE).or_insert(5); // buffer inicial
-                    if *iron_ore_count > 0 && state.fuel_remaining > 0.0 {
-                        entity.status = 1;
-                        state.fuel_remaining -= dt * 0.5;
+                    let iron_ore_count = *state.input_buffer.get(&ITEM_IRON_ORE).unwrap_or(&0);
+                    let copper_ore_count = *state.input_buffer.get(&ITEM_COPPER_ORE).unwrap_or(&0);
+                    let has_ore = iron_ore_count > 0 || copper_ore_count > 0;
+
+                    // Si necesita combustible, intenta consumir carbón del input_buffer
+                    if state.fuel_remaining <= 0.0 {
+                        if let Some(coal_cnt) = state.input_buffer.get_mut(&ITEM_COAL) {
+                            if *coal_cnt > 0 {
+                                *coal_cnt -= 1;
+                                state.fuel_remaining += 100.0;
+                            }
+                        }
+                    }
+
+                    if has_ore && state.fuel_remaining > 0.0 {
+                        entity.status = 1; // ARDIENDO / FUNDIENDO (Fire & Smoke)
+                        state.fuel_remaining = (state.fuel_remaining - dt * 1.5).max(0.0);
                         state.work_progress += dt * 0.3125; // 3.2 segundos por plancha
+
                         if state.work_progress >= 1.0 {
                             state.work_progress = 0.0;
-                            *iron_ore_count -= 1;
-                            let plates = state.output_buffer.entry(ITEM_IRON_PLATE).or_insert(0);
-                            *plates += 1;
+                            if iron_ore_count > 0 {
+                                if let Some(cnt) = state.input_buffer.get_mut(&ITEM_IRON_ORE) {
+                                    *cnt -= 1;
+                                }
+                                *state.output_buffer.entry(ITEM_IRON_PLATE).or_insert(0) += 1;
+                            } else if copper_ore_count > 0 {
+                                if let Some(cnt) = state.input_buffer.get_mut(&ITEM_COPPER_ORE) {
+                                    *cnt -= 1;
+                                }
+                                *state.output_buffer.entry(ITEM_COPPER_PLATE).or_insert(0) += 1;
+                            }
                         }
                         entity.animation_progress = state.work_progress;
+                    } else if has_ore && state.fuel_remaining <= 0.0 {
+                        entity.status = 3; // Sin combustible
+                        entity.animation_progress = 0.0;
                     } else {
-                        entity.status = 3; // Sin combustible / sin mineral
+                        entity.status = 0; // Inactivo / esperando mineral
+                        entity.animation_progress = 0.0;
                     }
                 }
                 // Ensambladora: Fabrica recetas
@@ -214,6 +326,26 @@ impl SimulationWorld {
                 _ => {
                     entity.status = 1;
                     entity.animation_progress = (entity.animation_progress + dt * 0.2).rem_euclid(1.0);
+                }
+            }
+        }
+
+        // Aplicar transferencias de mineral desde perforadoras a máquinas receptoras
+        for (target_coord, ore_type) in pending_transfers {
+            // Verificar si hay una entidad en target_coord o adyacente
+            let target_exists = entities.iter().any(|e| {
+                (e.tile_x.round() as i32 - target_coord.0).abs() <= 1 &&
+                (e.tile_y.round() as i32 - target_coord.1).abs() <= 1 &&
+                (e.entity_type == 3 || e.entity_type == 7 || e.entity_type == 9) // Horno, Cofre o Cinta
+            });
+
+            if target_exists {
+                let target_state = self.machine_states.entry(target_coord).or_default();
+                *target_state.input_buffer.entry(ore_type).or_insert(0) += 1;
+            } else {
+                // Si no hay máquina receptora, acumular en la perforadora
+                if let Some(drill_state) = self.machine_states.values_mut().next() {
+                    *drill_state.output_buffer.entry(ore_type).or_insert(0) += 1;
                 }
             }
         }
@@ -327,27 +459,60 @@ mod tests {
     #[test]
     fn test_simulation_world_mechanics() {
         let mut world = SimulationWorld::new();
-        // Verificar inventario inicial
-        assert!(*world.player_inventory.get(&ITEM_IRON_PLATE).unwrap() >= 20);
+        // Verificar inventario inicial auténtico
+        assert_eq!(*world.player_inventory.get(&ITEM_IRON_PLATE).unwrap(), 8);
+        assert_eq!(*world.player_inventory.get(&ITEM_MINING_DRILL).unwrap(), 1);
+        assert_eq!(*world.player_inventory.get(&ITEM_FURNACE).unwrap(), 1);
 
-        // Probar minera colocada sobre yacimiento de hierro en (-6.0, 4.0)
-        let mut entities = vec![LiveEntity {
-            entity_type: 2, // Mining drill
-            tile_x: -6.0,
-            tile_y: 4.0,
-            orientation: 0.0,
-            status: 0,
-            animation_progress: 0.0,
-            health_ratio: 1.0,
-        }];
+        // 1. Probar minado manual con pico en yacimiento de piedra (-6.0, -4.0)
+        let mined_stone = world.manual_mine(-6.0, -4.0);
+        assert_eq!(mined_stone, ITEM_STONE, "Debe haber extraído piedra");
+        assert_eq!(*world.player_inventory.get(&ITEM_STONE).unwrap(), 1);
 
-        // Simular 3 segundos
-        world.tick(&mut entities, 3.0);
+        // Minar 4 piedras más para alcanzar 5 de piedra
+        for _ in 0..4 {
+            world.manual_mine(-6.0, -4.0);
+        }
+        assert_eq!(*world.player_inventory.get(&ITEM_STONE).unwrap(), 5);
+
+        // 2. Probar minera colocada sobre yacimiento de hierro en (-6.0, 4.0)
+        // y horno de piedra colocado justo al lado para recibir el mineral
+        let mut entities = vec![
+            LiveEntity {
+                entity_type: 2, // Mining drill
+                tile_x: -6.0,
+                tile_y: 4.0,
+                orientation: 0.0,
+                status: 0,
+                animation_progress: 0.0,
+                health_ratio: 1.0,
+            },
+            LiveEntity {
+                entity_type: 3, // Stone furnace
+                tile_x: -6.0,
+                tile_y: 3.0,
+                orientation: 0.0,
+                status: 0,
+                animation_progress: 0.0,
+                health_ratio: 1.0,
+            }
+        ];
+
+        // Suministrar carbón inicial al horno
+        world.machine_states.entry((-6, 3)).or_default().fuel_remaining = 100.0;
+
+        // Simular 4 segundos
+        world.tick(&mut entities, 4.0);
 
         assert_eq!(entities[0].status, 1, "La minera debe estar trabajando");
-        let key = (-6, 4);
-        let machine = world.machine_states.get(&key).unwrap();
-        let mined = *machine.output_buffer.get(&ITEM_IRON_ORE).unwrap_or(&0);
-        assert!(mined >= 1, "La minera debe haber extraído al menos 1 mineral de hierro");
+        assert_eq!(entities[1].status, 1, "El horno debe estar ardiendo y fundiendo mineral");
+
+        // Simular 4 segundos adicionales para completar la fundición de planchas
+        world.tick(&mut entities, 4.0);
+
+        // 3. Probar looting del horno
+        let looted = world.interact_machine(-6.0, 3.0);
+        assert!(looted >= 1, "Debe haber recogido al menos 1 plancha de hierro fundida");
+        assert!(*world.player_inventory.get(&ITEM_IRON_PLATE).unwrap() > 8);
     }
 }

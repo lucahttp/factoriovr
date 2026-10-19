@@ -533,6 +533,10 @@ typedef bool (*pfn_xfactorvr_craft_item)(uint32_t item_id, uint32_t count);
 typedef bool (*pfn_xfactorvr_get_resource_patches)(ResourcePatchFfi* out_patches, uint32_t max_patches, uint32_t* out_count);
 typedef bool (*pfn_xfactorvr_connect_rcon)(const char* host, uint16_t port, const char* pwd);
 typedef bool (*pfn_xfactorvr_is_rcon_connected)();
+typedef uint32_t (*pfn_xfactorvr_manual_mine)(float tile_x, float tile_y);
+typedef uint32_t (*pfn_xfactorvr_interact_machine)(float tile_x, float tile_y);
+typedef bool (*pfn_xfactorvr_reset_world)(bool fresh_start);
+typedef bool (*pfn_xfactorvr_get_machine_info)(float tile_x, float tile_y, float* out_fuel, float* out_progress, uint32_t* out_input_ore, uint32_t* out_output_plates);
 
 static pfn_xfactorvr_load_glb s_load_glb = nullptr;
 static pfn_xfactorvr_free_glb s_free_glb = nullptr;
@@ -545,6 +549,16 @@ static pfn_xfactorvr_craft_item s_craft_item = nullptr;
 static pfn_xfactorvr_get_resource_patches s_get_resource_patches = nullptr;
 static pfn_xfactorvr_connect_rcon s_connect_rcon = nullptr;
 static pfn_xfactorvr_is_rcon_connected s_is_rcon_connected = nullptr;
+static pfn_xfactorvr_manual_mine s_manual_mine = nullptr;
+static pfn_xfactorvr_interact_machine s_interact_machine = nullptr;
+static pfn_xfactorvr_reset_world s_reset_world = nullptr;
+static pfn_xfactorvr_get_machine_info s_get_machine_info = nullptr;
+
+// Estado de Minado Manual con Pico (mantener Trigger en vetas de mineral)
+static float s_manual_mining_timer = 0.0f;
+static float s_manual_mining_tile_x = 999.0f;
+static float s_manual_mining_tile_y = 999.0f;
+static float s_last_mining_strike = 0.0f;
 
 // ============================================================================
 // PERSISTENCIA DE MESA (LAYOUT.JSON) — GENERALS ZERO HOUR XR PATTERN
@@ -939,6 +953,10 @@ static void init_glb_loader() {
     s_get_resource_patches = (pfn_xfactorvr_get_resource_patches)dlsym(handle, "xfactorvr_get_resource_patches");
     s_connect_rcon = (pfn_xfactorvr_connect_rcon)dlsym(handle, "xfactorvr_connect_rcon");
     s_is_rcon_connected = (pfn_xfactorvr_is_rcon_connected)dlsym(handle, "xfactorvr_is_rcon_connected");
+    s_manual_mine = (pfn_xfactorvr_manual_mine)dlsym(handle, "xfactorvr_manual_mine");
+    s_interact_machine = (pfn_xfactorvr_interact_machine)dlsym(handle, "xfactorvr_interact_machine");
+    s_reset_world = (pfn_xfactorvr_reset_world)dlsym(handle, "xfactorvr_reset_world");
+    s_get_machine_info = (pfn_xfactorvr_get_machine_info)dlsym(handle, "xfactorvr_get_machine_info");
 
     if (!s_load_glb || !s_get_live_entities) {
         void* mod_handle = dlopen("libxfactorvr.so", RTLD_NOW | RTLD_GLOBAL);
@@ -954,10 +972,14 @@ static void init_glb_loader() {
             s_get_resource_patches = (pfn_xfactorvr_get_resource_patches)dlsym(mod_handle, "xfactorvr_get_resource_patches");
             s_connect_rcon = (pfn_xfactorvr_connect_rcon)dlsym(mod_handle, "xfactorvr_connect_rcon");
             s_is_rcon_connected = (pfn_xfactorvr_is_rcon_connected)dlsym(mod_handle, "xfactorvr_is_rcon_connected");
+            s_manual_mine = (pfn_xfactorvr_manual_mine)dlsym(mod_handle, "xfactorvr_manual_mine");
+            s_interact_machine = (pfn_xfactorvr_interact_machine)dlsym(mod_handle, "xfactorvr_interact_machine");
+            s_reset_world = (pfn_xfactorvr_reset_world)dlsym(mod_handle, "xfactorvr_reset_world");
+            s_get_machine_info = (pfn_xfactorvr_get_machine_info)dlsym(mod_handle, "xfactorvr_get_machine_info");
         }
     }
-    LOGI("openxr_engine: Cargador GLB y FFI Factorio enlazados (load=%p, get=%p, inv=%p, patches=%p)",
-         s_load_glb, s_get_live_entities, s_get_player_inventory, s_get_resource_patches);
+    LOGI("openxr_engine: Cargador GLB y FFI Factorio enlazados (load=%p, get=%p, inv=%p, patches=%p, mine=%p, interact=%p)",
+         s_load_glb, s_get_live_entities, s_get_player_inventory, s_get_resource_patches, s_manual_mine, s_interact_machine);
 
     // Restaurar layout persistente si existe
     load_tabletop_layout();
@@ -1216,6 +1238,7 @@ static void draw_tabletop_scene(const float* vp_mat,
                                 const XrPosef& right_aim_pose,
                                 bool right_aim_valid,
                                 bool trigger_clicked,
+                                bool trigger_held,
                                 bool grip_clicked,
                                 bool is_primary_eye,
                                 XrSession session = XR_NULL_HANDLE,
@@ -1350,14 +1373,28 @@ static void draw_tabletop_scene(const float* vp_mat,
                 spawn_particle(mx - 0.045f, 0.16f, mz - 0.045f,
                                ((rand() % 100) - 50) * 0.0002f, 0.035f, ((rand() % 100) - 50) * 0.0002f,
                                0.85f, 0.88f, 0.92f, 0.50f, 0.016f, 1.2f);
-            } else if (ent.entity_type == ENTITY_FURNACE && (rand() % 8 == 0)) {
-                spawn_particle(mx, 0.14f, mz,
-                               ((rand() % 100) - 50) * 0.0002f, 0.030f, ((rand() % 100) - 50) * 0.0002f,
-                               0.95f, 0.60f, 0.25f, 0.65f, 0.012f, 0.9f);
-            } else if (ent.entity_type == ENTITY_MINING_DRILL && (rand() % 6 == 0)) {
-                spawn_particle(mx, 0.02f, mz,
-                               ((rand() % 100) - 50) * 0.0004f, 0.012f, ((rand() % 100) - 50) * 0.0004f,
-                               0.55f, 0.45f, 0.35f, 0.55f, 0.010f, 0.6f);
+            } else if (ent.entity_type == ENTITY_FURNACE && ent.status == 1) {
+                if (rand() % 4 == 0) {
+                    spawn_particle(mx, 0.14f, mz,
+                                   ((rand() % 100) - 50) * 0.0003f, 0.040f, ((rand() % 100) - 50) * 0.0003f,
+                                   0.35f, 0.35f, 0.35f, 0.75f, 0.016f, 1.2f);
+                }
+                if (rand() % 5 == 0) {
+                    spawn_particle(mx, 0.035f, mz + 0.038f,
+                                   ((rand() % 100) - 50) * 0.0004f, 0.020f, ((rand() % 100) - 50) * 0.0004f,
+                                   1.0f, 0.85f, 0.10f, 0.95f, 0.006f, 0.5f);
+                }
+            } else if (ent.entity_type == ENTITY_MINING_DRILL && ent.status == 1) {
+                if (rand() % 4 == 0) {
+                    spawn_particle(mx, 0.13f, mz - 0.025f,
+                                   0.0f, 0.028f, 0.0f,
+                                   0.45f, 0.45f, 0.45f, 0.60f, 0.014f, 0.9f);
+                }
+                if (rand() % 3 == 0) {
+                    spawn_particle(mx, 0.015f, mz,
+                                   ((rand() % 100) - 50) * 0.0005f, 0.015f, ((rand() % 100) - 50) * 0.0005f,
+                                   0.75f, 0.65f, 0.35f, 0.80f, 0.008f, 0.4f);
+                }
             }
         }
     }
@@ -1460,6 +1497,20 @@ static void draw_tabletop_scene(const float* vp_mat,
             // Vástago y broca reciprocante giratoria
             float drill_y = 0.045f + sinf(anim_time * 8.0f) * 0.012f;
             add_cylinder_textured(dyn_verts, mx, drill_y, mz, 0.024f, 0.07f, 0.55f, 0.60f, 0.65f, 1.0f, 8);
+        } else if (ent.entity_type == ENTITY_FURNACE) {
+            // Fuego del hogar incandescente cuando está fundiendo (status == 1)
+            if (ent.status == 1) {
+                float flicker = 0.85f + 0.15f * sinf(anim_time * 25.0f + (float)i * 3.1f);
+                add_box_textured(dyn_verts, mx, 0.032f, mz + 0.038f, 0.040f * flicker, 0.028f * flicker, 0.015f, 1.0f, 1.0f, 1.0f, 0.55f * flicker, 0.05f, 1.0f);
+            }
+            // Indicador holográfico de planchas fundidas listas para recoger
+            float m_fuel = 0.0f, m_prog = 0.0f;
+            uint32_t m_in = 0, m_out = 0;
+            if (s_get_machine_info && s_get_machine_info(ent.tile_x, ent.tile_y, &m_fuel, &m_prog, &m_in, &m_out) && m_out > 0) {
+                float bob = sinf(anim_time * 4.5f + (float)i) * 0.006f;
+                add_box_textured(dyn_verts, mx, 0.14f + bob, mz, 0.028f, 0.005f, 0.028f, 1.0f, 1.0f, 1.0f, 0.88f, 0.20f, 0.95f);
+                add_box_textured(dyn_verts, mx, 0.14f + bob, mz, 0.034f, 0.002f, 0.034f, 1.0f, 1.0f, 1.0f, 1.0f, 0.40f, 0.60f);
+            }
         } else if (ent.entity_type == ENTITY_ASSEMBLING_MACHINE) {
             // Baliza titilante en chimenea
             float beacon_g = 0.58f + sinf(anim_time * 5.0f) * 0.38f;
@@ -1565,18 +1616,19 @@ static void draw_tabletop_scene(const float* vp_mat,
                 }
             }
         } else if (s_active_ui_tab == 2) {
-            // Pestaña 2: Fabricación / Crafteo de recetas
-            float recipe_w = 0.120f, recipe_h = 0.046f;
-            for (int r = 0; r < 4; ++r) {
-                float rx_btn = (float)(r - 1.5f) * (recipe_w + 0.014f);
+            // Pestaña 2: Fabricación / Crafteo de recetas (5 recetas auténticas)
+            float recipe_w = 0.100f, recipe_h = 0.046f;
+            for (int r = 0; r < 5; ++r) {
+                float rx_btn = (float)(r - 2) * (recipe_w + 0.012f);
                 float ry_btn = ui_y - 0.055f;
 
                 float rr = 0.2f, rg = 0.5f, rb = 0.7f;
                 switch (r) {
-                    case 0: rr = 0.95f; rg = 0.78f; rb = 0.20f; break; // Engranaje (Hierro)
-                    case 1: rr = 0.20f; rg = 0.88f; rb = 0.35f; break; // Circuito Verde
-                    case 2: rr = 0.92f; rg = 0.82f; rb = 0.15f; break; // Cinta Transportadora
-                    case 3: rr = 0.18f; rg = 0.62f; rb = 0.58f; break; // Minera Eléctrica
+                    case 0: rr = 0.65f; rg = 0.55f; rb = 0.50f; break; // Horno de Piedra (5 Piedra)
+                    case 1: rr = 0.95f; rg = 0.78f; rb = 0.20f; break; // Engranaje (2 Planchas Hierro)
+                    case 2: rr = 0.20f; rg = 0.88f; rb = 0.35f; break; // Circuito Verde (1 Hierro + 3 Cobre)
+                    case 3: rr = 0.92f; rg = 0.82f; rb = 0.15f; break; // Cinta Transportadora (1 Hierro + 1 Engranaje)
+                    case 4: rr = 0.18f; rg = 0.62f; rb = 0.58f; break; // Minera Eléctrica/Vapor (9 Hierro + 5 Engr + 5 Piedra)
                 }
                 add_box_textured(dyn_verts, rx_btn, ry_btn, ui_z + 0.005f, recipe_w, recipe_h, 0.002f, 1.0f, 1.0f, rr * 0.85f, rg * 0.85f, rb * 0.85f, 0.95f);
                 if (s_hovered_recipe == r) {
@@ -1675,11 +1727,11 @@ static void draw_tabletop_scene(const float* vp_mat,
                 // Ranuras de Quickbar o Recetas de Crafteo (rel_y <= 0.0)
                 else if (rel_y <= 0.0f && rel_y >= -0.10f) {
                     if (s_active_ui_tab == 2) {
-                        // Modo Crafteo: 4 botones de recetas
-                        float recipe_w = 0.120f;
+                        // Modo Crafteo: 5 botones de recetas
+                        float recipe_w = 0.100f;
                         s_hovered_recipe = -1;
-                        for (int r = 0; r < 4; ++r) {
-                            float rx_btn = (float)(r - 1.5f) * (recipe_w + 0.014f);
+                        for (int r = 0; r < 5; ++r) {
+                            float rx_btn = (float)(r - 2) * (recipe_w + 0.012f);
                             if (fabsf(rel_x - rx_btn) < recipe_w * 0.5f && fabsf(rel_y - (-0.055f)) < 0.025f) {
                                 s_hovered_recipe = r;
                                 break;
@@ -1687,7 +1739,7 @@ static void draw_tabletop_scene(const float* vp_mat,
                         }
 
                         if (is_primary_eye && trigger_clicked && s_hovered_recipe >= 0) {
-                            const uint32_t recipe_item_ids[4] = { 7, 8, 12, 10 }; // Engranaje, Circuito, Cinta, Minera
+                            const uint32_t recipe_item_ids[5] = { 11, 7, 8, 12, 10 }; // Horno (11), Engranaje (7), Circuito (8), Cinta (12), Minera (10)
                             if (s_craft_item) {
                                 bool crafted = s_craft_item(recipe_item_ids[s_hovered_recipe], 1);
                                 if (crafted) {
@@ -1753,18 +1805,103 @@ static void draw_tabletop_scene(const float* vp_mat,
                 }
             }
 
+            // Comprobar si la casilla está sobre una veta de recurso
+            int hovered_patch_type = 0;
+            for (uint32_t p = 0; p < patch_count; ++p) {
+                float pdx = hover_tile_x - resource_patches[p].tile_x;
+                float pdy = hover_tile_y - resource_patches[p].tile_y;
+                if (pdx * pdx + pdy * pdy <= resource_patches[p].radius * resource_patches[p].radius && resource_patches[p].remaining > 0) {
+                    hovered_patch_type = resource_patches[p].item_type;
+                    break;
+                }
+            }
+
             // Cuadrado de la celda de rejilla magnética 4cm x 4cm
             float snap_mx = hover_tile_x * 0.04f;
             float snap_mz = hover_tile_y * 0.04f;
-            float g_r = is_occupied ? 0.95f : 0.20f;
-            float g_g = is_occupied ? 0.25f : 0.95f;
-            float g_b = is_occupied ? 0.20f : 0.35f;
+            float g_r = 0.20f, g_g = 0.95f, g_b = 0.35f;
+
+            float m_fuel = 0.0f, m_prog = 0.0f;
+            uint32_t m_in = 0, m_out = 0;
+            bool has_machine_info = false;
+
+            if (is_occupied) {
+                has_machine_info = s_get_machine_info && s_get_machine_info(hover_tile_x, hover_tile_y, &m_fuel, &m_prog, &m_in, &m_out);
+                if (has_machine_info && m_out > 0) {
+                    g_r = 1.0f; g_g = 0.85f; g_b = 0.20f; // Dorado Factorio: listo para lootear
+                } else {
+                    g_r = 0.95f; g_g = 0.25f; g_b = 0.20f; // Rojo: ocupado
+                }
+            } else if (hovered_patch_type > 0) {
+                if (hovered_patch_type == 1) { g_r = 0.35f; g_g = 0.65f; g_b = 0.95f; } // Hierro
+                else if (hovered_patch_type == 2) { g_r = 0.95f; g_g = 0.55f; g_b = 0.25f; } // Cobre
+                else if (hovered_patch_type == 3) { g_r = 0.35f; g_g = 0.35f; g_b = 0.35f; } // Carbón
+                else if (hovered_patch_type == 4) { g_r = 0.85f; g_g = 0.82f; g_b = 0.75f; } // Piedra
+            }
 
             float hw_tile = 0.02f;
             add_box_textured(dyn_verts, snap_mx, 0.002f, snap_mz - hw_tile, 0.04f, 0.001f, 0.002f, 1.0f, 1.0f, g_r, g_g, g_b, 0.8f);
             add_box_textured(dyn_verts, snap_mx, 0.002f, snap_mz + hw_tile, 0.04f, 0.001f, 0.002f, 1.0f, 1.0f, g_r, g_g, g_b, 0.8f);
             add_box_textured(dyn_verts, snap_mx - hw_tile, 0.002f, snap_mz, 0.002f, 0.001f, 0.04f, 1.0f, 1.0f, g_r, g_g, g_b, 0.8f);
             add_box_textured(dyn_verts, snap_mx + hw_tile, 0.002f, snap_mz, 0.002f, 0.001f, 0.04f, 1.0f, 1.0f, g_r, g_g, g_b, 0.8f);
+
+            // Minado Manual con Pico (mantener Trigger presionado en veta de mineral)
+            if (hovered_patch_type > 0 && !is_occupied && s_selected_build_tool == ENTITY_NONE) {
+                if (trigger_held) {
+                    if (fabsf(hover_tile_x - s_manual_mining_tile_x) > 0.5f || fabsf(hover_tile_y - s_manual_mining_tile_y) > 0.5f) {
+                        s_manual_mining_timer = 0.0f;
+                        s_manual_mining_tile_x = hover_tile_x;
+                        s_manual_mining_tile_y = hover_tile_y;
+                        s_last_mining_strike = 0.0f;
+                    }
+                    s_manual_mining_timer += dt;
+
+                    // Golpes rítmicos de pico cada 0.24s
+                    if (s_manual_mining_timer - s_last_mining_strike >= 0.24f || s_last_mining_strike > s_manual_mining_timer) {
+                        s_last_mining_strike = s_manual_mining_timer;
+                        trigger_controller_haptics(session, haptic_action, 0.55f, 25.0f);
+                        play_spatial_sound(SFX_MINE, s_table_pos.x + snap_mx, s_table_pos.y, s_table_pos.z + snap_mz, 0.7f);
+                        for (int k = 0; k < 6; ++k) {
+                            spawn_particle(snap_mx, 0.015f, snap_mz,
+                                           ((rand() % 100) - 50) * 0.001f, 0.035f + (rand() % 30) * 0.0005f, ((rand() % 100) - 50) * 0.001f,
+                                           g_r, g_g, g_b, 0.9f, 0.008f, 0.5f);
+                        }
+                    }
+
+                    // Anillo de progreso circular de minado alrededor del retículo
+                    float fill_ratio = std::clamp(s_manual_mining_timer / 0.70f, 0.0f, 1.0f);
+                    int arc_steps = (int)(fill_ratio * 20.0f);
+                    float ring_r = 0.030f;
+                    for (int s = 0; s < arc_steps; ++s) {
+                        float a0 = (float)s * 6.2831853f / 20.0f;
+                        float a1 = (float)(s + 1) * 6.2831853f / 20.0f;
+                        dyn_verts.push_back({snap_mx + cosf(a0) * ring_r, 0.006f, snap_mz + sinf(a0) * ring_r, 0, 1, 0, 0, 0, 0.2f, 0.95f, 0.35f, 1.0f});
+                        dyn_verts.push_back({snap_mx + cosf(a1) * ring_r, 0.006f, snap_mz + sinf(a1) * ring_r, 0, 1, 0, 0, 0, 0.2f, 0.95f, 0.35f, 1.0f});
+                    }
+
+                    if (s_manual_mining_timer >= 0.70f) {
+                        s_manual_mining_timer = 0.0f;
+                        s_last_mining_strike = 0.0f;
+                        if (s_manual_mine) {
+                            uint32_t mined = s_manual_mine(hover_tile_x, hover_tile_y);
+                            LOGI("Minado manual completado en (%.1f, %.1f), item=%u", hover_tile_x, hover_tile_y, mined);
+                            trigger_controller_haptics(session, haptic_action, 0.95f, 65.0f);
+                            play_spatial_sound(SFX_CRAFT, s_table_pos.x + snap_mx, s_table_pos.y, s_table_pos.z + snap_mz, 1.0f);
+                            for (int k = 0; k < 18; ++k) {
+                                spawn_particle(snap_mx, 0.035f, snap_mz,
+                                               ((rand() % 100) - 50) * 0.0012f, 0.06f + (rand() % 40) * 0.0008f, ((rand() % 100) - 50) * 0.0012f,
+                                               1.0f, 0.90f, 0.25f, 0.95f, 0.010f, 0.7f);
+                            }
+                        }
+                    }
+                } else {
+                    s_manual_mining_timer = 0.0f;
+                    s_last_mining_strike = 0.0f;
+                }
+            } else {
+                s_manual_mining_timer = 0.0f;
+                s_last_mining_strike = 0.0f;
+            }
 
             // GHOST PREVIEW holográfico del edificio seleccionado
             if (s_selected_build_tool != ENTITY_NONE && s_entity_meshes[s_selected_build_tool].vao != 0) {
@@ -1786,9 +1923,9 @@ static void draw_tabletop_scene(const float* vp_mat,
                 glUniform3f(s_emissive_loc, 0.0f, 0.0f, 0.0f);
             }
 
-            // ACCIONES DE CONSTRUCCIÓN Y MINADO (Fase 2)
+            // ACCIONES DE CONSTRUCCIÓN, INTERACCIÓN Y MINADO (Fase 2)
             if (is_primary_eye) {
-                // Colocar edificio con gatillo
+                // 1. Colocar edificio con gatillo sobre casilla vacía
                 if (trigger_clicked && s_selected_build_tool != ENTITY_NONE && !is_occupied) {
                     if (s_place_or_update_entity) {
                         s_place_or_update_entity(s_selected_build_tool, hover_tile_x, hover_tile_y, s_placement_yaw);
@@ -1803,9 +1940,28 @@ static void draw_tabletop_scene(const float* vp_mat,
                         }
                     }
                 }
-                // Minar / Deconstruir con Modo Demoler o con botón Grip
-                else if ((trigger_clicked && s_selected_build_tool == ENTITY_NONE && is_occupied) ||
-                         (grip_clicked && is_occupied)) {
+                // 2. Interactuar / Lootear productos terminados o abastecer máquina ocupada
+                else if (is_occupied && trigger_clicked && (s_selected_build_tool == ENTITY_NONE || (has_machine_info && m_out > 0))) {
+                    if (s_interact_machine) {
+                        uint32_t looted = s_interact_machine(hover_tile_x, hover_tile_y);
+                        if (looted > 0) {
+                            LOGI("Recogidas %u piezas de la máquina en (%.1f, %.1f)", looted, hover_tile_x, hover_tile_y);
+                            trigger_controller_haptics(session, haptic_action, 0.90f, 55.0f);
+                            play_spatial_sound(SFX_CRAFT, s_table_pos.x + snap_mx, s_table_pos.y, s_table_pos.z + snap_mz, 1.0f);
+                            for (int k = 0; k < 20; ++k) {
+                                spawn_particle(snap_mx, 0.07f, snap_mz,
+                                               ((rand() % 100) - 50) * 0.0012f, 0.05f + (rand() % 50) * 0.0008f, ((rand() % 100) - 50) * 0.0012f,
+                                               1.0f, 0.90f, 0.30f, 0.95f, 0.012f, 0.8f);
+                            }
+                        } else {
+                            // Auto-abastecer combustible/mineral
+                            trigger_controller_haptics(session, haptic_action, 0.40f, 30.0f);
+                            play_spatial_sound(SFX_CLICK, s_table_pos.x + snap_mx, s_table_pos.y, s_table_pos.z + snap_mz, 0.8f);
+                        }
+                    }
+                }
+                // 3. Minar / Deconstruir máquina con botón Grip o modo demoler si no hay productos
+                else if (is_occupied && (grip_clicked || (trigger_clicked && s_selected_build_tool == ENTITY_NONE && (!has_machine_info || m_out == 0)))) {
                     if (s_mine_entity) {
                         s_mine_entity(hover_tile_x, hover_tile_y);
                         LOGI("Minado/Deconstruido en tile (%.1f, %.1f)", hover_tile_x, hover_tile_y);
@@ -2521,7 +2677,7 @@ static void* openxr_thread_main(void* arg) {
             mat4_view_from_pose(views[i].pose, viewMat);
             mat4_multiply(proj, viewMat, vp_mat);
 
-            draw_tabletop_scene(vp_mat, anim_time, 0.016f, rightAimLoc.pose, rightAimValid, trigger_clicked, grip_clicked, (i == 0), session, rightHapticAction);
+            draw_tabletop_scene(vp_mat, anim_time, 0.016f, rightAimLoc.pose, rightAimValid, trigger_clicked, (trigState.currentState > 0.5f), grip_clicked, (i == 0), session, rightHapticAction);
 
             XrSwapchainImageReleaseInfo relInfo = { .type = XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO };
             xrReleaseSwapchainImage(swapchains[i].handle, &relInfo);

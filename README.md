@@ -12,6 +12,13 @@ The factory is projected onto your real table as an interactive three-dimensiona
 
 ## Main Features
 
+* **Authentic Factorio Early-Game Progression**:
+  * Starter inventory faithful to Crash Site (8 Iron Plates, 1 Burner Mining Drill, 1 Stone Furnace, 1 Coal).
+  * **Manual Mining**: Hold Index Trigger on any mineral deposit (Stone, Coal, Iron, Copper) with empty hands / Demolish tool to mine with rhythmic pickaxe strikes, dust particles, and circular progress gauge.
+  * **Authentic Crafting**: Craft Stone Furnaces (5 Stone), Iron Gears (2 Iron Plates), Electronic Circuits (1 Iron + 3 Copper), Transport Belts (1 Iron + 1 Gear), and Mining Drills.
+  * **Direct Machine Automation**: Place mining drills directly facing stone furnaces; drills automatically feed extracted ore into adjacent furnaces.
+  * **Furnace Smelting & Blazing Fire Visuals**: Stone Furnaces burn coal fuel and smelt ore into Iron/Copper Plates, featuring animated incandescent hearth flames and billowing industrial smoke.
+  * **Interactive Machine Looting & Auto-Fueling**: Aim at running furnaces/drills with completed plates (golden reticle indicator) and click Trigger to collect finished plates into inventory or auto-supply fuel.
 * **Tabletop Diorama Mode (Generals Zero Hour XR Style)**: Projects the Factorio factory fixed-anchor to the floor in `XR_REFERENCE_SPACE_TYPE_STAGE` space at the exact height of the physical desk (~0.74m), eliminating floating in front of your face.
 * **Tabletop Layout Persistence (`layout.json`)**: Automatically saves the diorama's position, yaw orientation, and scale to `/sdcard/XFactorVR/layout.json` upon releasing grip and restores it seamlessly on startup.
 * **Two-Handed Pinch-to-Zoom & Dual-Grip Rotation (`XrInteraction`)**: Pinch-to-zoom (0.25x to 4.0x) and free table rotation along the vertical Y-axis by squeezing both Pico controller Grip buttons simultaneously.
@@ -20,7 +27,7 @@ The factory is projected onto your real table as an interactive three-dimensiona
 * **Multi-Tab Spatial Holographic Console (`XrCommandUI`)**:
   * **Build Tab**: 9-slot Quickbar for industrial structures and demolition tool.
   * **Inventory Tab**: Real-time inspection of player inventory items with visual stock gauge bars.
-  * **Crafting Tab**: Interactive workbench to craft Iron Gears, Electronic Circuits, Transport Belts, and Mining Drills with a single trigger click.
+  * **Crafting Tab**: Interactive workbench to craft Stone Furnaces, Iron Gears, Electronic Circuits, Transport Belts, and Mining Drills with a single trigger click.
 * **3D Holographic Controller Tooltips (`XrControllerHelp`)**: Floating HUD badge above the right wrist/controller displaying color-coded button guidance (Trigger: Action, Grip: Move/Demolish, Stick: Rotate/Height, 2-Grips: Zoom/Rotate).
 * **3D Positional Spatial Audio (`XrAudio`)**: Native 48 kHz stereo synthesis via AAudio with continuous industrial factory hum, distance attenuation, and head-pose spatial stereo panning, plus distinct sound effects for placement, mining, crafting, and UI interactions.
 * **Controller Haptic Feedback (`XrHapticVibration`)**: Precise tactile pulses for menu clicks (25ms), heavy metallic clunks when placing machinery (45ms), and dismantling vibrations (65ms).
@@ -31,6 +38,7 @@ The factory is projected onto your real table as an interactive three-dimensiona
   * Electric mining drill with vertical reciprocating piston and drill bit.
   * Roboport with orbiting 3D aerial patrol drones.
   * Assembling machine with blinking chimney beacon and steam puffs.
+  * Stone furnace with blazing hearth fire and thick industrial smoke.
   * Power poles with 3D catenary cables automatically strung between adjacent poles.
   * Conveyor belts with animated UV scrolling and real items in transit.
   * 3D particle system for industrial smoke, steam, construction sparks, and demolition debris.
@@ -74,13 +82,15 @@ This project uses and is inspired by the following repositories as reference:
 | Action | Pico Controller | Factorio XR Function |
 | --- | --- | --- |
 | **Laser Pointer & Reticle** | Right Controller (6DoF Aim) | Aims at factory cells, Quickbar slots, or holographic console buttons |
-| **Index Trigger** | Click on Quickbar slot | Select active building tool / entity |
-| **Index Trigger** | Click on empty table tile | Build selected entity (Green Ghost Preview) |
-| **Grip Button** | Click on existing entity | Mine / Deconstruct targeted entity (returns to inventory) |
-| **Index Trigger** | Click with Demolish tool | Mine / Deconstruct targeted entity |
-| **Index Trigger** | Click on Crafting recipe | Craft item (Gear, Circuit, Belt, Drill) with haptic ping |
+| **Index Trigger (Hold)** | Hold on mineral patch (Empty hands) | **Manual Mining with Pickaxe**: Rhythmic strikes, particles, progress gauge |
+| **Index Trigger (Click)** | Click on operating machine with loot | **Loot Finished Items**: Collects smelted plates and auto-fuels machine |
+| **Index Trigger (Click)** | Click on Quickbar slot | Select active building tool / entity |
+| **Index Trigger (Click)** | Click on empty table tile | Build selected entity (Green Ghost Preview) |
+| **Grip Button (Click)** | Click on existing entity | Mine / Deconstruct targeted entity (returns to inventory) |
+| **Index Trigger (Click)** | Click with Demolish tool (Slot 8) | Mine / Deconstruct targeted entity |
+| **Index Trigger (Click)** | Click on Crafting recipe | Craft item (Furnace, Gear, Circuit, Belt, Drill) with haptic ping |
 | **Joystick X (Thumbstick)** | Left / Right | Rotate placement orientation of the entity by 90° |
-| **Grip Button (Single)** | Hold on table | Drag and reposition the table freely in physical room (`XrSurfaceGrab`) |
+| **Grip Button (Single Hold)** | Hold on table | Drag and reposition the table freely in physical room (`XrSurfaceGrab`) |
 | **Both Grip Buttons (Dual)** | Squeeze both grips | Two-handed pinch-to-zoom (scale 0.25x-4.0x) and table rotation |
 | **Joystick Y (Table Mode)** | Up / Down | Fine adjustment of table height ($\pm4\text{mm}$ per step) |
 | **Joystick (Observer Mode)** | 2D Stick | Foot movement at 1:1 scale across the factory floor |

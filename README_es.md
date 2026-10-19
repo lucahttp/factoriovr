@@ -8,6 +8,13 @@ La fábrica se proyecta sobre tu mesa real como un diorama tridimensional intera
 
 ## Características Principales
 
+* **Progresión Auténtica del Nivel Inicial de Factorio (Early-Game)**:
+  * Pack inicial fiel a Crash Site (8 Planchas de Hierro, 1 Perforadora de Vapor, 1 Horno de Piedra, 1 Carbón).
+  * **Minado Manual con Pico**: Mantén el gatillo Trigger presionado sobre cualquier veta de recurso (Piedra, Carbón, Hierro, Cobre) con las manos vacías o herramienta Demoler; muestra un anillo medidor circular de progreso 3D alrededor del retículo, golpes rítmicos de pico, sonido espacial y chispas de mineral hasta extraerlo al inventario.
+  * **Fabricación Auténtica**: Craftea el primer Horno de Piedra con 5 piedras minadas en la pestaña Fabricar, además de Engranajes, Circuitos, Cintas y Perforadoras.
+  * **Automatización Directa Perforadora-Horno**: Coloca la perforadora sobre la veta de hierro apuntando directamente hacia el horno contiguo; la perforadora deposita el mineral extraído directamente en el búfer de entrada del horno.
+  * **Fundición con Fuego y Humo Visual 3D**: Los hornos consumen carbón y funden mineral a planchas metálicas con fuego incandescente animado en el hogar y humo industrial denso.
+  * **Recolección Interactiva (Looting) y Auto-Abastecimiento**: Apunta a cualquier máquina en funcionamiento con planchas listas (retículo dorado y placa brillante flotante) y pulsa Trigger para recoger el producto terminado en tu inventario o reabastecer carbón y mineral.
 * **Modo Maqueta / Tabletop Diorama (Estilo Generals Zero Hour XR)**: Proyecta la fábrica de Factorio anclada de forma fija al suelo en espacio `XR_REFERENCE_SPACE_TYPE_STAGE` a la altura exacta del escritorio físico (~0.74m), eliminando la flotación frente a la cara.
 * **Persistencia del Anclaje de Mesa (`layout.json`)**: Guarda automáticamente la posición, orientación yaw y escala de la maqueta en `/sdcard/XFactorVR/layout.json` al soltar el agarre y la restaura exactamente en el siguiente inicio.
 * **Interacción Bimanual (`XrInteraction`)**: Pellizcar para hacer zoom (Pinch-to-zoom de 0.25x a 4.0x) y rotación libre sobre el eje Y sujetando ambos gatillos Grip de los mandos Pico simultáneamente.
@@ -16,7 +23,7 @@ La fábrica se proyecta sobre tu mesa real como un diorama tridimensional intera
 * **Consola Holográfica Espacial Multi-Pestaña (`XrCommandUI`)**:
   * **Pestaña Construir**: Quickbar de 9 ranuras para edificios industriales.
   * **Pestaña Inventario**: Inspección del inventario real del jugador con barras medidoras de stock.
-  * **Pestaña Fabricar**: Banco de trabajo interactivo para craftear Engranajes, Circuitos Electrónicos, Cintas Transportadoras y Perforadoras con un clic de gatillo.
+  * **Pestaña Fabricar**: Banco de trabajo interactivo para craftear Hornos de Piedra, Engranajes, Circuitos Electrónicos, Cintas Transportadoras y Perforadoras con un clic de gatillo.
 * **Tooltips Holográficos 3D en Mandos (`XrControllerHelp`)**: Badge HUD flotante sobre la muñeca del mando derecho con indicaciones codificadas por color (Trigger: Acción, Grip: Mover/Demoler, Stick: Rotar/Altura, 2-Grips: Zoom/Giro).
 * **Audio Espacial 3D Posicional (`XrAudio`)**: Síntesis estéreo nativa a 48000 Hz mediante AAudio con zumbido industrial continuo de fábrica, atenuación por distancia y paneo espacial dependiente de la pose de la cabeza, además de efectos acústicos para colocación, minado, crafteo y pulsaciones de interfaz.
 * **Feedback Háptico en Mandos (`XrHapticVibration`)**: Vibraciones táctiles sutiles en pulsaciones de menú (25ms), impactos al asentar maquinaria (45ms) y sacudidas firmes al desmantelar instalaciones (65ms).
@@ -24,9 +31,10 @@ La fábrica se proyecta sobre tu mesa real como un diorama tridimensional intera
 * **Animaciones de Maquinaria y Partículas 3D (`factorio-3d-mod`)**:
   * Antena de radar con rotación continua de 360°.
   * Torreta defensiva con rotación y seguimiento independiente del cabezal superior.
-  * Perforadora minera con pistón/broca vertical reciprocante.
+  * Perforadora minera con pistón/broca vertical reciprocante y humo de escape.
   * Robopuerto con drones de patrulla aérea orbitando en 3D.
   * Máquina de ensamblaje con baliza titilante en la chimenea y bocanadas de vapor.
+  * Horno de piedra con fuego incandescente animado y humo denso de fundición.
   * Postes de tendido eléctrico con cables catenarios tridimensionales autogenerados entre postes contiguos.
   * Cintas transportadoras con desplazamiento UV animado e ítems en tránsito.
   * Sistema de partículas 3D para humo, vapor, chispas de colocación y escombros de minado.
@@ -68,15 +76,19 @@ Este proyecto utiliza y se inspira en los siguientes repositorios como referenci
 | Acción | Mando Pico | Función en Factorio XR |
 |---|---|---|
 | **Puntero Láser & Retículo** | Mando derecho (6DoF Aim) | Apunta a casillas de la fábrica, Quickbar o botones de la consola |
-| **Gatillo Índice (Trigger)** | Clic sobre ranura Quickbar | Selecciona la herramienta/entidad activa a construir |
-| **Gatillo Índice (Trigger)** | Clic sobre casilla vacía | Construir entidad seleccionada (Ghost verde) |
-| **Gatillo Lateral (Grip)** | Clic sobre entidad existente | Minar / Deconstruir entidad apuntada |
-| **Gatillo Índice (Trigger)** | Clic con herramienta Demoler | Minar / Deconstruir entidad apuntada |
+| **Gatillo Índice (Mantener)** | Mantener sobre veta mineral (Mano vacía) | **Minado Manual con Pico**: Golpes continuos, sonido de pico, anillo circular de progreso |
+| **Gatillo Índice (Clic)** | Clic sobre máquina con producto listo | **Recoger Productos (Looting)**: Recoge planchas fundidas y reabastece combustible/mineral |
+| **Gatillo Índice (Clic)** | Clic sobre ranura Quickbar | Selecciona la herramienta/entidad activa a construir |
+| **Gatillo Índice (Clic)** | Clic sobre casilla vacía | Construir entidad seleccionada (Ghost verde) |
+| **Gatillo Lateral (Clic)** | Clic sobre entidad existente | Minar / Deconstruir entidad apuntada (devuelve al inventario) |
+| **Gatillo Índice (Clic)** | Clic con herramienta Demoler (Ranura 8) | Minar / Deconstruir entidad apuntada |
+| **Gatillo Índice (Clic)** | Clic en receta de crafteo | Fabricar ítem (Horno, Engranaje, Circuito, Cinta, Minera) |
 | **Joystick X (Thumbstick)** | Izquierda / Derecha | Rotar orientación de colocación de la entidad en 90° |
-| **Gatillo Lateral (Grip)** | Mantener sobre borde mesa | Agarrar y arrastrar la mesa (`XrSurfaceGrab`) para reubicarla |
+| **Grip Individual (Mantener)** | Mantener sobre borde mesa | Agarrar y arrastrar la mesa (`XrSurfaceGrab`) para reubicarla |
+| **Ambos Grips (Bimanual)** | Apretar ambos grips a la vez | Zoom bimanual (0.25x - 4.0x) y giro angular libre de la mesa |
 | **Joystick Y (Modo Mesa)** | Arriba / Abajo | Ajuste fino de altura de la mesa ($\pm4\text{mm}$ por paso) |
 | **Joystick (Modo Observador)** | 2D Stick | Desplazamiento a pie en escala 1:1 por el suelo de la fábrica |
-| **Consola Holográfica** | Botón [OBSERVADOR 1:1] | Alternar entre vista de maqueta táctica y vista de suelo en 1:1 |
+| **Consola Holográfica** | Botones de Comando | Alternar Observador 1:1, Re-anclar, Construir, Inventario y Crafteo |
 
 ---
 

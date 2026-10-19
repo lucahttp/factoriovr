@@ -154,10 +154,16 @@ fi
 if [ -f "$LOCAL_ASSETS/manifest.json" ]; then
     echo "[6/7] Subiendo los assets reales del juego..."
     "$ADB" shell "mkdir -p $REMOTE_DATA/assets"
-    for f in manifest.json atlas.rgba atlas.png; do
-        if [ -f "$LOCAL_ASSETS/$f" ]; then
-            "$ADB" push "$LOCAL_ASSETS/$f" "$REMOTE_DATA/assets/$f"
-        fi
+    "$ADB" push "$LOCAL_ASSETS/manifest.json" "$REMOTE_DATA/assets/manifest.json"
+    # El atlas va paginado (atlas_0.rgba, atlas_1.rgba...): una textura de mas
+    # de 4096 px de alto no se puede subir en la GPU del visor.
+    for f in "$LOCAL_ASSETS"/atlas_*.rgba; do
+        [ -f "$f" ] || continue
+        "$ADB" push "$f" "$REMOTE_DATA/assets/$(basename "$f")"
+    done
+    for f in "$LOCAL_ASSETS"/atlas_*.png; do
+        [ -f "$f" ] || continue
+        "$ADB" push "$f" "$REMOTE_DATA/assets/$(basename "$f")"
     done
     "$ADB" shell "chmod 644 $REMOTE_DATA/assets/*" 2>/dev/null || true
 else

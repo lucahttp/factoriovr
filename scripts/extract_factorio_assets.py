@@ -2086,66 +2086,124 @@ def pack_shelf(rects, max_width):
 
 
 def pack_skyline(rects, max_width):
-    """Empaquetador 'skyline bottom-left'.
+    """Empaquetador 'skyline bottom-left' de una sola pagina.
 
     Mucho mas compacto que el shelf clasico cuando hay muchos frames de
     alturas distintas (en Factorio hay ~250 alturas distintas), que es
     justamente el caso de un atlas de sprites.  Garantiza que ningun
     rectangulo se solapa."""
-    ordered = sorted(rects, key=lambda r: (-r[1], -r[0], str(r[2])))
-    # el skyline particiona [0, max_width) en segmentos [x, y, width]
-    skyline = [[0, 0, max_width]]
-    placements = {}
-    height = 0
-    for w, h, key in ordered:
-        if w > max_width:
-            raise ExtractError("frame %r (%dx%d) no cabe en el atlas de ancho %d"
-                              % (key, w, h, max_width))
+    packer = PagePacker(max_width)
+    for w, h, key in rects:
+        packer.add(key, w, h)
+    return packer.placements(), packer.width(), packer.height()
+
+
+class PagePacker(object):
+    """Empaqueta rectangulos en paginas de 'page_size' x 'page_size'.
+
+    Cada pagina es un rectangulo del tamaño maximo de textura que la GPU
+    soporta (GL_MAX_TEXTURE_SIZE suele ser 2048 o 4096).  Cuando una pagina
+    se llena se abre la siguiente.
+    """
+
+    def __init__(self, page_size):
+        self.page_size = max(1, int(page_size))
+        self._pages = []          # [{skyline, placements, width, height}]
+
+    # -- interno ---------------------------------------------------------
+    def _new_page(self):
+        page = {
+            "skyline": [[0, 0, self.page_size]],
+            "placements": {},
+            "width": 0,
+            "height": 0,
+        }
+        self._pages.append(page)
+        return page
+
+    def _find_position(self, page, w, h):
+        """Mejor posicion (y minima, luego x minima) dentro de la pagina."""
         best = None
-        for i, node in enumerate(skyline):
-            nx, ny, nw = node
-            # altura efectiva en el tramo [nx, nx+w): un frame puede ocupar
-            # varios segmentos seguidos del skyline
+        for i, node in enumerate(page["skyline"]):
+            nx, ny, _nw = node
             yy = ny
             rem = w
             j = i
-            while rem > 0 and j < len(skyline):
-                if skyline[j][1] > yy:
-                    yy = skyline[j][1]
-                rem -= skyline[j][2]
+            while rem > 0 and j < len(page["skyline"]):
+                if page["skyline"][j][1] > yy:
+                    yy = page["skyline"][j][1]
+                rem -= page["skyline"][j][2]
                 j += 1
             if rem > 0:
-                continue          # no cabe horizontalmente
+                continue              # no cabe horizontalmente
+            if yy + h > self.page_size:
+                continue              # no cabe verticalmente
             if best is None or (yy, nx) < (best[0], best[1]):
                 best = (yy, nx, i)
-            if best[0] == 0:
-                break         # y=0 es el minimo posible; no hay nada mejor
+        return best
+
+    def _place(self, page, w, h, key):
+        best = self._find_position(page, w, h)
         if best is None:
-            raise ExtractError("no se pudo colocar el frame %r" % (key,))
+            return None
         y, x, i = best
-        placements[key] = (x, y)
-        # reconstruye el skyline
+        page["placements"][key] = (x, y)
         touched = []
         rem = w
         j = i
-        while rem > 0 and j < len(skyline):
-            node = skyline[j]
+        while rem > 0 and j < len(page["skyline"]):
+            node = page["skyline"][j]
             take = min(rem, node[2])
             touched.append((node, take))
             rem -= take
             j += 1
-        new = [list(n) for n in skyline[:i]]
+        new = [list(n) for n in page["skyline"][:i]]
         new.append([x, y + h, w])
         for node, take in touched:
             left = node[2] - take
             if left > 0:
                 new.append([node[0] + take, node[1], left])
-        new.extend([list(n) for n in skyline[j:]])
-        skyline = new
-        if y + h > height:
-            height = y + h
-    width = max((x + w) for (x, _y) in placements.values()) if placements else 1
-    return placements, max(width, 1), height
+        new.extend([list(n) for n in page["skyline"][j:]])
+        page["skyline"] = new
+        if y + h > page["height"]:
+            page["height"] = y + h
+        if x + w > page["width"]:
+            page["width"] = x + w
+        return (x, y)
+
+    # -- publico ---------------------------------------------------------
+    def add(self, key, w, h):
+        """Coloca un rectangulo; devuelve (pagina, x, y) o None."""
+        if w > self.page_size or h > self.page_size:
+            return None
+        if not self._pages:
+            self._new_page()
+        page = self._pages[-1]
+        placed = self._place(page, w, h, key)
+        if placed is None:
+            page = self._new_page()
+            placed = self._place(page, w, h, key)
+            if placed is None:
+                return None
+            return len(self._pages) - 1, placed[0], placed[1]
+        return len(self._pages) - 1, placed[0], placed[1]
+
+    def page_count(self):
+        return len(self._pages)
+
+    def placements(self):
+        """{clave: (pagina, x, y)} de todas las paginas."""
+        out = {}
+        for index, page in enumerate(self._pages):
+            for key, (x, y) in page["placements"].items():
+                out[key] = (index, x, y)
+        return out
+
+    def width(self):
+        return max([p["width"] for p in self._pages] or [0])
+
+    def height(self):
+        return max([p["height"] for p in self._pages] or [0])
 
 
 # ===========================================================================
@@ -2528,8 +2586,8 @@ def build_arg_parser():
                         help="detecta y reporta la version de Factorio")
     parser.add_argument("--atlas-size", type=int, default=2048,
                         help="ancho maximo del atlas en pixeles (por defecto 2048)")
-    parser.add_argument("--max-atlas-height", type=int, default=24576,
-                        help="alto maximo del atlas en pixeles (por defecto 24576)")
+    parser.add_argument("--max-atlas-height", type=int, default=32768,
+                        help="alto maximo del atlas en pixeles (por defecto 32768)")
     parser.add_argument("--no-raw", action="store_true",
                         help="no escribir atlas.rgba (el motor lo sube crudo a la GPU)")
     parser.add_argument("--skip-icons", action="store_true",

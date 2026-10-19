@@ -549,22 +549,33 @@ typedef void (*pfn_xfactorvr_update_simulation)(float delta_time);
 // --- Atlas de sprites reales de Factorio -------------------------------------
 // El renderer deja de inventar primitivas: dibuja los sprites que usa el juego,
 // recortados del atlas que extrae scripts/extract_factorio_assets.py.
-typedef bool (*pfn_xfactorvr_get_atlas_size)(int* out_w, int* out_h);
-typedef int  (*pfn_xfactorvr_get_atlas_pixels)(uint8_t* out, int max_len);
+typedef int  (*pfn_xfactorvr_get_atlas_page_count)();
+typedef bool (*pfn_xfactorvr_get_atlas_page_size)(uint32_t page, int* out_w, int* out_h);
+typedef int  (*pfn_xfactorvr_get_atlas_page_pixels)(uint32_t page, uint8_t* out, int max_len);
 typedef bool (*pfn_xfactorvr_get_sprite_frame)(uint32_t sprite_id, uint32_t anim_frame,
                                                float orientation, float* out);
 
-static pfn_xfactorvr_get_atlas_size   s_get_atlas_size   = nullptr;
-static pfn_xfactorvr_get_atlas_pixels s_get_atlas_pixels = nullptr;
-static pfn_xfactorvr_get_sprite_frame s_get_sprite_frame = nullptr;
+static pfn_xfactorvr_get_atlas_page_count   s_get_atlas_page_count   = nullptr;
+static pfn_xfactorvr_get_atlas_page_size    s_get_atlas_page_size    = nullptr;
+static pfn_xfactorvr_get_atlas_page_pixels  s_get_atlas_page_pixels  = nullptr;
+static pfn_xfactorvr_get_sprite_frame       s_get_sprite_frame       = nullptr;
 
-static GLuint s_tex_atlas = 0;
-static int    s_atlas_w = 0;
-static int    s_atlas_h = 0;
+// El atlas se parte en paginas: una textura de mas de 4096 px de alto no se
+// puede subir en la GPU movil (GL_MAX_TEXTURE_SIZE).
+#define XFACTORVR_MAX_ATLAS_PAGES 32
+static GLuint s_tex_atlas[XFACTORVR_MAX_ATLAS_PAGES] = {0};
+static int    s_atlas_page_w[XFACTORVR_MAX_ATLAS_PAGES] = {0};
+static int    s_atlas_page_h[XFACTORVR_MAX_ATLAS_PAGES] = {0};
+static int    s_atlas_page_count = 0;
 static bool   s_atlas_probed = false;
-static GLuint s_sprite_vao = 0;
-static GLuint s_sprite_vbo = 0;
-static int    s_sprite_vertex_count = 0;
+
+struct SpriteBatch {
+    GLuint vao = 0;
+    GLuint vbo = 0;
+    int vertex_count = 0;
+    std::vector<DioramaVertex> verts;
+};
+static SpriteBatch s_sprite_batches[XFACTORVR_MAX_ATLAS_PAGES];
 typedef bool (*pfn_xfactorvr_get_player_inventory)(PlayerItemFfi* out_items, uint32_t max_items, uint32_t* out_count);
 typedef bool (*pfn_xfactorvr_craft_item)(uint32_t item_id, uint32_t count);
 typedef bool (*pfn_xfactorvr_get_resource_patches)(ResourcePatchFfi* out_patches, uint32_t max_patches, uint32_t* out_count);
@@ -1028,36 +1039,42 @@ static GLuint create_mesh_vao(const std::vector<DioramaVertex>& verts, GLuint& o
 
 // --- Atlas de sprites reales de Factorio -------------------------------------
 // Los pixeles llegan en RGBA8 crudo desde Rust: el extractor escribe el atlas
-// en crudo porque en Android no hay decodificador de PNG.
+// en crudo porque en Android no hay decodificador de PNG, y lo parte en paginas
+// porque una textura de mas de 4096 px de alto no cabe en la GPU movil.
 static bool ensure_atlas_texture() {
-    if (s_atlas_probed) return s_tex_atlas != 0;
+    if (s_atlas_probed) return s_atlas_page_count > 0;
     s_atlas_probed = true;
-    if (!s_get_atlas_size || !s_get_atlas_pixels) return false;
+    if (!s_get_atlas_page_count || !s_get_atlas_page_size || !s_get_atlas_page_pixels) return false;
 
-    int w = 0, h = 0;
-    if (!s_get_atlas_size(&w, &h) || w <= 0 || h <= 0) {
-        LOGI("openxr_engine: no hay atlas de sprites desplegado (mismo texto procedural)");
-        return false;
-    }
-    size_t bytes = (size_t)w * (size_t)h * 4u;
-    std::vector<uint8_t> pixels(bytes);
-    int written = s_get_atlas_pixels(pixels.data(), (int)bytes);
-    if (written <= 0) {
-        LOGI("openxr_engine: no se pudieron leer los pixeles del atlas");
+    int pages = s_get_atlas_page_count();
+    if (pages <= 0 || pages > XFACTORVR_MAX_ATLAS_PAGES) {
+        LOGI("openxr_engine: no hay atlas de sprites (paginas=%d)", pages);
         return false;
     }
 
-    glGenTextures(1, &s_tex_atlas);
-    glBindTexture(GL_TEXTURE_2D, s_tex_atlas);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, pixels.data());
-    s_atlas_w = w;
-    s_atlas_h = h;
-    LOGI("openxr_engine: atlas de sprites de Factorio cargado (%dx%d)", w, h);
-    return true;
+    for (int p = 0; p < pages; ++p) {
+        int w = 0, h = 0;
+        if (!s_get_atlas_page_size((uint32_t)p, &w, &h) || w <= 0 || h <= 0) continue;
+        size_t bytes = (size_t)w * (size_t)h * 4u;
+        std::vector<uint8_t> pixels(bytes);
+        int written = s_get_atlas_page_pixels((uint32_t)p, pixels.data(), (int)bytes);
+        if (written <= 0) continue;
+
+        GLuint tex = 0;
+        glGenTextures(1, &tex);
+        glBindTexture(GL_TEXTURE_2D, tex);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, pixels.data());
+        s_tex_atlas[p] = tex;
+        s_atlas_page_w[p] = w;
+        s_atlas_page_h[p] = h;
+        s_atlas_page_count = p + 1;
+    }
+    LOGI("openxr_engine: atlas de sprites de Factorio cargado (%d paginas)", s_atlas_page_count);
+    return s_atlas_page_count > 0;
 }
 
 // Anade al lote un quad plano: el sprite tumbado sobre la mesa. El arte de
@@ -1091,25 +1108,26 @@ static void add_sprite_quad(std::vector<DioramaVertex>& verts,
     }
 }
 
-// Sube el lote de sprites a la GPU y lo dibuja tumbado sobre la mesa.
-static void draw_sprite_batch(const std::vector<DioramaVertex>& verts,
+// Sube el lote de sprites de una pagina a la GPU y lo dibuja tumbado sobre la
+// mesa. Cada pagina del atlas es una textura y se pinta por separado.
+static void draw_sprite_batch(SpriteBatch& batch, uint32_t page,
                               const float* model, const float* mvp) {
-    if (verts.empty() || s_tex_atlas == 0) return;
+    if (batch.verts.empty() || page >= (uint32_t)s_atlas_page_count) return;
 
-    if (s_sprite_vao == 0) {
-        s_sprite_vao = create_mesh_vao(verts, s_sprite_vbo);
+    if (batch.vao == 0) {
+        batch.vao = create_mesh_vao(batch.verts, batch.vbo);
     } else {
-        glBindBuffer(GL_ARRAY_BUFFER, s_sprite_vbo);
-        glBufferData(GL_ARRAY_BUFFER, verts.size() * sizeof(DioramaVertex),
-                     verts.data(), GL_DYNAMIC_DRAW);
+        glBindBuffer(GL_ARRAY_BUFFER, batch.vbo);
+        glBufferData(GL_ARRAY_BUFFER, batch.verts.size() * sizeof(DioramaVertex),
+                     batch.verts.data(), GL_DYNAMIC_DRAW);
     }
-    s_sprite_vertex_count = (int)verts.size();
+    batch.vertex_count = (int)batch.verts.size();
 
     glUseProgram(s_program);
     glUniformMatrix4fv(s_model_loc, 1, GL_FALSE, model);
     glUniformMatrix4fv(s_mvp_loc, 1, GL_FALSE, mvp);
     glActiveTexture(GL_TEXTURE0);
-    glBindTexture(GL_TEXTURE_2D, s_tex_atlas);
+    glBindTexture(GL_TEXTURE_2D, s_tex_atlas[page]);
     glUniform1i(s_tex_loc, 0);
     glUniform1f(s_use_tex_loc, 1.0f);
     glUniform1f(s_lit_loc, 1.0f);
@@ -1117,8 +1135,8 @@ static void draw_sprite_batch(const std::vector<DioramaVertex>& verts,
     glEnable(GL_BLEND);
     glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
     glDepthMask(GL_FALSE);
-    glBindVertexArray(s_sprite_vao);
-    glDrawArrays(GL_TRIANGLES, 0, s_sprite_vertex_count);
+    glBindVertexArray(batch.vao);
+    glDrawArrays(GL_TRIANGLES, 0, batch.vertex_count);
     glDepthMask(GL_TRUE);
     glDisable(GL_BLEND);
 
@@ -1147,8 +1165,9 @@ static void init_glb_loader() {
     s_get_carried_item = (pfn_xfactorvr_get_carried_item)dlsym(handle, "xfactorvr_get_carried_item");
     s_pan_view = (pfn_xfactorvr_pan_view)dlsym(handle, "xfactorvr_pan_view");
     s_get_view_center = (pfn_xfactorvr_get_view_center)dlsym(handle, "xfactorvr_get_view_center");
-    s_get_atlas_size = (pfn_xfactorvr_get_atlas_size)dlsym(handle, "xfactorvr_get_atlas_size");
-    s_get_atlas_pixels = (pfn_xfactorvr_get_atlas_pixels)dlsym(handle, "xfactorvr_get_atlas_pixels");
+    s_get_atlas_page_count = (pfn_xfactorvr_get_atlas_page_count)dlsym(handle, "xfactorvr_get_atlas_page_count");
+    s_get_atlas_page_size = (pfn_xfactorvr_get_atlas_page_size)dlsym(handle, "xfactorvr_get_atlas_page_size");
+    s_get_atlas_page_pixels = (pfn_xfactorvr_get_atlas_page_pixels)dlsym(handle, "xfactorvr_get_atlas_page_pixels");
     s_get_sprite_frame = (pfn_xfactorvr_get_sprite_frame)dlsym(handle, "xfactorvr_get_sprite_frame");
 
     if (!s_load_glb || !s_get_live_entities) {
@@ -1526,8 +1545,9 @@ static void draw_tabletop_scene(const float* vp_mat,
     glUniform3f(s_emissive_loc, 0.0f, 0.0f, 0.0f);
 
     std::vector<LiveEntity> electric_poles;
-    std::vector<DioramaVertex> sprite_verts;
-    sprite_verts.reserve((size_t)entity_count * 6);
+    for (int p = 0; p < XFACTORVR_MAX_ATLAS_PAGES; ++p) {
+        s_sprite_batches[p].verts.clear();
+    }
 
     for (int i = 0; i < entity_count; ++i) {
         const LiveEntity& ent = live_entities[i];
@@ -1540,21 +1560,27 @@ static void draw_tabletop_scene(const float* vp_mat,
         // Si el juego tiene sprite para este tipo, se dibuja el sprite REAL
         // tumbado sobre la mesa en lugar de una primitiva inventada.
         if (ent.sprite_id != 0 && s_get_sprite_frame && ensure_atlas_texture()) {
-            float rect[9];
+            float rect[10];
             if (s_get_sprite_frame(ent.sprite_id, ent.anim_frame, ent.orientation, rect)) {
-                float mx = (ent.tile_x - s_view_pan_x) * 0.04f;
-                float mz = (ent.tile_y - s_view_pan_y) * 0.04f;
-                // El sprite mide frame_width px a escala s; en el juego una
-                // casilla son 32 px y aqui una casilla son 0.04 m.
-                float tiles = rect[4] * rect[8] / 32.0f;
-                float half = tiles * 0.04f * 0.5f;
-                float u0 = rect[0] / (float)s_atlas_w;
-                float v0 = rect[1] / (float)s_atlas_h;
-                float u1 = (rect[0] + rect[2]) / (float)s_atlas_w;
-                float v1 = (rect[1] + rect[3]) / (float)s_atlas_h;
-                add_sprite_quad(sprite_verts, mx, mz, 0.0012f, half, half,
-                                u0, v0, u1, v1, 1.0f, 1.0f, 1.0f, 1.0f);
-                continue;  // sprite real: no se dibuja la malla primitiva
+                int page = (int)rect[9];
+                if (page >= 0 && page < XFACTORVR_MAX_ATLAS_PAGES) {
+                    float mx = (ent.tile_x - s_view_pan_x) * 0.04f;
+                    float mz = (ent.tile_y - s_view_pan_y) * 0.04f;
+                    // El sprite mide frame_width px a escala s; en el juego una
+                    // casilla son 32 px y aqui una casilla son 0.04 m.
+                    float tiles = rect[4] * rect[8] / 32.0f;
+                    float half = tiles * 0.04f * 0.5f;
+                    float pw = (float)s_atlas_page_w[page];
+                    float ph = (float)s_atlas_page_h[page];
+                    float u0 = rect[0] / pw;
+                    float v0 = rect[1] / ph;
+                    float u1 = (rect[0] + rect[2]) / pw;
+                    float v1 = (rect[1] + rect[3]) / ph;
+                    add_sprite_quad(s_sprite_batches[page].verts, mx, mz, 0.0012f,
+                                    half, half, u0, v0, u1, v1,
+                                    1.0f, 1.0f, 1.0f, 1.0f);
+                    continue;  // sprite real: no se dibuja la malla primitiva
+                }
             }
         }
 
@@ -1626,9 +1652,10 @@ static void draw_tabletop_scene(const float* vp_mat,
         }
     }
 
-    // Lote de sprites reales de Factorio, tumbados sobre la mesa.
-    if (!sprite_verts.empty()) {
-        draw_sprite_batch(sprite_verts, active_model, vp_mat);
+    // Lote de sprites reales de Factorio, tumbados sobre la mesa. Cada pagina
+    // del atlas es una textura y se pinta por separado.
+    for (int p = 0; p < s_atlas_page_count; ++p) {
+        draw_sprite_batch(s_sprite_batches[p], (uint32_t)p, active_model, vp_mat);
     }
 
     // F) Consola UI Holográfica Espacial (Generals XR pattern)

@@ -727,17 +727,19 @@ pub unsafe extern "C" fn xfactorvr_is_rcon_connected() -> bool {
     }
 }
 
-/// Pixeles del atlas de sprites en RGBA8 crudo, listos para subir a la GPU.
-///
-/// `out` recibe los pixeles (RGBA8, en orden de filas). Devuelve el numero de
-/// bytes escritos, o 0 si no hay atlas desplegado. Android no trae
-/// decodificador de PNG, por eso el extractor escribe tambien el atlas en crudo.
+/// Numero de paginas del atlas de sprites. 0 = no hay atlas.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn xfactorvr_get_atlas_size(out_w: *mut i32, out_h: *mut i32) -> bool {
+pub unsafe extern "C" fn xfactorvr_get_atlas_page_count() -> i32 {
+    assets::atlas_page_count() as i32
+}
+
+/// Tamano de una pagina del atlas (ancho y alto en pixeles).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn xfactorvr_get_atlas_page_size(page: u32, out_w: *mut i32, out_h: *mut i32) -> bool {
     if out_w.is_null() || out_h.is_null() {
         return false;
     }
-    match assets::atlas_pixels() {
+    match assets::atlas_page_pixels(page) {
         Some((_, w, h)) => {
             *out_w = *w as i32;
             *out_h = *h as i32;
@@ -747,12 +749,18 @@ pub unsafe extern "C" fn xfactorvr_get_atlas_size(out_w: *mut i32, out_h: *mut i
     }
 }
 
+/// Pixeles de una pagina del atlas en RGBA8 crudo, listos para subir a la GPU.
+///
+/// El atlas se parte en paginas porque una textura de mas de 4096 px de alto no
+/// se puede subir en la GPU movil. Devuelve el numero de bytes escritos, o 0
+/// si no hay esa pagina. Android no trae decodificador de PNG, por eso el
+/// extractor escribe tambien el atlas en crudo.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn xfactorvr_get_atlas_pixels(out: *mut u8, max_len: i32) -> i32 {
+pub unsafe extern "C" fn xfactorvr_get_atlas_page_pixels(page: u32, out: *mut u8, max_len: i32) -> i32 {
     if out.is_null() || max_len <= 0 {
         return 0;
     }
-    match assets::atlas_pixels() {
+    match assets::atlas_page_pixels(page) {
         Some((data, _, _)) => {
             if (data.len() as i64) > max_len as i64 {
                 return 0;
@@ -764,12 +772,13 @@ pub unsafe extern "C" fn xfactorvr_get_atlas_pixels(out: *mut u8, max_len: i32) 
     }
 }
 
+
 /// Rectangulo del frame de un sprite real de Factorio dentro del atlas.
 ///
 /// Lo consume el motor C++ para dibujar el sprite en vez de una primitiva.
-/// `out` recibe 9 floats: x, y, w, h (pixeles del atlas), el ancho y alto
-/// logicos del frame, el numero de direcciones de la capa, los frames de
-/// animacion y la escala del sprite en el juego. Devuelve false si no hay sprite (se dibuja la primitiva de
+/// `out` recibe 10 floats: x, y, w, h (pixeles de la pagina del atlas), el
+/// ancho y alto logicos del frame, el numero de direcciones de la capa, los
+/// frames de animacion, la escala del sprite y el indice de pagina. Devuelve false si no hay sprite (se dibuja la primitiva de
 /// siempre).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn xfactorvr_get_sprite_frame(
@@ -795,6 +804,7 @@ pub unsafe extern "C" fn xfactorvr_get_sprite_frame(
             *out.add(6) = f.direction_count as f32;
             *out.add(7) = f.animation_frames as f32;
             *out.add(8) = f.scale;
+            *out.add(9) = f.page as f32;
             true
         }
         None => false,

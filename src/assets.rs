@@ -57,6 +57,10 @@ pub struct Animation {
 
 #[derive(Debug, Clone, Copy, Deserialize)]
 pub struct AtlasRect {
+    /// Pagina del atlas donde vive el frame (el atlas se parte en paginas
+    /// porque una textura de mas de 4096 px no cabe en la GPU movil).
+    #[serde(default)]
+    pub page: u32,
     pub x: f32,
     pub y: f32,
     pub w: f32,
@@ -95,6 +99,18 @@ pub struct AtlasInfo {
     /// extractor para que el motor no tenga que decodificar PNG.
     #[serde(default)]
     pub raw_file: Option<String>,
+    /// Paginas del atlas. Cada una es una textura independiente.
+    #[serde(default)]
+    pub pages: Vec<AtlasPage>,
+    pub width: u32,
+    pub height: u32,
+}
+
+/// Pagina del atlas: una textura que se puede subir a la GPU.
+#[derive(Debug, Clone, Deserialize)]
+pub struct AtlasPage {
+    #[serde(default)]
+    pub file: String,
     pub width: u32,
     pub height: u32,
 }
@@ -111,6 +127,7 @@ pub struct SpriteFrame {
     pub direction_count: u32,
     pub animation_frames: u32,
     pub scale: f32,
+    pub page: u32,
 }
 
 static MANIFEST: OnceLock<Option<AssetManifest>> = OnceLock::new();
@@ -237,6 +254,7 @@ pub fn sprite_frame_in(
         direction_count: dirs,
         animation_frames: anim,
         scale: layer.scale,
+        page: rect.page,
     })
 }
 
@@ -252,36 +270,57 @@ pub fn atlas_file() -> Option<PathBuf> {
     Some(assets_dir().join(file))
 }
 
-static ATLAS_PIXELS: OnceLock<Option<(Vec<u8>, u32, u32)>> = OnceLock::new();
+static ATLAS_PIXELS: OnceLock<Option<Vec<(Vec<u8>, u32, u32)>>> = OnceLock::new();
 
 /// Pixeles del atlas en RGBA8 crudo, listos para subir a la GPU.
 ///
 /// Android no trae decodificador de PNG, asi que el extractor escribe
 /// ademas el atlas en crudo (`atlas.rgba`): son width*height*4 bytes en
 /// orden de filas, sin cabecera. Aqui solo se lee el fichero.
-pub fn atlas_pixels() -> Option<&'static (Vec<u8>, u32, u32)> {
+pub fn atlas_pages() -> Option<&'static Vec<(Vec<u8>, u32, u32)>> {
     ATLAS_PIXELS
         .get_or_init(|| {
             let m = manifest()?;
             let atlas = m.atlas.as_ref()?;
-            let raw_name = atlas
-                .raw_file
-                .clone()
-                .unwrap_or_else(|| "atlas.rgba".to_string());
-            let path = assets_dir().join(raw_name);
-            let data = std::fs::read(&path).ok()?;
-            let expected = (atlas.width as usize) * (atlas.height as usize) * 4;
-            if data.len() != expected {
-                log::warn!(
-                    "Atlas crudo con tamano inesperado ({} != {} bytes)",
-                    data.len(),
-                    expected
-                );
+            let dir = assets_dir();
+            let mut out = Vec::new();
+            for page in &atlas.pages {
+                let path = dir.join(&page.file);
+                let data = match std::fs::read(&path) {
+                    Ok(d) => d,
+                    Err(e) => {
+                        log::warn!("Pagina de atlas {} ilegible: {}", page.file, e);
+                        return None;
+                    }
+                };
+                let expected = (page.width as usize) * (page.height as usize) * 4;
+                if data.len() != expected {
+                    log::warn!(
+                        "Pagina {} con tamano inesperado ({} != {} bytes)",
+                        page.file,
+                        data.len(),
+                        expected
+                    );
+                    return None;
+                }
+                out.push((data, page.width, page.height));
+            }
+            if out.is_empty() {
                 return None;
             }
-            Some((data, atlas.width, atlas.height))
+            Some(out)
         })
         .as_ref()
+}
+
+/// Numero de paginas del atlas.
+pub fn atlas_page_count() -> usize {
+    atlas_pages().map(|p| p.len()).unwrap_or(0)
+}
+
+/// Pixeles de una pagina del atlas (RGBA8 crudo).
+pub fn atlas_page_pixels(page: u32) -> Option<&'static (Vec<u8>, u32, u32)> {
+    atlas_pages()?.get(page as usize)
 }
 
 #[cfg(test)]
@@ -337,7 +376,7 @@ mod tests {
     fn test_rectangulo_de_frame() {
         // Capa de 8 frames en 4 direcciones (2 frames por direccion).
         let frames: Vec<AtlasRect> = (0..8)
-            .map(|i| AtlasRect { x: i as f32 * 64.0, y: 0.0, w: 64.0, h: 64.0 })
+            .map(|i| AtlasRect { page: 0, x: i as f32 * 64.0, y: 0.0, w: 64.0, h: 64.0 })
             .collect();
         let layer = SpriteLayer {
             filename: String::new(),

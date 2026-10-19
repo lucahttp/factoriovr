@@ -136,20 +136,19 @@ PROTECTED_ENTITIES = {
 # Tipos de entidad que el motor VR dibuja realmente (los que le envia el
 # juego).  Con --only-listed el atlas se reduce a lo que hace falta.
 LISTED_ENTITY_TYPES = [
+    # la maquinaria basica de una fabrica
     "assembling-machine-1", "assembling-machine-2", "assembling-machine-3",
-    "big-electric-pole", "burner-mining-drill", "campfire", "electric-furnace",
-    "electric-mining-drill", "express-transport-belt", "fast-inserter",
-    "fast-transport-belt", "gun-turret", "inserter", "iron-chest",
-    "laser-turret", "long-handed-inserter", "medium-electric-pole",
-    "offshore-mining-drill", "radar", "resource", "roboport",
-    "small-electric-pole", "splitter", "steel-chest", "steel-furnace",
-    "stone-furnace", "substation", "transport-belt", "transport-chest",
-    "underground-belt", "wooden-chest",
-    # recursos y decoracion que tambien se dibujan
-    "tree", "iron-ore", "copper-ore", "coal", "uranium-ore", "stone",
-    "crude-oil", "water",
-    # y las variantes de bitero
-    "small-biter", "medium-biter", "big-biter", "boss-biter",
+    "burner-mining-drill", "electric-mining-drill",
+    "stone-furnace", "steel-furnace", "electric-furnace",
+    "transport-belt", "fast-transport-belt", "express-transport-belt",
+    "inserter", "fast-inserter",
+    "small-electric-pole", "medium-electric-pole", "big-electric-pole",
+    "iron-chest", "steel-chest",
+    "gun-turret", "radar", "roboport",
+    "splitter", "underground-belt", "substation",
+    # los recursos y los arboles
+    "iron-ore", "copper-ore", "coal", "uranium-ore", "stone", "crude-oil",
+    "tree",
 ]
 
 
@@ -2170,6 +2169,7 @@ class PagePacker(object):
         page = {
             "skyline": [[0, 0, self.page_size]],
             "placements": {},
+            "sizes": {},
             "width": 0,
             "height": 0,
         }
@@ -2203,6 +2203,7 @@ class PagePacker(object):
             return None
         y, x, i = best
         page["placements"][key] = (x, y)
+        page["sizes"][key] = (w, h)
         touched = []
         rem = w
         j = i
@@ -2245,6 +2246,10 @@ class PagePacker(object):
 
     def page_count(self):
         return len(self._pages)
+
+    def pages(self):
+        """Las paginas con su skyline, colocaciones y medidas."""
+        return self._pages
 
     def placements(self):
         """{clave: (pagina, x, y)} de todas las paginas."""
@@ -2841,6 +2846,7 @@ def main(argv=None):
         return blocks
 
     def area_for():
+        """Area (en pixeles del atlas) del contenido seleccionado."""
         total = 0
         for entity in entities:
             if entity.omitted:
@@ -2848,8 +2854,9 @@ def main(argv=None):
             for layer in entity.layers:
                 if layer.omitted:
                     continue
-                total += (layer.geometry.sheet_width *
-                          layer.geometry.sheet_height)
+                cell_w, cell_h = scaled_cell(layer)
+                cols, rows = used_grid(layer)
+                total += cols * rows * cell_w * cell_h
         return total
 
     dropped_entities = 0
@@ -2868,7 +2875,7 @@ def main(argv=None):
                 if layer.omitted:
                     continue
                 area += (layer.geometry.sheet_width *
-                         layer.geometry.sheet_height)
+                         layer.geometry.sheet_height) * args.scale * args.scale
                 # la capa principal (la de mayor area) define la prioridad real
                 # de la entidad: el reflejo o las luces de conexion no deben
                 # decidir el destino de la entidad entera
@@ -2927,8 +2934,8 @@ def main(argv=None):
             if entity.omitted or layer.omitted:
                 continue
             key = (entity.name, layer.index, c0, r0)
-            placed = packer.add(key, n_cols * layer.geometry.frame_width,
-                                n_rows * layer.geometry.frame_height)
+            cell_w, cell_h = scaled_cell(layer)
+            placed = packer.add(key, n_cols * cell_w, n_rows * cell_h)
             if placed is None:
                 layer.omitted = "atlas-corta"
                 layer.blocks = []
@@ -2936,8 +2943,8 @@ def main(argv=None):
             page, px, py = placed
             layer.blocks.append({
                 "page": page, "atlas_x": px, "atlas_y": py,
-                "width": n_cols * layer.geometry.frame_width,
-                "height": n_rows * layer.geometry.frame_height,
+                "width": n_cols * cell_w,
+                "height": n_rows * cell_h,
                 "first_col": c0, "first_row": r0,
                 "cols": n_cols, "rows": n_rows,
             })
@@ -2956,6 +2963,23 @@ def main(argv=None):
         dropped_entities += 1
         dropped_layers += len(victim.layers)
         packer = pack_all()
+
+    # asercion: ninguna pagina puede pasar de page_size en ningun eje, o la
+    # GPU no podria subirla (GL_MAX_TEXTURE_SIZE)
+    for index, page in enumerate(packer.pages()):
+        assert page["width"] <= page_size, (
+            "la pagina %d mide %d px de ancho (maximo %d)"
+            % (index, page["width"], page_size))
+        assert page["height"] <= page_size, (
+            "la pagina %d mide %d px de alto (maximo %d)"
+            % (index, page["height"], page_size))
+        for key, (x, y) in page["placements"].items():
+            w, h = page["sizes"][key]
+            assert 0 <= x and 0 <= y, "posicion negativa en la pagina %d" % index
+            assert x + w <= page_size, \
+                "un rect se sale de la pagina %d" % index
+            assert y + h <= page_size, \
+                "un rect se sale de la pagina %d" % index
 
     if packer.page_count() == 0:
         sys.stderr.write("ERROR: no se pudo colocar ninguna hoja en el atlas\n")
@@ -2985,8 +3009,9 @@ def main(argv=None):
                 continue
             wanted = set()
             for blk in layer.blocks:
-                for r in range(blk["first_row"] * geo.frame_height,
-                               (blk["first_row"] + blk["rows"]) * geo.frame_height):
+                src_y0 = blk["first_row"] * geo.frame_height
+                src_h = blk["rows"] * geo.frame_height
+                for r in range(src_y0, src_y0 + src_h):
                     wanted.add(r)
             try:
                 rows = dict(decode_png_rows(layer.abs_path, wanted))
@@ -2999,21 +3024,36 @@ def main(argv=None):
                 page = pages[blk["page"]]
                 src_x0 = blk["first_col"] * geo.frame_width
                 src_y0 = blk["first_row"] * geo.frame_height
-                for r in range(blk["rows"] * geo.frame_height):
-                    src = rows.get(src_y0 + r)
+                src_w = blk["cols"] * geo.frame_width
+                src_h = blk["rows"] * geo.frame_height
+                dest_w = blk["width"]
+                dest_h = blk["height"]
+                fx = geo.frame_width / max(1, dest_w // max(1, blk["cols"]))
+                fy = geo.frame_height / max(1, dest_h // max(1, blk["rows"]))
+                for r in range(dest_h):
+                    sy = src_y0 + int(r * fy)
+                    src = rows.get(sy)
                     if src is None:
                         continue
-                    src_off = src_x0 * 4
-                    length = blk["width"] * 4
-                    if src_off + length > len(src):
-                        length = max(0, len(src) - src_off)
-                    if length <= 0:
+                    block_row = src[src_x0 * 4:(src_x0 + src_w) * 4]
+                    if len(block_row) < src_w * 4:
                         continue
+                    if fx == 2.0 and fy == 2.0:
+                        other = rows.get(sy + 1)
+                        block_row2 = None
+                        if other is not None:
+                            block_row2 = other[src_x0 * 4:(src_x0 + src_w) * 4]
+                        line = downscale_2x2(block_row, block_row2, dest_w)
+                    elif fx == int(fx) and fx >= 1:
+                        line = downscale_nearest(block_row, dest_w, int(fx))
+                    else:
+                        line = block_row[:dest_w * 4]
                     dst_off = ((blk["atlas_y"] + r) * page_size +
                                blk["atlas_x"]) * 4
-                    page[dst_off:dst_off + length] = src[src_off:src_off + length]
+                    page[dst_off:dst_off + len(line)] = line
             # frames: un rectangulo por celda de la rejilla, en orden de fila
             fw, fh = geo.frame_width, geo.frame_height
+            cell_w, cell_h = scaled_cell(layer)
             grid_cols, grid_rows = used_grid(layer)
             layer.grid_cols = grid_cols
             layer.grid_rows = grid_rows
@@ -3029,15 +3069,15 @@ def main(argv=None):
                             break
                     if blk is None:
                         continue
-                    x = blk["atlas_x"] + (col - blk["first_col"]) * fw
-                    y = blk["atlas_y"] + (row - blk["first_row"]) * fh
+                    x = blk["atlas_x"] + (col - blk["first_col"]) * cell_w
+                    y = blk["atlas_y"] + (row - blk["first_row"]) * cell_h
                     layer.frames.append({
                         "index": len(layer.frames),
                         "page": blk["page"],
                         "x": x,
                         "y": y,
-                        "w": fw,
-                        "h": fh,
+                        "w": cell_w,
+                        "h": cell_h,
                         "sheet_x": geo.offset_x + col * fw,
                         "sheet_y": geo.offset_y + row * fh,
                     })
@@ -3087,9 +3127,11 @@ def main(argv=None):
     atlas_info = {
         "page_size": page_size,
         "width": page_size,
-        "height": page_size * page_count,
+        "height": page_size,
         "page_count": page_count,
         "pixel_format": "RGBA8",
+        "scale": args.scale,
+        "total_pixels": page_size * page_size * page_count,
         "pages": pages_info,
     }
     if not args.no_raw:

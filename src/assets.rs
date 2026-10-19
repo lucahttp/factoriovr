@@ -38,6 +38,20 @@ pub struct SpriteLayer {
     /// Escala del sprite en el juego (0.5 en la plupart de entidades).
     #[serde(default = "default_scale")]
     pub scale: f32,
+    /// Pagina del atlas donde vive esta capa (si el rect no la lleva).
+    #[serde(default)]
+    pub page: u32,
+    /// Origen de la capa dentro de la pagina (si el rect no es absoluto).
+    #[serde(default)]
+    pub atlas_x: f32,
+    #[serde(default)]
+    pub atlas_y: f32,
+    /// La capa es el cuerpo de la entidad (no una sombra ni una luz).
+    #[serde(default)]
+    pub is_body: bool,
+    /// La capa no se pudo meter en el atlas; no se puede dibujar.
+    #[serde(default)]
+    pub omitted: Option<String>,
     /// Posicion de cada frame dentro del atlas.
     #[serde(default)]
     pub frames: Vec<AtlasRect>,
@@ -222,7 +236,20 @@ pub fn sprite_frame_in(
     names.sort();
     let name = names.get((sprite_id - 1) as usize)?;
     let entity = m.entities.get(*name)?;
-    let layer = entity.layers.first()?;
+    // Se prefiere la capa marcada como cuerpo; si no hay, la primera con
+    // frames utilizables (una capa "omitida" no se puede dibujar).
+    let mut candidatas: Vec<&SpriteLayer> = entity
+        .layers
+        .iter()
+        .filter(|l| l.omitted.is_none() && !l.frames.is_empty())
+        .collect();
+    if candidatas.is_empty() {
+        return None;
+    }
+    let layer = match candidatas.iter().find(|l| l.is_body) {
+        Some(l) => *l,
+        None => candidatas[0],
+    };
 
     let anim = layer.animation.as_ref().map(|a| a.frames).unwrap_or(1).max(1);
     let dirs = layer.direction_count.max(1);
@@ -244,9 +271,12 @@ pub fn sprite_frame_in(
     let index = (row * per_row + anim_index).min(layer.frame_count.saturating_sub(1));
 
     let rect = layer.frames.get(index as usize)?;
+    // El rect puede traer su pagina, o tomarla de la capa. Y sus coordenadas
+    // pueden ser relativas al origen de la capa dentro de la pagina.
+    let page = if rect.page != 0 { rect.page } else { layer.page };
     Some(SpriteFrame {
-        x: rect.x,
-        y: rect.y,
+        x: rect.x + layer.atlas_x,
+        y: rect.y + layer.atlas_y,
         w: rect.w,
         h: rect.h,
         frame_width: layer.frame_width,
@@ -254,7 +284,7 @@ pub fn sprite_frame_in(
         direction_count: dirs,
         animation_frames: anim,
         scale: layer.scale,
-        page: rect.page,
+        page,
     })
 }
 
@@ -386,6 +416,11 @@ mod tests {
             direction_count: 4,
             animation: Some(Animation { frames: 2, speed: 0.1 }),
             scale: 0.5,
+            page: 0,
+            atlas_x: 0.0,
+            atlas_y: 0.0,
+            is_body: true,
+            omitted: None,
             frames,
         };
         let per_row = (layer.frame_count / layer.direction_count).max(1);

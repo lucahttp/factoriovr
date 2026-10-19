@@ -50,7 +50,26 @@ def frame_de_la_capa(capa, frame_anim, direccion):
     rects = capa.get("frames", [])
     if indice >= len(rects):
         return None
-    return rects[indice]
+    rect = dict(rects[indice])
+    # La pagina puede venir en el rect o en la capa; las coordenadas pueden ser
+    # relativas al origen de la capa.
+    if not rect.get("page"):
+        rect["page"] = capa.get("page", 0)
+    rect["x"] = rect.get("x", 0) + capa.get("atlas_x", 0)
+    rect["y"] = rect.get("y", 0) + capa.get("atlas_y", 0)
+    return rect
+
+
+def capa_cuerpo(entidad):
+    """Primera capa dibujable, prefiriendo la marcada como cuerpo."""
+    capas = [c for c in entidad.get("layers", [])
+             if not c.get("omitted") and c.get("frames")]
+    if not capas:
+        return None
+    for c in capas:
+        if c.get("is_body"):
+            return c
+    return capas[0]
 
 
 class Paginas:
@@ -182,10 +201,9 @@ def main():
         if sid == 0:
             continue
         ent = manifiesto["entities"][nombre]
-        capas = ent.get("layers", [])
-        if not capas:
+        capa = capa_cuerpo(ent)
+        if capa is None:
             continue
-        capa = capas[0]
         rect = frame_de_la_capa(capa, e.get("f", 0), e.get("d", 0))
         if rect is None:
             continue

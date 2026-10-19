@@ -2,14 +2,46 @@
 set -euo pipefail
 
 # deploy_pico.sh — Despliegue de XFactorVR en Pico 4 Ultra vía ADB
+#
+# Deja el visor en modo standalone:
+#   1. instala el APK,
+#   2. copia el motor headless de Factorio 2.0 a /data/local/tmp (nunca a
+#      /sdcard, que esta montado como noexec),
+#   3. copia el runtime de glibc (Android usa bionic, Factorio necesita glibc),
+#   4. instala el mod puente xfactorvr_bridge,
+#   5. arranca el servidor Factorio con RCON en 127.0.0.1:27015,
+#   6. abre la app, que se conecta al servidor por RCON.
+#
+# Opciones:
+#   --stream    sigue los logs en vivo (Ctrl+C para salir)
+#   --no-start  no arranca el servidor (solo deja todo listo)
 
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-ADB="/Volumes/X10Pro/Android/sdk/platform-tools/adb"
+ADB="${ADB:-/Volumes/X10Pro/Android/sdk/platform-tools/adb}"
 APK="$PROJECT_ROOT/build/XFactorVR_Pico4Ultra.apk"
 PACKAGE="com.xfactorvr.tabletop"
 REMOTE_DATA="/sdcard/XFactorVR"
 
-echo "=== Desplegando XFactorVR en Pico 4 Ultra ==="
+# El motor va a /data/local/tmp porque /sdcard esta montado como noexec.
+REMOTE_FACTORIO="/data/local/tmp/factorio_arm64"
+REMOTE_GLIBC="/data/local/tmp/glibc"
+REMOTE_SCRIPT="/data/local/tmp/start_factorio_standalone.sh"
+
+# Payload local del motor headless ARM64.
+LOCAL_FACTORIO="$PROJECT_ROOT/factorio_arm64"
+LOCAL_MOD="$PROJECT_ROOT/mods/xfactorvr_bridge"
+MOD_ID="xfactorvr_bridge_0.1.0"
+
+STREAM=0
+START_SERVER=1
+for arg in "$@"; do
+    case "$arg" in
+        --stream)   STREAM=1 ;;
+        --no-start) START_SERVER=0 ;;
+    esac
+done
+
+echo "=== Desplegando XFactorVR en Pico 4 Ultra (modo standalone) ==="
 
 # 1. Verificar conexión ADB con el visor
 DEVICE_COUNT=$("$ADB" devices | grep -v "List" | grep "device" | wc -l | tr -d ' ')
@@ -28,37 +60,79 @@ if [ ! -f "$APK" ]; then
     exit 1
 fi
 
-echo "[1/3] Instalando $APK..."
+echo "[1/6] Instalando $APK..."
 "$ADB" install -r "$APK"
 "$ADB" shell appops set "$PACKAGE" MANAGE_EXTERNAL_STORAGE allow 2>/dev/null || true
 
-# 3. Transferir assets de Factorio y modelos 3D al almacenamiento del visor
-echo "[2/3] Sincronizando datos de Factorio a la Pico 4 Ultra ($REMOTE_DATA)..."
-"$ADB" shell "mkdir -p $REMOTE_DATA"
-
-GAME_DATA="/Volumes/X10Pro/SteamLibrary/steamapps/common/Factorio_Linux/data"
-if [ -d "$GAME_DATA" ]; then
-    echo "Subiendo data/base y data/core..."
-    "$ADB" push "$GAME_DATA/base" "$REMOTE_DATA/"
-    "$ADB" push "$GAME_DATA/core" "$REMOTE_DATA/"
+# 3. Motor headless de Factorio
+# Se empaqueta en un .tar sin comprimir para que la transferencia sea una sola
+# en vez de miles de ficheros sueltos, y porque el toybox de Android no
+# descomprime xz de forma fiable.
+echo "[2/6] Empaquetando el motor headless de Factorio..."
+if [ ! -d "$LOCAL_FACTORIO/bin/arm64" ]; then
+    echo "No se encuentra el motor local en $LOCAL_FACTORIO"
+    echo "Descargalo con el tarball factorio-headless_arm64.tar.xz del repositorio."
+    exit 1
 fi
 
-MODELS_DIR="$PROJECT_ROOT/factorio-3d-mod/models"
-if [ ! -d "$MODELS_DIR" ]; then
-    echo "Descargando modelos 3D de factorio-3d-mod..."
-    git clone https://github.com/GDani31/factorio-3d-mod.git "$PROJECT_ROOT/factorio-3d-mod"
-fi
-if [ -d "$MODELS_DIR" ]; then
-    echo "Subiendo modelos 3D GLTF de máquinas..."
-    "$ADB" push "$MODELS_DIR" "$REMOTE_DATA/"
+PAYLOAD_TAR="$PROJECT_ROOT/build/factorio_arm64.tar"
+mkdir -p "$PROJECT_ROOT/build"
+tar -cf "$PAYLOAD_TAR" -C "$LOCAL_FACTORIO" bin data config-path.cfg
+echo "    payload: $(du -h "$PAYLOAD_TAR" | cut -f1)"
+
+echo "[3/6] Copiando el motor a $REMOTE_FACTORIO ..."
+"$ADB" shell "mkdir -p $REMOTE_FACTORIO"
+"$ADB" push "$PAYLOAD_TAR" "$REMOTE_FACTORIO/payload.tar"
+"$ADB" shell "cd $REMOTE_FACTORIO && tar -xf payload.tar && rm -f payload.tar && chmod 755 bin/arm64/factorio && mkdir -p mods"
+
+# 4. Runtime de glibc
+echo "[4/6] Preparando el runtime de glibc..."
+if [ ! -f "$PROJECT_ROOT/build/glibc.tar.gz" ]; then
+    bash "$PROJECT_ROOT/scripts/prepare_glibc.sh"
 fi
 
-# 4. Iniciar la aplicación
-echo "[3/3] Iniciando XFactorVR Tabletop en la Pico 4 Ultra..."
+if [ -f "$PROJECT_ROOT/build/glibc.tar.gz" ]; then
+    "$ADB" shell "mkdir -p $REMOTE_GLIBC"
+    "$ADB" push "$PROJECT_ROOT/build/glibc.tar.gz" "$REMOTE_GLIBC/glibc.tar.gz"
+    "$ADB" shell "cd $REMOTE_GLIBC && tar -xzf glibc.tar.gz && rm -f glibc.tar.gz && chmod 755 lib/ld-linux-aarch64.so.1"
+    echo "    linker: $REMOTE_GLIBC/lib/ld-linux-aarch64.so.1"
+else
+    echo "    AVISO: sin runtime de glibc. Si el visor tiene Termux con"
+    echo "    'pkg install glibc' el motor usara ese linker automaticamente."
+fi
+
+# 5. Mod puente
+# El nombre de la carpeta DEBE coincidir con <nombre>_<version> de info.json
+# o Factorio no carga el mod y el puente RCON no existe.
+echo "[5/6] Instalando el mod puente $MOD_ID..."
+"$ADB" shell "mkdir -p $REMOTE_FACTORIO/mods/$MOD_ID"
+"$ADB" push "$LOCAL_MOD/control.lua" "$REMOTE_FACTORIO/mods/$MOD_ID/control.lua"
+"$ADB" push "$LOCAL_MOD/info.json" "$REMOTE_FACTORIO/mods/$MOD_ID/info.json"
+"$ADB" shell "chmod 644 $REMOTE_FACTORIO/mods/$MOD_ID/control.lua $REMOTE_FACTORIO/mods/$MOD_ID/info.json"
+
+# 6. Script de arranque standalone
+echo "[6/6] Subiendo el script de arranque standalone..."
+"$ADB" push "$PROJECT_ROOT/scripts/start_factorio_standalone.sh" "$REMOTE_SCRIPT"
+"$ADB" shell "chmod 755 $REMOTE_SCRIPT"
+
+# 7. Arrancar el servidor Factorio
+if [ "$START_SERVER" -eq 1 ]; then
+    echo "Arrancando el servidor Factorio headless..."
+    if "$ADB" shell "sh $REMOTE_SCRIPT" 2>&1 | tee /tmp/xfactorvr_standalone.log; then
+        echo "Servidor Factorio en marcha."
+    else
+        echo "AVISO: el servidor no arranco. Revisa /tmp/xfactorvr_standalone.log"
+        echo "       y el registro en el visor: /data/local/tmp/factorio_arm64/logs/standalone.log"
+    fi
+fi
+
+# 8. Iniciar la aplicación
+echo "Iniciando XFactorVR Tabletop en la Pico 4 Ultra..."
 "$ADB" shell am start -n "$PACKAGE/android.app.NativeActivity"
 
 echo "=== Despliegue completado con éxito ==="
-if [ "${1:-}" = "--stream" ]; then
+echo "El visor ya tiene el motor real: la mesa OpenXR muestra Factorio 2.0 en vivo."
+if [ "$STREAM" -eq 1 ]; then
     echo "Monitoreando logs en tiempo real (Ctrl+C para salir):"
     "$ADB" logcat -s XFactorVR_Launcher:V libxfactorvr:V
 else

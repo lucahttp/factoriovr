@@ -19,6 +19,7 @@
 #include <cmath>
 #include <cstring>
 #include <algorithm>
+#include <chrono>
 #include <dlfcn.h>
 #include <aaudio/AAudio.h>
 
@@ -470,6 +471,17 @@ static int s_active_ui_tab = 0;
 static int s_hovered_ui_btn = -1;
 static int s_hovered_recipe = -1;
 
+// Recetas disponibles en la pestaña Fabricar.
+#define CRAFT_RECIPE_COUNT 7
+
+// Extensiones OpenXR negociadas con el runtime PICO 3.0.0.
+// Se consultan con xrEnumerateInstanceExtensionProperties y solo se habilitan
+// las realmente soportadas: activar una extensión ausente aborta xrCreateInstance.
+static bool s_has_fb_passthrough   = false; // XR_FB_passthrough
+static bool s_has_bd_controller    = false; // XR_BD_controller_interaction
+static bool s_has_ext_perf         = false; // XR_EXT_performance_settings
+static bool s_has_fb_refresh       = false; // XR_FB_display_refresh_rate
+
 // Texturas Factorio procedurales
 static GLuint s_tex_concrete = 0;
 static GLuint s_tex_hazard   = 0;
@@ -489,16 +501,19 @@ struct LiveEntity {
     uint32_t status;
     float animation_progress;
     float health_ratio;
+    float arm_angle;   // angulo del brazo en radianes (solo insertadores)
 };
 
+// Tabla de tipos de entidad. Debe coincidir con src/tabletop.rs y con el mod
+// puente mods/xfactorvr_bridge/control.lua.
 enum EntityType {
     ENTITY_NONE = 0,
     ENTITY_ASSEMBLING_MACHINE = 1,
     ENTITY_MINING_DRILL = 2,
     ENTITY_FURNACE = 3,
-    ENTITY_RADAR = 4,
-    ENTITY_ROBOPORT = 5,
-    ENTITY_GUN_TURRET = 6,
+    ENTITY_GUN_TURRET = 4,
+    ENTITY_RADAR = 5,
+    ENTITY_ROBOPORT = 6,
     ENTITY_CHEST = 7,
     ENTITY_ELECTRIC_POLE = 8,
     ENTITY_TRANSPORT_BELT = 9,
@@ -537,6 +552,11 @@ typedef uint32_t (*pfn_xfactorvr_manual_mine)(float tile_x, float tile_y);
 typedef uint32_t (*pfn_xfactorvr_interact_machine)(float tile_x, float tile_y);
 typedef bool (*pfn_xfactorvr_reset_world)(bool fresh_start);
 typedef bool (*pfn_xfactorvr_get_machine_info)(float tile_x, float tile_y, float* out_fuel, float* out_progress, uint32_t* out_input_ore, uint32_t* out_output_plates);
+typedef bool (*pfn_xfactorvr_get_carried_item)(float tile_x, float tile_y, uint32_t* out_item_id, uint32_t* out_count);
+// El lado Rust devuelve bool en estos dos: el valor de retorno debe coincidir
+// o el ABI queda desalineado entre la libreria y el engine.
+typedef bool (*pfn_xfactorvr_pan_view)(float delta_x, float delta_y);
+typedef bool (*pfn_xfactorvr_get_view_center)(float* out_x, float* out_y);
 
 static pfn_xfactorvr_load_glb s_load_glb = nullptr;
 static pfn_xfactorvr_free_glb s_free_glb = nullptr;
@@ -553,6 +573,9 @@ static pfn_xfactorvr_manual_mine s_manual_mine = nullptr;
 static pfn_xfactorvr_interact_machine s_interact_machine = nullptr;
 static pfn_xfactorvr_reset_world s_reset_world = nullptr;
 static pfn_xfactorvr_get_machine_info s_get_machine_info = nullptr;
+static pfn_xfactorvr_get_carried_item s_get_carried_item = nullptr;
+static pfn_xfactorvr_pan_view s_pan_view = nullptr;
+static pfn_xfactorvr_get_view_center s_get_view_center = nullptr;
 
 // Estado de Minado Manual con Pico (mantener Trigger en vetas de mineral)
 static float s_manual_mining_timer = 0.0f;
@@ -628,6 +651,48 @@ static int s_selected_build_tool = ENTITY_ASSEMBLING_MACHINE;
 static float s_placement_yaw = 0.0f;
 static int s_hovered_quickbar_slot = -1;
 static bool s_stick_rotated = false;
+
+// Construcción por arrastre continuo (drag-to-build).
+// Mantener el gatillo y mover el puntero tiende lineas de cintas o postes sin
+// tener que hacer clic casilla por casilla.
+static int s_last_drag_tile_x = 9999;
+static int s_last_drag_tile_y = 9999;
+
+// Herramientas que se extienden arrastrando (cintas, postes y muros).
+static bool is_drag_build_tool(int type) {
+    return type == ENTITY_TRANSPORT_BELT || type == ENTITY_ELECTRIC_POLE;
+}
+
+// Desplazamiento de la ventana de mapa, en casillas.
+// Permite explorar la fabrica mas alla del area inicial requestada al servidor.
+static float s_view_pan_x = 0.0f;
+static float s_view_pan_y = 0.0f;
+
+// Color de cada item (ids de src/game_bridge.rs) para las piezas que viajan
+// por las cintas y los insertadores.
+static void item_color(uint32_t item_id, float& r, float& g, float& b) {
+    switch (item_id) {
+        case 1:  r = 0.45f; g = 0.38f; b = 0.32f; break; // mineral de hierro
+        case 2:  r = 0.58f; g = 0.38f; b = 0.24f; break; // mineral de cobre
+        case 3:  r = 0.14f; g = 0.14f; b = 0.16f; break; // carbon
+        case 4:  r = 0.55f; g = 0.53f; b = 0.50f; break; // piedra
+        case 5:  r = 0.74f; g = 0.77f; b = 0.80f; break; // plancha de hierro
+        case 6:  r = 0.86f; g = 0.50f; b = 0.28f; break; // plancha de cobre
+        case 7:  r = 0.60f; g = 0.62f; b = 0.66f; break; // engranaje
+        case 8:  r = 0.20f; g = 0.85f; b = 0.32f; break; // circuito electronico
+        case 9:  r = 0.25f; g = 0.45f; b = 0.62f; break; // ensambladora
+        case 10: r = 0.18f; g = 0.55f; b = 0.50f; break; // perforadora
+        case 11: r = 0.50f; g = 0.40f; b = 0.32f; break; // horno
+        case 12: r = 0.92f; g = 0.80f; b = 0.18f; break; // cinta
+        case 13: r = 0.96f; g = 0.72f; b = 0.12f; break; // insertador
+        case 14: r = 0.45f; g = 0.35f; b = 0.22f; break; // poste
+        case 15: r = 0.40f; g = 0.42f; b = 0.46f; break; // torreta
+        case 16: r = 0.72f; g = 0.74f; b = 0.78f; break; // radar
+        case 17: r = 0.60f; g = 0.65f; b = 0.72f; break; // robopuerto
+        case 18: r = 0.55f; g = 0.38f; b = 0.22f; break; // cofre
+        default: r = 0.85f; g = 0.85f; b = 0.85f; break;
+    }
+}
 
 // Partículas de humo, vapor, polvo y chispas (Fase 3)
 struct Particle {
@@ -957,6 +1022,9 @@ static void init_glb_loader() {
     s_interact_machine = (pfn_xfactorvr_interact_machine)dlsym(handle, "xfactorvr_interact_machine");
     s_reset_world = (pfn_xfactorvr_reset_world)dlsym(handle, "xfactorvr_reset_world");
     s_get_machine_info = (pfn_xfactorvr_get_machine_info)dlsym(handle, "xfactorvr_get_machine_info");
+    s_get_carried_item = (pfn_xfactorvr_get_carried_item)dlsym(handle, "xfactorvr_get_carried_item");
+    s_pan_view = (pfn_xfactorvr_pan_view)dlsym(handle, "xfactorvr_pan_view");
+    s_get_view_center = (pfn_xfactorvr_get_view_center)dlsym(handle, "xfactorvr_get_view_center");
 
     if (!s_load_glb || !s_get_live_entities) {
         void* mod_handle = dlopen("libxfactorvr.so", RTLD_NOW | RTLD_GLOBAL);
@@ -976,10 +1044,21 @@ static void init_glb_loader() {
             s_interact_machine = (pfn_xfactorvr_interact_machine)dlsym(mod_handle, "xfactorvr_interact_machine");
             s_reset_world = (pfn_xfactorvr_reset_world)dlsym(mod_handle, "xfactorvr_reset_world");
             s_get_machine_info = (pfn_xfactorvr_get_machine_info)dlsym(mod_handle, "xfactorvr_get_machine_info");
+            s_get_carried_item = (pfn_xfactorvr_get_carried_item)dlsym(mod_handle, "xfactorvr_get_carried_item");
+            s_pan_view = (pfn_xfactorvr_pan_view)dlsym(mod_handle, "xfactorvr_pan_view");
+            s_get_view_center = (pfn_xfactorvr_get_view_center)dlsym(mod_handle, "xfactorvr_get_view_center");
         }
     }
     LOGI("openxr_engine: Cargador GLB y FFI Factorio enlazados (load=%p, get=%p, inv=%p, patches=%p, mine=%p, interact=%p)",
          s_load_glb, s_get_live_entities, s_get_player_inventory, s_get_resource_patches, s_manual_mine, s_interact_machine);
+
+    // Conectar con el motor real de Factorio. Sin esta llamada el puente RCON
+    // queda como codigo muerto y la mesa solo muestra la simulacion local.
+    // El servidor headless corre dentro del propio visor en 127.0.0.1:27015.
+    if (s_connect_rcon) {
+        bool linked = s_connect_rcon("127.0.0.1", 27015, "xfactorvr");
+        LOGI("openxr_engine: Conexion RCON con Factorio %s", linked ? "ESTABLECIDA" : "fallida (se reintentara)");
+    }
 
     // Restaurar layout persistente si existe
     load_tabletop_layout();
@@ -1334,8 +1413,8 @@ static void draw_tabletop_scene(const float* vp_mat,
         const ModelMesh& mesh = s_entity_meshes[ent.entity_type];
         if (mesh.vao == 0 || mesh.vertex_count == 0) continue;
 
-        float mx = ent.tile_x * 0.04f;
-        float mz = ent.tile_y * 0.04f;
+        float mx = (ent.tile_x - s_view_pan_x) * 0.04f;
+        float mz = (ent.tile_y - s_view_pan_y) * 0.04f;
 
         float ent_trans[16], ent_rot[16], ent_local[16], ent_world[16], ent_mvp[16];
         mat4_rotate_y(ent_rot, ent.orientation);
@@ -1427,8 +1506,8 @@ static void draw_tabletop_scene(const float* vp_mat,
     if (s_get_resource_patches && s_get_resource_patches(resource_patches, 16, &patch_count)) {
         for (uint32_t p = 0; p < patch_count; ++p) {
             const ResourcePatchFfi& patch = resource_patches[p];
-            float px = patch.tile_x * 0.04f;
-            float pz = patch.tile_y * 0.04f;
+            float px = (patch.tile_x - s_view_pan_x) * 0.04f;
+            float pz = (patch.tile_y - s_view_pan_y) * 0.04f;
             float pr = patch.radius * 0.04f;
 
             float col_r = 0.5f, col_g = 0.5f, col_b = 0.5f;
@@ -1458,10 +1537,10 @@ static void draw_tabletop_scene(const float* vp_mat,
             float dy = electric_poles[p1].tile_y - electric_poles[p2].tile_y;
             float dist = sqrtf(dx * dx + dy * dy);
             if (dist < 10.0f) { // Alcance de conexión del poste mediano (10 tiles = 0.40m)
-                float x0 = electric_poles[p1].tile_x * 0.04f;
-                float z0 = electric_poles[p1].tile_y * 0.04f;
-                float x1 = electric_poles[p2].tile_x * 0.04f;
-                float z1 = electric_poles[p2].tile_y * 0.04f;
+                float x0 = (electric_poles[p1].tile_x - s_view_pan_x) * 0.04f;
+                float z0 = (electric_poles[p1].tile_y - s_view_pan_y) * 0.04f;
+                float x1 = (electric_poles[p2].tile_x - s_view_pan_x) * 0.04f;
+                float z1 = (electric_poles[p2].tile_y - s_view_pan_y) * 0.04f;
                 add_catenary_cable(dyn_verts, x0, 0.22f, z0, x1, 0.22f, z1, 0.035f, 8, 0.20f, 0.22f, 0.24f, 1.0f);
             }
         }
@@ -1470,8 +1549,8 @@ static void draw_tabletop_scene(const float* vp_mat,
     // 2. Piezas móviles animadas ancladas a entidades vivas activas
     for (int i = 0; i < entity_count; ++i) {
         const LiveEntity& ent = live_entities[i];
-        float mx = ent.tile_x * 0.04f;
-        float mz = ent.tile_y * 0.04f;
+        float mx = (ent.tile_x - s_view_pan_x) * 0.04f;
+        float mz = (ent.tile_y - s_view_pan_y) * 0.04f;
 
         if (ent.entity_type == ENTITY_RADAR) {
             // Antena parabólica giratoria continua 360°
@@ -1515,6 +1594,42 @@ static void draw_tabletop_scene(const float* vp_mat,
             // Baliza titilante en chimenea
             float beacon_g = 0.58f + sinf(anim_time * 5.0f) * 0.38f;
             add_cylinder_textured(dyn_verts, mx + 0.065f, 0.12f, mz + 0.065f, 0.008f, 0.016f, 1.0f, beacon_g, 0.1f, 1.0f, 6);
+        } else if (ent.entity_type == ENTITY_TRANSPORT_BELT || ent.entity_type == ENTITY_INSERTER) {
+            // Piezas que circulan por la fabrica: se dibujan traveling sobre la
+            // cinta o en la punta del brazo del insertador, para que se vea
+            // como avanza el material en tiempo real.
+            uint32_t carried_id = 0, carried_count = 0;
+            bool has_carried = s_get_carried_item &&
+                s_get_carried_item(ent.tile_x, ent.tile_y, &carried_id, &carried_count) &&
+                carried_count > 0;
+
+            if (has_carried) {
+                float ir = 0.85f, ig = 0.85f, ib = 0.85f;
+                item_color(carried_id, ir, ig, ib);
+
+                float item_x = mx, item_z = mz, item_y = 0.022f;
+
+                if (ent.entity_type == ENTITY_TRANSPORT_BELT) {
+                    // La pieza avanza a lo largo de la cinta segun su direccion.
+                    float bdx = sinf(ent.orientation);
+                    float bdz = -cosf(ent.orientation);
+                    float travel = (ent.animation_progress - 0.5f) * 0.04f;
+                    item_x = mx + bdx * travel;
+                    item_z = mz + bdz * travel;
+                } else {
+                    // El insertador sostiene la pieza en la punta del brazo.
+                    // Con Factorio real se usa el angulo vivo del brazo.
+                    float arm_a = ent.arm_angle;
+                    if (arm_a == 0.0f) {
+                        arm_a = ent.orientation + sinf(anim_time * 2.2f) * 0.82f;
+                    }
+                    item_x = mx + sinf(arm_a) * 0.034f;
+                    item_z = mz - cosf(arm_a) * 0.034f;
+                    item_y = 0.030f;
+                }
+
+                add_box_textured(dyn_verts, item_x, item_y, item_z, 0.008f, 0.008f, 0.008f, 1.0f, 1.0f, ir, ig, ib, 1.0f);
+            }
         }
     }
 
@@ -1616,10 +1731,10 @@ static void draw_tabletop_scene(const float* vp_mat,
                 }
             }
         } else if (s_active_ui_tab == 2) {
-            // Pestaña 2: Fabricación / Crafteo de recetas (5 recetas auténticas)
-            float recipe_w = 0.100f, recipe_h = 0.046f;
-            for (int r = 0; r < 5; ++r) {
-                float rx_btn = (float)(r - 2) * (recipe_w + 0.012f);
+            // Pestaña 2: Fabricación / Crafteo de recetas (7 recetas auténticas)
+            float recipe_w = 0.088f, recipe_h = 0.046f;
+            for (int r = 0; r < CRAFT_RECIPE_COUNT; ++r) {
+                float rx_btn = (float)(r - (CRAFT_RECIPE_COUNT - 1) / 2) * (recipe_w + 0.008f);
                 float ry_btn = ui_y - 0.055f;
 
                 float rr = 0.2f, rg = 0.5f, rb = 0.7f;
@@ -1629,6 +1744,8 @@ static void draw_tabletop_scene(const float* vp_mat,
                     case 2: rr = 0.20f; rg = 0.88f; rb = 0.35f; break; // Circuito Verde (1 Hierro + 3 Cobre)
                     case 3: rr = 0.92f; rg = 0.82f; rb = 0.15f; break; // Cinta Transportadora (1 Hierro + 1 Engranaje)
                     case 4: rr = 0.18f; rg = 0.62f; rb = 0.58f; break; // Minera Eléctrica/Vapor (9 Hierro + 5 Engr + 5 Piedra)
+                    case 5: rr = 0.96f; rg = 0.72f; rb = 0.12f; break; // Insertador Robótico (1 Hierro + 1 Engr + 1 Circuito)
+                    case 6: rr = 0.25f; rg = 0.45f; rb = 0.62f; break; // Ensambladora (9 Hierro + 5 Engr + 3 Circuitos)
                 }
                 add_box_textured(dyn_verts, rx_btn, ry_btn, ui_z + 0.005f, recipe_w, recipe_h, 0.002f, 1.0f, 1.0f, rr * 0.85f, rg * 0.85f, rb * 0.85f, 0.95f);
                 if (s_hovered_recipe == r) {
@@ -1727,11 +1844,11 @@ static void draw_tabletop_scene(const float* vp_mat,
                 // Ranuras de Quickbar o Recetas de Crafteo (rel_y <= 0.0)
                 else if (rel_y <= 0.0f && rel_y >= -0.10f) {
                     if (s_active_ui_tab == 2) {
-                        // Modo Crafteo: 5 botones de recetas
-                        float recipe_w = 0.100f;
+                        // Modo Crafteo: 7 botones de recetas
+                        float recipe_w = 0.088f;
                         s_hovered_recipe = -1;
-                        for (int r = 0; r < 5; ++r) {
-                            float rx_btn = (float)(r - 2) * (recipe_w + 0.012f);
+                        for (int r = 0; r < CRAFT_RECIPE_COUNT; ++r) {
+                            float rx_btn = (float)(r - (CRAFT_RECIPE_COUNT - 1) / 2) * (recipe_w + 0.008f);
                             if (fabsf(rel_x - rx_btn) < recipe_w * 0.5f && fabsf(rel_y - (-0.055f)) < 0.025f) {
                                 s_hovered_recipe = r;
                                 break;
@@ -1739,7 +1856,9 @@ static void draw_tabletop_scene(const float* vp_mat,
                         }
 
                         if (is_primary_eye && trigger_clicked && s_hovered_recipe >= 0) {
-                            const uint32_t recipe_item_ids[5] = { 11, 7, 8, 12, 10 }; // Horno (11), Engranaje (7), Circuito (8), Cinta (12), Minera (10)
+                            // Horno(11), Engranaje(7), Circuito(8), Cinta(12), Minera(10),
+                            // Insertador(13), Ensambladora(9)
+                            const uint32_t recipe_item_ids[CRAFT_RECIPE_COUNT] = { 11, 7, 8, 12, 10, 13, 9 };
                             if (s_craft_item) {
                                 bool crafted = s_craft_item(recipe_item_ids[s_hovered_recipe], 1);
                                 if (crafted) {
@@ -1788,10 +1907,13 @@ static void draw_tabletop_scene(const float* vp_mat,
 
         // 3. Rejilla Magnética (Grid Snapping) y Ghost Preview 6DoF sobre la mesa (Fase 2)
         if (has_table_hit && !has_ui_hit) {
-            float hover_tile_x = roundf(loc_x / 0.04f);
-            float hover_tile_y = roundf(loc_z / 0.04f);
-            hover_tile_x = std::clamp(hover_tile_x, -14.0f, 14.0f);
-            hover_tile_y = std::clamp(hover_tile_y, -9.0f, 9.0f);
+            float hover_tile_x = roundf(loc_x / 0.04f) + s_view_pan_x;
+            float hover_tile_y = roundf(loc_z / 0.04f) + s_view_pan_y;
+            // El limite es relativo al centro de la vista: con el clamp absoluto
+            // la ventana quedaba anclada al area inicial y era imposible explorar
+            // la fabrica mas alla de las casillas de arranque.
+            hover_tile_x = std::clamp(hover_tile_x, s_view_pan_x - 14.0f, s_view_pan_x + 14.0f);
+            hover_tile_y = std::clamp(hover_tile_y, s_view_pan_y - 9.0f, s_view_pan_y + 9.0f);
 
             bool is_occupied = false;
             for (int i = 0; i < entity_count; ++i) {
@@ -1817,8 +1939,8 @@ static void draw_tabletop_scene(const float* vp_mat,
             }
 
             // Cuadrado de la celda de rejilla magnética 4cm x 4cm
-            float snap_mx = hover_tile_x * 0.04f;
-            float snap_mz = hover_tile_y * 0.04f;
+            float snap_mx = (hover_tile_x - s_view_pan_x) * 0.04f;
+            float snap_mz = (hover_tile_y - s_view_pan_y) * 0.04f;
             float g_r = 0.20f, g_g = 0.95f, g_b = 0.35f;
 
             float m_fuel = 0.0f, m_prog = 0.0f;
@@ -1925,6 +2047,12 @@ static void draw_tabletop_scene(const float* vp_mat,
 
             // ACCIONES DE CONSTRUCCIÓN, INTERACCIÓN Y MINADO (Fase 2)
             if (is_primary_eye) {
+                // Al soltar el gatillo se cancela el arrastre en curso.
+                if (!trigger_held) {
+                    s_last_drag_tile_x = 9999;
+                    s_last_drag_tile_y = 9999;
+                }
+
                 // 1. Colocar edificio con gatillo sobre casilla vacía
                 if (trigger_clicked && s_selected_build_tool != ENTITY_NONE && !is_occupied) {
                     if (s_place_or_update_entity) {
@@ -1937,6 +2065,28 @@ static void draw_tabletop_scene(const float* vp_mat,
                             spawn_particle(snap_mx, 0.05f, snap_mz,
                                            ((rand() % 100) - 50) * 0.001f, 0.04f + (rand() % 50) * 0.0005f, ((rand() % 100) - 50) * 0.001f,
                                            0.20f, 0.95f, 0.40f, 0.95f, 0.010f, 0.8f);
+                        }
+                    }
+                    // El primer clic del arrastre marca el origen de la linea.
+                    s_last_drag_tile_x = (int)hover_tile_x;
+                    s_last_drag_tile_y = (int)hover_tile_y;
+                }
+                // 1.b Arrastre continuo: mantener el gatillo y mover el puntero
+                //     tiende lineas de cintas transportadoras (o postes) de una
+                //     sola vez, como se hace en Factorio con el raton.
+                else if (trigger_held && s_selected_build_tool != ENTITY_NONE && !is_occupied &&
+                         is_drag_build_tool(s_selected_build_tool)) {
+                    int drag_tx = (int)hover_tile_x;
+                    int drag_ty = (int)hover_tile_y;
+                    if (drag_tx != s_last_drag_tile_x || drag_ty != s_last_drag_tile_y) {
+                        s_last_drag_tile_x = drag_tx;
+                        s_last_drag_tile_y = drag_ty;
+                        if (s_place_or_update_entity) {
+                            s_place_or_update_entity(s_selected_build_tool,
+                                                     (float)drag_tx, (float)drag_ty, s_placement_yaw);
+                            LOGI("Arrastre: tipo=%d en tile (%d, %d)", s_selected_build_tool, drag_tx, drag_ty);
+                            // Feedback háptico suave: confirma la casilla sin distraer.
+                            trigger_controller_haptics(session, haptic_action, 0.35f, 15.0f);
                         }
                     }
                 }
@@ -2091,10 +2241,58 @@ static void* openxr_thread_main(void* arg) {
     }
 
     // 2. Crear Instancia OpenXR
-    const char* const enabledExtensions[] = {
+    // 2.1 Negocio de extensiones: el runtime PICO 3.0.0 no soporta necesariamente
+    //     todas las extensiones deseadas. Habilitar una extensión ausente hace
+    //     fallar xrCreateInstance, así que se consultan primero y se filtran.
+    uint32_t extCount = 0;
+    xrEnumerateInstanceExtensionProperties(nullptr, 0, &extCount, nullptr);
+    std::vector<XrExtensionProperties> available(extCount, { .type = XR_TYPE_EXTENSION_PROPERTIES });
+    if (extCount > 0) {
+        xrEnumerateInstanceExtensionProperties(nullptr, extCount, &extCount, available.data());
+    }
+
+    auto is_supported = [&](const char* name) {
+        for (const auto& ext : available) {
+            if (strcmp(ext.extensionName, name) == 0) return true;
+        }
+        return false;
+    };
+
+    // Extensiones requeridas (si el runtime no ofrece las de OpenGL ES, no hay motor).
+    const char* const requiredExtensions[] = {
         "XR_KHR_android_create_instance",
         "XR_KHR_opengl_es_enable",
     };
+    // Extensiones opcionales de PICO (passthrough, mando, rendimiento).
+    const char* const optionalExtensions[] = {
+        "XR_FB_passthrough",
+        "XR_BD_controller_interaction",
+        "XR_EXT_performance_settings",
+        "XR_FB_display_refresh_rate",
+    };
+
+    std::vector<const char*> enabledExtensions;
+    for (const char* name : requiredExtensions) {
+        if (!is_supported(name)) {
+            LOGE("Extensión OpenXR obligatoria ausente: %s", name);
+            return nullptr;
+        }
+        enabledExtensions.push_back(name);
+    }
+
+    s_has_fb_passthrough = is_supported("XR_FB_passthrough");
+    s_has_bd_controller  = is_supported("XR_BD_controller_interaction");
+    s_has_ext_perf       = is_supported("XR_EXT_performance_settings");
+    s_has_fb_refresh     = is_supported("XR_FB_display_refresh_rate");
+
+    for (const char* name : optionalExtensions) {
+        if (is_supported(name)) {
+            enabledExtensions.push_back(name);
+            LOGI("Extensión OpenXR habilitada: %s", name);
+        } else {
+            LOGI("Extensión OpenXR no soportada por el runtime (omitida): %s", name);
+        }
+    }
 
     XrInstanceCreateInfoAndroidKHR instanceAndroid = {
         .type = XR_TYPE_INSTANCE_CREATE_INFO_ANDROID_KHR,
@@ -2114,8 +2312,8 @@ static void* openxr_thread_main(void* arg) {
             .engineVersion = 1,
             .apiVersion = XR_CURRENT_API_VERSION,
         },
-        .enabledExtensionCount = 2,
-        .enabledExtensionNames = enabledExtensions,
+        .enabledExtensionCount = (uint32_t)enabledExtensions.size(),
+        .enabledExtensionNames = enabledExtensions.data(),
     };
 
     XrInstance instance = XR_NULL_HANDLE;
@@ -2200,6 +2398,33 @@ static void* openxr_thread_main(void* arg) {
     }
     LOGI("XrSession creada exitosamente");
 
+    // 6.1 Capa de Passthrough (XR_FB_passthrough)
+    // La capa de passthrough debe ir PRIMERA en el arreglo de capas de xrEndFrame:
+    // el runtime la usa como fondo y la capa de proyección se compone encima.
+    XrPassthroughLayerFB passthroughLayer = XR_NULL_HANDLE;
+    if (s_has_fb_passthrough) {
+        PFN_xrCreatePassthroughLayerFB xrCreatePassthroughLayerFB = nullptr;
+        xrGetInstanceProcAddr(instance, "xrCreatePassthroughLayerFB",
+                              (PFN_xrVoidFunction*)&xrCreatePassthroughLayerFB);
+        if (xrCreatePassthroughLayerFB) {
+            XrPassthroughLayerCreateInfoFB ptInfo = {
+                .type = XR_TYPE_PASSTHROUGH_LAYER_CREATE_INFO_FB,
+                .next = nullptr,
+                // IS_RUNNING_AT_CREATION: la capa arranca activa para no parpadear
+                // durante los primeros frames mientras compone la mesa.
+                .flags = XR_PASSTHROUGH_IS_RUNNING_AT_CREATION_BIT_FB,
+                .purpose = XR_PASSTHROUGH_LAYER_PURPOSE_RECONSTRUCTION_FB,
+            };
+            res = xrCreatePassthroughLayerFB(session, &ptInfo, &passthroughLayer);
+            if (XR_SUCCEEDED(res)) {
+                LOGI("Capa de Passthrough (XR_FB_passthrough) creada");
+            } else {
+                passthroughLayer = XR_NULL_HANDLE;
+                LOGI("No se pudo crear la capa de Passthrough (res=%d); se usará ALPHA_BLEND", res);
+            }
+        }
+    }
+
     // 7. Crear espacio de referencia STAGE (Fijo al suelo de la habitación)
     XrReferenceSpaceCreateInfo spaceInfo = {
         .type = XR_TYPE_REFERENCE_SPACE_CREATE_INFO,
@@ -2270,6 +2495,14 @@ static void* openxr_thread_main(void* arg) {
     XrAction rightStickAction = XR_NULL_HANDLE;
     xrCreateAction(actionSet, &stickInfo, &rightStickAction);
 
+    // Stick izquierdo: desplazamiento del mapa (pan de vista). El stick derecho
+    // ya esta ocupado por la altura de la mesa y el giro de la herramienta de
+    // colocacion, asi que el pan necesita su propio stick para no pelearse.
+    strncpy(stickInfo.actionName, "left_stick", XR_MAX_ACTION_NAME_SIZE);
+    strncpy(stickInfo.localizedActionName, "Left Stick", XR_MAX_LOCALIZED_ACTION_NAME_SIZE);
+    XrAction leftStickAction = XR_NULL_HANDLE;
+    xrCreateAction(actionSet, &stickInfo, &leftStickAction);
+
     // Haptics (Vibración háptica táctil)
     XrActionCreateInfo hapticInfo = { .type = XR_TYPE_ACTION_CREATE_INFO, .actionType = XR_ACTION_TYPE_VIBRATION_OUTPUT };
     strncpy(hapticInfo.actionName, "right_haptic", XR_MAX_ACTION_NAME_SIZE);
@@ -2279,9 +2512,12 @@ static void* openxr_thread_main(void* arg) {
 
     // Bindings de interacción
     XrPath simpleProfile = XR_NULL_PATH, oculusProfile = XR_NULL_PATH, picoProfile = XR_NULL_PATH;
+    XrPath pico4sProfile = XR_NULL_PATH;
     xrStringToPath(instance, "/interaction_profiles/khr/simple_controller", &simpleProfile);
     xrStringToPath(instance, "/interaction_profiles/oculus/touch_controller", &oculusProfile);
     xrStringToPath(instance, "/interaction_profiles/bytedance/pico4_controller", &picoProfile);
+    // Pico 4 Ultra (controlador "Hawk"): perfil propio, distinto del Pico 4.
+    xrStringToPath(instance, "/interaction_profiles/bytedance/pico4s_controller", &pico4sProfile);
 
     XrPath rightAimPath = XR_NULL_PATH, rightTrigPath = XR_NULL_PATH, rightGripPath = XR_NULL_PATH, rightStickPath = XR_NULL_PATH;
     xrStringToPath(instance, "/user/hand/right/input/aim/pose", &rightAimPath);
@@ -2289,9 +2525,10 @@ static void* openxr_thread_main(void* arg) {
     xrStringToPath(instance, "/user/hand/right/input/squeeze/value", &rightGripPath);
     xrStringToPath(instance, "/user/hand/right/input/thumbstick", &rightStickPath);
 
-    XrPath leftAimPath = XR_NULL_PATH, leftGripPath = XR_NULL_PATH, rightHapticPath = XR_NULL_PATH;
+    XrPath leftAimPath = XR_NULL_PATH, leftGripPath = XR_NULL_PATH, leftStickPath = XR_NULL_PATH, rightHapticPath = XR_NULL_PATH;
     xrStringToPath(instance, "/user/hand/left/input/aim/pose", &leftAimPath);
     xrStringToPath(instance, "/user/hand/left/input/squeeze/value", &leftGripPath);
+    xrStringToPath(instance, "/user/hand/left/input/thumbstick", &leftStickPath);
     xrStringToPath(instance, "/user/hand/right/output/haptic", &rightHapticPath);
 
     XrPath simpleClickPath = XR_NULL_PATH;
@@ -2316,12 +2553,13 @@ static void* openxr_thread_main(void* arg) {
         { rightStickAction, rightStickPath },
         { leftAimAction, leftAimPath },
         { leftGripAction, leftGripPath },
+        { leftStickAction, leftStickPath },
         { rightHapticAction, rightHapticPath }
     };
     XrInteractionProfileSuggestedBinding touchSuggested = {
         .type = XR_TYPE_INTERACTION_PROFILE_SUGGESTED_BINDING,
         .interactionProfile = oculusProfile,
-        .countSuggestedBindings = 7,
+        .countSuggestedBindings = 8,
         .suggestedBindings = touchBindings,
     };
     xrSuggestInteractionProfileBindings(instance, &touchSuggested);
@@ -2329,10 +2567,27 @@ static void* openxr_thread_main(void* arg) {
     XrInteractionProfileSuggestedBinding picoSuggested = {
         .type = XR_TYPE_INTERACTION_PROFILE_SUGGESTED_BINDING,
         .interactionProfile = picoProfile,
-        .countSuggestedBindings = 7,
+        .countSuggestedBindings = 8,
         .suggestedBindings = touchBindings,
     };
     xrSuggestInteractionProfileBindings(instance, &picoSuggested);
+
+    // Perfil del mando de la Pico 4 Ultra (Hawk). Sin este binding el visor no
+    // entrega poses de puntero y el gameplay no responde al controlador.
+    if (pico4sProfile != XR_NULL_PATH) {
+        XrInteractionProfileSuggestedBinding pico4sSuggested = {
+            .type = XR_TYPE_INTERACTION_PROFILE_SUGGESTED_BINDING,
+            .interactionProfile = pico4sProfile,
+            .countSuggestedBindings = 8,
+            .suggestedBindings = touchBindings,
+        };
+        XrResult bindRes = xrSuggestInteractionProfileBindings(instance, &pico4sSuggested);
+        if (XR_SUCCEEDED(bindRes)) {
+            LOGI("Bindings del perfil Pico 4 Ultra (pico4s_controller) registrados");
+        } else {
+            LOGI("Perfil pico4s_controller no aceptado por el runtime (res=%d)", bindRes);
+        }
+    }
 
     XrSessionActionSetsAttachInfo attachInfo = {
         .type = XR_TYPE_SESSION_ACTION_SETS_ATTACH_INFO,
@@ -2428,6 +2683,10 @@ static void* openxr_thread_main(void* arg) {
     float anim_time = 0.0f;
     bool prev_trigger = false;
     bool prev_grip = false;
+    // Marca de tiempo del frame anterior: el delta real alimenta el pan de la
+    // vista y las velocidades dependientes del tiempo (cintas, insertadores).
+    auto last_frame_time = std::chrono::steady_clock::now();
+    float dt_seconds = 0.016f;
 
     while (s_running) {
         pump_android_input_queue();
@@ -2474,6 +2733,17 @@ static void* openxr_thread_main(void* arg) {
         XrFrameWaitInfo waitInfo = { .type = XR_TYPE_FRAME_WAIT_INFO };
         XrFrameState frameState = { .type = XR_TYPE_FRAME_STATE };
         xrWaitFrame(session, &waitInfo, &frameState);
+
+        // Delta real del frame. Se acota para que una pausa larga del runtime
+        // no dispare un salto de animacion ni un pan descontrolado.
+        {
+            auto now = std::chrono::steady_clock::now();
+            dt_seconds = std::chrono::duration<float>(now - last_frame_time).count();
+            last_frame_time = now;
+            if (!(dt_seconds > 0.0f) || dt_seconds > 0.25f) {
+                dt_seconds = 0.016f;
+            }
+        }
 
         XrFrameBeginInfo beginInfo = { .type = XR_TYPE_FRAME_BEGIN_INFO };
         xrBeginFrame(session, &beginInfo);
@@ -2575,6 +2845,36 @@ static void* openxr_thread_main(void* arg) {
         XrActionStateGetInfo getStick = { .type = XR_TYPE_ACTION_STATE_GET_INFO, .action = rightStickAction };
         xrGetActionStateVector2f(session, &getStick, &stickState);
 
+        // Desplazamiento de la ventana de mapa con el joystick izquierdo.
+        // Permite explorar la fabrica mas alla de las casillas iniciales.
+        // El stick derecho queda para la altura de la mesa y el giro de colocacion.
+        XrActionStateVector2f leftStickState = { .type = XR_TYPE_ACTION_STATE_VECTOR2F };
+        XrActionStateGetInfo getLeftStick = { .type = XR_TYPE_ACTION_STATE_GET_INFO, .action = leftStickAction };
+        xrGetActionStateVector2f(session, &getLeftStick, &leftStickState);
+
+        if (s_pan_view) {
+            const float deadzone = 0.18f;
+            float stick_len = sqrtf(leftStickState.currentState.x * leftStickState.currentState.x +
+                                    leftStickState.currentState.y * leftStickState.currentState.y);
+            if (stick_len > deadzone) {
+                // El desplazamiento se escala por el tiempo real del frame para
+                // que la velocidad de exploracion sea igual a 60 y 90 Hz.
+                float pan_speed = 9.0f * dt_seconds;
+                s_pan_view(leftStickState.currentState.x * pan_speed,
+                           leftStickState.currentState.y * pan_speed);
+            }
+        }
+
+        // El centro de vista vive en Rust (lo usa el radio del snapshot RCON).
+        // Se relee para que el render y la consulta al motor nunca divergan.
+        if (s_get_view_center) {
+            float cx = 0.0f, cy = 0.0f;
+            if (s_get_view_center(&cx, &cy)) {
+                s_view_pan_x = cx;
+                s_view_pan_y = cy;
+            }
+        }
+
         XrActionStateFloat leftGripState = { .type = XR_TYPE_ACTION_STATE_FLOAT };
         XrActionStateGetInfo getLeftGrip = { .type = XR_TYPE_ACTION_STATE_GET_INFO, .action = leftGripAction };
         xrGetActionStateFloat(session, &getLeftGrip, &leftGripState);
@@ -2654,7 +2954,7 @@ static void* openxr_thread_main(void* arg) {
             }
         }
 
-        anim_time += 0.016f;
+        anim_time += dt_seconds;
 
         std::vector<XrCompositionLayerProjectionView> projViews(viewCount, { .type = XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW });
 
@@ -2677,7 +2977,7 @@ static void* openxr_thread_main(void* arg) {
             mat4_view_from_pose(views[i].pose, viewMat);
             mat4_multiply(proj, viewMat, vp_mat);
 
-            draw_tabletop_scene(vp_mat, anim_time, 0.016f, rightAimLoc.pose, rightAimValid, trigger_clicked, (trigState.currentState > 0.5f), grip_clicked, (i == 0), session, rightHapticAction);
+            draw_tabletop_scene(vp_mat, anim_time, dt_seconds, rightAimLoc.pose, rightAimValid, trigger_clicked, (trigState.currentState > 0.5f), grip_clicked, (i == 0), session, rightHapticAction);
 
             XrSwapchainImageReleaseInfo relInfo = { .type = XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO };
             xrReleaseSwapchainImage(swapchains[i].handle, &relInfo);
@@ -2694,19 +2994,36 @@ static void* openxr_thread_main(void* arg) {
 
         XrCompositionLayerProjection layer = {
             .type = XR_TYPE_COMPOSITION_LAYER_PROJECTION,
-            .layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT,
+            .layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT
+                        | XR_COMPOSITION_LAYER_CORRECT_CHROMATIC_ABERRATION_BIT
+                        | XR_COMPOSITION_LAYER_UNPREMULTIPLIED_ALPHA_BIT,
             .space = appSpace,
             .viewCount = viewCount,
             .views = projViews.data(),
         };
-        const XrCompositionLayerBaseHeader* layers[] = { (XrCompositionLayerBaseHeader*)&layer };
+
+        // El fondo de la mesa se compone sobre el passthrough: la capa de
+        // passthrough va primero y la de proyección encima.
+        // ptLayer debe vivir hasta xrEndFrame: el arreglo guarda su dirección.
+        XrCompositionLayerPassthroughFB ptLayer = {
+            .type = XR_TYPE_COMPOSITION_LAYER_PASSTHROUGH_FB,
+            .next = nullptr,
+            .flags = 0,
+            .space = appSpace,
+            .layerHandle = passthroughLayer,
+        };
+        std::vector<XrCompositionLayerBaseHeader*> layers;
+        if (passthroughLayer != XR_NULL_HANDLE) {
+            layers.push_back((XrCompositionLayerBaseHeader*)&ptLayer);
+        }
+        layers.push_back((XrCompositionLayerBaseHeader*)&layer);
 
         XrFrameEndInfo endInfo = {
             .type = XR_TYPE_FRAME_END_INFO,
             .displayTime = frameState.predictedDisplayTime,
             .environmentBlendMode = chosenBlendMode,
-            .layerCount = 1u,
-            .layers = layers,
+            .layerCount = (uint32_t)layers.size(),
+            .layers = layers.data(),
         };
         xrEndFrame(session, &endInfo);
 

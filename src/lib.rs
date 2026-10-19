@@ -234,7 +234,10 @@ pub unsafe extern "C" fn xfactorvr_place_or_update_entity(
         }
     }
 
-    // Si hay conexión RCON con Factorio, emitir comando a la simulación nativa
+    // Si hay conexión RCON con Factorio, emitir comando a la simulación nativa.
+    // La orientación se envía en radianes: el mod la convierte a las 16
+    // direcciones de Factorio 2.0. Antes se enviaba fija en 0 y todo salía
+    // mirando al norte, que rompía las cadenas de cintas.
     if let Ok(mut rcon) = game_bridge::get_rcon_client().lock() {
         let name_str = match entity_type {
             tabletop::ENTITY_ASSEMBLING_MACHINE => "assembling-machine-1",
@@ -251,8 +254,8 @@ pub unsafe extern "C" fn xfactorvr_place_or_update_entity(
         };
         if !name_str.is_empty() {
             let cmd = format!(
-                "/c remote.call('xfactorvr', 'place_entity', '{}', {}, {}, 0)",
-                name_str, tile_x, tile_y
+                "/silent-command remote.call('xfactorvr', 'place_entity', '{}', {:.2}, {:.2}, {:.3})",
+                name_str, tile_x, tile_y, orientation
             );
             rcon.execute(&cmd);
         }
@@ -272,6 +275,7 @@ pub unsafe extern "C" fn xfactorvr_place_or_update_entity(
                 status: 1,
                 animation_progress: 0.0,
                 health_ratio: 1.0,
+                arm_angle: 0.0,
             });
         }
         true
@@ -318,11 +322,61 @@ pub unsafe extern "C" fn xfactorvr_mine_entity(
 /// Actualiza el ciclo de simulación y animaciones continuas de las entidades vivas
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn xfactorvr_update_simulation(delta_time: f32) {
+    // 1) Sondeo RCON. La E/S de red se hace FUERA de los locks del mundo y de
+    //    las entidades: el servidor puede tardar y el render de la mesa no
+    //    puede congelarse por eso.
+    let view_center = match game_bridge::get_simulation_world().read() {
+        Ok(w) => w.view_center,
+        Err(_) => (0.0, 0.0),
+    };
+    let poll = game_bridge::poll_rcon_sync(delta_time, view_center);
+
+    // 2) Aplicar el estado real y avanzar la simulación.
     let lock = get_live_entities_lock();
     if let Ok(mut entities) = lock.write() {
         if let Ok(mut world) = game_bridge::get_simulation_world().write() {
-            world.tick(&mut entities, delta_time);
+            world.is_connected_to_rcon = poll.connected;
+
+            if poll.connected {
+                if let Some(ref raw) = poll.snapshot {
+                    world.apply_snapshot(&mut entities, raw);
+                }
+                if let Some(ref raw) = poll.inventory {
+                    world.apply_inventory(raw);
+                }
+            } else {
+                // Sin motor real conectado: la simulación local lleva la partida.
+                world.tick(&mut entities, delta_time);
+            }
         }
+    }
+}
+
+/// Desplaza el centro de la vista sobre la mesa (pan de la ventana de mapa).
+/// Permite explorar la fabrica mas alla de las casillas iniciales.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn xfactorvr_pan_view(delta_x: f32, delta_y: f32) -> bool {
+    if let Ok(mut world) = game_bridge::get_simulation_world().write() {
+        world.view_center.0 += delta_x;
+        world.view_center.1 += delta_y;
+        true
+    } else {
+        false
+    }
+}
+
+/// Obtiene el centro actual de la vista en casillas.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn xfactorvr_get_view_center(out_x: *mut f32, out_y: *mut f32) -> bool {
+    if out_x.is_null() || out_y.is_null() {
+        return false;
+    }
+    if let Ok(world) = game_bridge::get_simulation_world().read() {
+        *out_x = world.view_center.0;
+        *out_y = world.view_center.1;
+        true
+    } else {
+        false
     }
 }
 
@@ -433,9 +487,71 @@ pub unsafe extern "C" fn xfactorvr_craft_item(
                     return true;
                 }
             }
+            // Insertador robótico: 1 plancha de hierro + 1 engranaje + 1 circuito
+            game_bridge::ITEM_INSERTER => {
+                let required_plates = count;
+                let required_gears = count;
+                let required_circuits = count;
+                let plates = *world.player_inventory.get(&game_bridge::ITEM_IRON_PLATE).unwrap_or(&0);
+                let gears = *world.player_inventory.get(&game_bridge::ITEM_IRON_GEAR).unwrap_or(&0);
+                let circuits = *world.player_inventory.get(&game_bridge::ITEM_ELECTRONIC_CIRCUIT).unwrap_or(&0);
+                if plates >= required_plates && gears >= required_gears && circuits >= required_circuits {
+                    *world.player_inventory.get_mut(&game_bridge::ITEM_IRON_PLATE).unwrap() -= required_plates;
+                    *world.player_inventory.get_mut(&game_bridge::ITEM_IRON_GEAR).unwrap() -= required_gears;
+                    *world.player_inventory.get_mut(&game_bridge::ITEM_ELECTRONIC_CIRCUIT).unwrap() -= required_circuits;
+                    let inserters = world.player_inventory.entry(game_bridge::ITEM_INSERTER).or_insert(0);
+                    *inserters += count;
+                    return true;
+                }
+            }
+            // Máquina de ensamblaje: 9 planchas + 5 engranajes + 3 circuitos
+            game_bridge::ITEM_ASSEMBLING_MACHINE => {
+                let required_plates = count * 9;
+                let required_gears = count * 5;
+                let required_circuits = count * 3;
+                let plates = *world.player_inventory.get(&game_bridge::ITEM_IRON_PLATE).unwrap_or(&0);
+                let gears = *world.player_inventory.get(&game_bridge::ITEM_IRON_GEAR).unwrap_or(&0);
+                let circuits = *world.player_inventory.get(&game_bridge::ITEM_ELECTRONIC_CIRCUIT).unwrap_or(&0);
+                if plates >= required_plates && gears >= required_gears && circuits >= required_circuits {
+                    *world.player_inventory.get_mut(&game_bridge::ITEM_IRON_PLATE).unwrap() -= required_plates;
+                    *world.player_inventory.get_mut(&game_bridge::ITEM_IRON_GEAR).unwrap() -= required_gears;
+                    *world.player_inventory.get_mut(&game_bridge::ITEM_ELECTRONIC_CIRCUIT).unwrap() -= required_circuits;
+                    let machines = world.player_inventory.entry(game_bridge::ITEM_ASSEMBLING_MACHINE).or_insert(0);
+                    *machines += count;
+                    return true;
+                }
+            }
             _ => {}
         }
     }
+
+    // Si el motor real de Factorio esta conectado, la fabricacion se pide al
+    // juego de verdad usando sus recetas oficiales.
+    if let Ok(world) = game_bridge::get_simulation_world().read() {
+        if world.is_connected_to_rcon {
+            let recipe_name = match item_id {
+                game_bridge::ITEM_FURNACE => "stone-furnace",
+                game_bridge::ITEM_IRON_GEAR => "iron-gear-wheel",
+                game_bridge::ITEM_ELECTRONIC_CIRCUIT => "electronic-circuit",
+                game_bridge::ITEM_TRANSPORT_BELT => "transport-belt",
+                game_bridge::ITEM_MINING_DRILL => "electric-mining-drill",
+                game_bridge::ITEM_INSERTER => "inserter",
+                game_bridge::ITEM_ASSEMBLING_MACHINE => "assembling-machine-1",
+                _ => "",
+            };
+            if !recipe_name.is_empty() {
+                let cmd = format!(
+                    "/silent-command remote.call('xfactorvr', 'craft', '{}', {})",
+                    recipe_name, count
+                );
+                if let Ok(mut rcon) = game_bridge::get_rcon_client().lock() {
+                    rcon.execute(&cmd);
+                }
+                return true;
+            }
+        }
+    }
+
     false
 }
 
@@ -460,12 +576,16 @@ pub unsafe extern "C" fn xfactorvr_interact_machine(tile_x: f32, tile_y: f32) ->
 }
 
 /// Reinicia el mundo de simulación al estado inicial auténtico
+/// `fresh_start = true` deja la mesa vacía; `false` restaura la fábrica inicial.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn xfactorvr_reset_world(fresh_start: bool) -> bool {
     let lock = get_live_entities_lock();
     if let Ok(mut entities) = lock.write() {
         if fresh_start {
             entities.clear();
+        } else {
+            entities.clear();
+            entities.extend(tabletop::init_default_factory_entities());
         }
     }
     if let Ok(mut world) = game_bridge::get_simulation_world().write() {
@@ -498,6 +618,30 @@ pub unsafe extern "C" fn xfactorvr_get_machine_info(
             return true;
         }
     }
+    false
+}
+
+/// Devuelve el item que viaja sobre una cinta o sostiene un insertador.
+/// Permite dibujar en la mesa las piezas que circulan por la fabrica.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn xfactorvr_get_carried_item(
+    tile_x: f32,
+    tile_y: f32,
+    out_item_id: *mut u32,
+    out_count: *mut u32,
+) -> bool {
+    if out_item_id.is_null() || out_count.is_null() {
+        return false;
+    }
+    if let Ok(world) = game_bridge::get_simulation_world().read() {
+        if let Some((id, count)) = world.get_carried_item(tile_x, tile_y) {
+            *out_item_id = id;
+            *out_count = count;
+            return true;
+        }
+    }
+    *out_item_id = 0;
+    *out_count = 0;
     false
 }
 
@@ -546,15 +690,28 @@ pub unsafe extern "C" fn xfactorvr_connect_rcon(
     let c_pwd = std::ffi::CStr::from_ptr(password).to_string_lossy();
     let addr = format!("{}:{}", c_host, port);
 
-    if let Ok(mut rcon) = game_bridge::get_rcon_client().lock() {
-        let success = rcon.connect(&addr, &c_pwd);
-        if let Ok(mut world) = game_bridge::get_simulation_world().write() {
-            world.is_connected_to_rcon = success;
-        }
-        success
-    } else {
-        false
+    // Guardar la configuracion para el sondeo automatico posterior.
+    if let Ok(mut cfg) = game_bridge::get_rcon_config().lock() {
+        cfg.host = c_host.to_string();
+        cfg.port = port;
+        cfg.password = c_pwd.to_string();
     }
+
+    // El lock del cliente RCON se libera ANTES de tomar el del mundo: el
+    // sondeo periodico toma mundo -> rcon, y al revés se produciria un
+    // interbloqueo clasico (ABBA).
+    let success = {
+        if let Ok(mut rcon) = game_bridge::get_rcon_client().lock() {
+            rcon.connect(&addr, &c_pwd)
+        } else {
+            false
+        }
+    };
+
+    if let Ok(mut world) = game_bridge::get_simulation_world().write() {
+        world.is_connected_to_rcon = success;
+    }
+    success
 }
 
 /// Consulta si el puente RCON con Factorio está activo
@@ -593,6 +750,7 @@ pub unsafe extern "C" fn xfactorvr_on_entity_draw(
                 status,
                 animation_progress: 0.0,
                 health_ratio: 1.0,
+                arm_angle: 0.0,
             });
         }
     }
@@ -610,6 +768,14 @@ mod tests {
     use super::*;
     use glam::Vec3;
 
+    /// Los tests comparten el estado global de la mesa (lista de entidades).
+    /// Este cerrojo serializa los que lo modifican para que no se pisen.
+    static TEST_STATE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn lock_test_state() -> std::sync::MutexGuard<'static, ()> {
+        TEST_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     #[test]
     fn test_tabletop_raycast() {
         let mgr = tabletop::TabletopManager::new(tabletop::TabletopConfig::default());
@@ -626,6 +792,9 @@ mod tests {
 
     #[test]
     fn test_live_entities_management() {
+        let _guard = lock_test_state();
+        // Restaurar la fabrica inicial para partir de un estado determinista.
+        unsafe { xfactorvr_reset_world(false) };
         let mut buffer = [tabletop::LiveEntity {
             entity_type: 0,
             tile_x: 0.0,
@@ -634,6 +803,7 @@ mod tests {
             status: 0,
             animation_progress: 0.0,
             health_ratio: 0.0,
+            arm_angle: 0.0,
         }; 64];
         let mut count = 0;
 
@@ -664,6 +834,7 @@ mod tests {
 
     #[test]
     fn test_simulation_progression_and_hook() {
+        let _guard = lock_test_state();
         let mut buffer = [tabletop::LiveEntity {
             entity_type: 0,
             tile_x: 0.0,
@@ -672,6 +843,7 @@ mod tests {
             status: 0,
             animation_progress: 0.0,
             health_ratio: 0.0,
+            arm_angle: 0.0,
         }; 64];
         let mut count = 0;
 
@@ -702,6 +874,7 @@ mod tests {
 
     #[test]
     fn test_early_game_progression_ffi() {
+        let _guard = lock_test_state();
         unsafe {
             // 1. Resetear mundo
             assert!(xfactorvr_reset_world(true));

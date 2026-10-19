@@ -49,31 +49,31 @@ import zlib
 # 0. Constantes
 # ---------------------------------------------------------------------------
 
-# Orden de dibujado derivado de `priority`.  Los seis primeros valores son los
-# fijados por la especificacion del pipeline; el resto continua la escala.
+# Orden de dibujado derivado de `priority`.  Escala de Factorio:
+# extra-low < low < terrain < terrain-high < object < high < extra-high
 PRIORITY_DRAW_ORDER = {
-    "terrain-low": 0,
-    "terrain": 1,
-    "low": 2,
-    "normal": 3,
-    "high": 4,
-    "train": 5,
+    "extra-low": 0,
+    "low": 1,
+    "terrain": 2,
+    "terrain-high": 3,
+    "object": 4,
+    "normal": 4,
+    "high": 5,
     "extra-high": 6,
-    "extra-high-no-glow": 7,
-    "ghost": 8,
-    "selection-box": 9,
-    "highlight": 10,
-    "alert-icon": 11,
+    # valores adicionales que aparecen en algunos prototipos
+    "terrain-low": 1,
+    "train": 5,
+    "extra-high-no-glow": 6,
+    "ghost": 7,
+    "selection-box": 8,
+    "highlight": 9,
+    "alert-icon": 10,
 }
-DEFAULT_DRAW_ORDER = 3
+DEFAULT_DRAW_ORDER = 4
 
 # Altura maxima del atlas.  65535 es el limite de la especificacion PNG que
 # respetan los decodificadores habituales.
 PNG_MAX_DIMENSION = 65535
-
-# Escalera de "frames por capa" que se prueba para que el atlas quepa en el
-# presupuesto de pixeles.  Se usa la mayor que quepa.
-FRAME_CAP_LADDER = (64, 32, 16, 8, 4, 2, 1)
 
 # Una capa cuyo frame individual supere esto se considera no apta para el
 # atlas y se descarta con aviso (evita decodificar hojas de 4096x8192 enteras).
@@ -123,23 +123,13 @@ PROTECTED_ENTITIES = {
     "assembling-machine-1", "burner-mining-drill", "electric-mining-drill",
     "stone-furnace", "transport-belt", "inserter", "small-electric-pole",
     "iron-chest", "gun-turret", "radar", "roboport",
-    # la maquinaria mas usada de una fabrica
-    "assembling-machine-2", "assembling-machine-3", "fast-transport-belt",
-    "express-transport-belt", "underground-belt", "fast-inserter",
-    "bulk-inserter", "burner-inserter", "big-electric-pole", "steel-chest",
-    "steel-furnace", "electric-furnace", "boiler", "steam-engine",
-    "steam-turbine", "oil-refinery", "chemical-plant", "centrifuge", "lab",
-    "splitter", "storage-tank", "pump", "pipe-to-ground", "loader",
-    "beacon", "substation", "power-switch", "offshore-pump", "valve",
-    "burner-generator", "gas-generator", "nuclear-reactor", "heat-exchanger",
-    "cooling-tower", "rocket-silo", "landfill", "wall", "gate", "train-stop",
-    "locomotive", "cargo-wagon", "fluid-wagon", "car", "tank", "character",
-    "turret", "fluid-turret", "laser-turret", "artillery-turret",
-    "logistic-chest-passive-provider", "logistic-chest-passive-consumer",
+    # y las mas usadas y pequenas de una fabrica
+    "assembling-machine-2", "fast-inserter", "bulk-inserter",
+    "burner-inserter", "steel-furnace", "electric-furnace", "steel-chest",
+    "big-electric-pole", "boiler", "storage-tank", "oil-refinery",
+    "solar-panel", "substation", "power-switch", "electric-energy-interface",
+    "beacon", "heat-exchanger", "logistic-chest-passive-provider",
     "logistic-chest-active-provider", "logistic-chest-buffer",
-    "logistic-chest-requester", "solar-panel", "accumulator", "battery",
-    "electric-energy-interface", "burner-inserter", "straight-rail",
-    "curved-rail", "rail-chain-signal", "rail-signal",
 }
 
 
@@ -1604,7 +1594,8 @@ def _walk_layers(value, out, warnings, visited, depth=0):
 class LayerGeometry(object):
     __slots__ = ("frame_width", "frame_height", "cols", "rows", "cells",
                  "frame_count", "direction_count", "anim_frames", "anim_speed",
-                 "offset_x", "offset_y", "strip_path")
+                 "offset_x", "offset_y", "strip_path", "sheet_width",
+                 "sheet_height", "grid_mismatch", "line_length")
 
     def __init__(self):
         self.frame_width = 0
@@ -1619,6 +1610,10 @@ class LayerGeometry(object):
         self.offset_x = 0
         self.offset_y = 0
         self.strip_path = None
+        self.sheet_width = 0
+        self.sheet_height = 0
+        self.grid_mismatch = False
+        self.line_length = 0
 
     @property
     def frame_pixels(self):
@@ -1702,6 +1697,8 @@ def compute_geometry(layer, data_dir, png_width, png_height, warnings):
     anim_speed = _as_float(layer.get("animation_speed"))
     if anim_speed is not None:
         geo.anim_speed = anim_speed
+    if strip is not None:
+        geo.line_length = _as_int(strip.get("line_length")) or 0
 
     # Factorio 2.1: el PNG es una rejilla y el prototipo dice cuantos frames
     # caben en horizontal y en vertical (width_in_frames / height_in_frames).
@@ -1718,6 +1715,12 @@ def compute_geometry(layer, data_dir, png_width, png_height, warnings):
         geo.frame_height = fh
         geo.cols = max(1, png_width // fw)
         geo.rows = max(1, png_height // fh)
+        # el PNG deberia encajar exacto en la rejilla de frames
+        if png_width % fw or png_height % fh:
+            geo.grid_mismatch = True
+            # si la definicion de tira dice cuantas columnas tiene, se usa
+            if geo.line_length and geo.line_length > 0:
+                geo.cols = geo.line_length
     else:
         # sin informacion de frame: la imagen entera es un frame
         geo.frame_width = png_width
@@ -1725,6 +1728,14 @@ def compute_geometry(layer, data_dir, png_width, png_height, warnings):
         geo.cols = 1
         geo.rows = 1
     geo.cells = geo.cols * geo.rows
+
+    # la definicion de tira debe concordar con las filas reales del PNG
+    if geo.line_length and not wif and not hif:
+        if geo.line_length != geo.cols:
+            geo.grid_mismatch = True
+            if geo.line_length > 0:
+                geo.cols = geo.line_length
+                geo.cells = geo.cols * geo.rows
 
     # posicion absoluta dentro del PNG (sprites de acantilado etc.)
     ox = _as_int(layer.get("x"))
@@ -1735,6 +1746,9 @@ def compute_geometry(layer, data_dir, png_width, png_height, warnings):
         geo.cols = 1
         geo.rows = 1
         geo.cells = 1
+
+    geo.sheet_width = png_width
+    geo.sheet_height = png_height
 
     if geo.frame_count <= 0:
         geo.frame_count = geo.cells
@@ -2261,7 +2275,8 @@ def list_sounds(data_dir):
 # ===========================================================================
 
 class EntityAsset(object):
-    __slots__ = ("name", "ptype", "layers", "draw_order", "omitted")
+    __slots__ = ("name", "ptype", "layers", "draw_order", "omitted",
+                 "direction_count", "variants", "flipped")
 
     def __init__(self, name, ptype):
         self.name = name
@@ -2269,13 +2284,17 @@ class EntityAsset(object):
         self.layers = []
         self.draw_order = DEFAULT_DRAW_ORDER
         self.omitted = None
+        self.direction_count = 0
+        self.variants = {}      # {"N": indice_de_capa, ...}
+        self.flipped = {}       # {"N": indice_de_capa, ...}
 
 
 class LayerAsset(object):
     __slots__ = ("entity", "index", "ref", "rel_path", "abs_path", "priority",
                  "geometry", "header", "frames", "omitted", "flags", "shift",
                  "scale", "anim_speed", "frame_count", "direction_count",
-                 "table")
+                 "table", "is_body", "z_order", "atlas_x", "atlas_y",
+                 "animation_frames", "strips")
 
     def __init__(self):
         self.entity = ""
@@ -2295,6 +2314,12 @@ class LayerAsset(object):
         self.frame_count = 1
         self.direction_count = 1
         self.table = None      # tabla Lua original de la capa
+        self.is_body = False
+        self.z_order = 0
+        self.atlas_x = 0
+        self.atlas_y = 0
+        self.animation_frames = 1
+        self.strips = []
 
 
 def _lua_to_json(value):
@@ -2352,12 +2377,80 @@ def build_entity_assets(runtime, data_dir, proto_dir, warnings):
             entity.layers.append(layer)
         for i, layer in enumerate(entity.layers):
             layer.index = i
+        # direction_count del prototipo (si lo declara) y deteccion de cuerpo
+        entity.direction_count = _as_int(proto.get("direction_count")) or 0
+        _classify_layers(entity)
         if entity.layers:
             orders = [PRIORITY_DRAW_ORDER.get(l.priority, DEFAULT_DRAW_ORDER)
                       for l in entity.layers]
             entity.draw_order = max(orders)
             entities.append(entity)
     return entities, no_sprite
+
+
+# Sufijos de direccion que usa Factorio en el nombre de los ficheros
+DIRECTION_SUFFIXES = ("N", "E", "S", "W")
+
+# Marcas de una capa que NO son el cuerpo de la entidad
+NON_BODY_MARKS = ("-shadow", "-light", "-lights", "-reflection",
+                  "-reflections", "-mask", "-overlay", "-glow")
+
+
+def detect_variant(ref):
+    """Deduce (direccion, flipped) del nombre del fichero.
+
+    'burner-mining-drill-N.png'        -> ('N', False)
+    'burner-mining-drill-N-flipped.png'-> ('N', True)
+    """
+    stem = os.path.basename(ref).rsplit(".", 1)[0]
+    parts = stem.split("-")
+    flipped = False
+    if parts and parts[-1] == "flipped":
+        flipped = True
+        parts = parts[:-1]
+    direction = None
+    if len(parts) > 1 and parts[-1] in DIRECTION_SUFFIXES:
+        direction = parts[-1]
+    return direction, flipped
+
+
+def is_body_layer(layer):
+    """True si la capa define el cuerpo visible de la entidad."""
+    name = layer.ref.lower()
+    for mark in NON_BODY_MARKS:
+        if mark in name:
+            return False
+    if "shadow" in layer.flags:
+        return False
+    if "mask" in layer.flags:
+        return False
+    if "light" in layer.flags:
+        return False
+    return True
+
+
+def _classify_layers(entity):
+    """Marca is_body y calcula los mapas de variantes por direccion."""
+    body_found = False
+    for layer in entity.layers:
+        body = is_body_layer(layer)
+        if body and not body_found:
+            body_found = True
+            layer.is_body = True
+        else:
+            layer.is_body = False
+        direction, flipped = detect_variant(layer.ref)
+        if direction and layer.is_body:
+            if flipped:
+                entity.flipped[direction] = layer.index
+            else:
+                entity.variants[direction] = layer.index
+    if not entity.variants and not entity.flipped:
+        # una sola capa de cuerpo: es la variante por defecto
+        for layer in entity.layers:
+            if layer.is_body:
+                entity.variants["default"] = layer.index
+                break
 
 
 def resolve_layer_geometry(entities, data_dir, warnings, missing):
@@ -2394,8 +2487,20 @@ def resolve_layer_geometry(entities, data_dir, warnings, missing):
                 continue
             layer.geometry = geo
             layer.frame_count = geo.frame_count
-            layer.direction_count = geo.direction_count
             layer.anim_speed = geo.anim_speed
+            # direction_count: el del prototipo manda; si no, el de la capa;
+            # si no, se deduce de las filas de la hoja
+            if entity.direction_count:
+                layer.direction_count = entity.direction_count
+            elif geo.direction_count > 1:
+                layer.direction_count = geo.direction_count
+            else:
+                layer.direction_count = geo.rows
+            # frames de animacion por direccion
+            if layer.direction_count > 1 and geo.cells % layer.direction_count == 0:
+                layer.animation_frames = geo.cells // layer.direction_count
+            else:
+                layer.animation_frames = geo.frame_count
             kept.append(layer)
         entity.layers = kept
         if kept:
@@ -2423,10 +2528,10 @@ def build_arg_parser():
                         help="detecta y reporta la version de Factorio")
     parser.add_argument("--atlas-size", type=int, default=2048,
                         help="ancho maximo del atlas en pixeles (por defecto 2048)")
-    parser.add_argument("--max-atlas-height", type=int, default=12288,
-                        help="alto maximo del atlas en pixeles (por defecto 12288)")
-    parser.add_argument("--max-frames-per-layer", type=int, default=0,
-                        help="frames por capa (0 = automatico segun el presupuesto)")
+    parser.add_argument("--max-atlas-height", type=int, default=24576,
+                        help="alto maximo del atlas en pixeles (por defecto 24576)")
+    parser.add_argument("--no-raw", action="store_true",
+                        help="no escribir atlas.rgba (el motor lo sube crudo a la GPU)")
     parser.add_argument("--skip-icons", action="store_true",
                         help="no copiar los iconos de items")
     parser.add_argument("--skip-locale", action="store_true",
@@ -2498,21 +2603,59 @@ def main(argv=None):
     entities = resolve_layer_geometry(entities, data_dir, warnings, missing)
 
     entities = [e for e in entities if e.layers]
+    if not entities:
+        sys.stderr.write(
+            "ERROR: no se encontro ningun PNG de sprite en %s\n"
+            "       Si es una instalacion headless (sin graficos) los sprites\n"
+            "       no existen: usa una instalacion de Factorio con graficos.\n"
+            "       PNG referenciados que faltan: %d\n"
+            % (data_dir, len(missing)))
+        for ename, ref in missing[:10]:
+            sys.stderr.write("         - %s (en %s)\n" % (ref, ename))
+        return 1
 
     # --- presupuesto del atlas -----------------------------------------
+    # El atlas guarda las HOJAS COMPLETAS de cada capa: asi los frames de una
+    # capa quedan contiguos en la textura y el motor puede calcular cualquier
+    # celda con cols/rows.  El arte completo de Factorio son ~1000 Mpx, muy
+    # por encima de lo que cabe en un unico atlas, asi que se descartan
+    # entidades enteras empezando por las menos importantes.
     atlas_width = max(1, args.atlas_size)
     max_height = max(1, min(args.max_atlas_height, PNG_MAX_DIMENSION))
     budget = atlas_width * max_height
 
     total_cells = 0
+    total_sheets = 0
     for entity in entities:
         for layer in entity.layers:
             total_cells += layer.geometry.cells
+            total_sheets += (layer.geometry.sheet_width *
+                             layer.geometry.sheet_height)
 
-    def plan_for(cap):
-        """Construye la lista de rectangulos y los empaqueta en el atlas."""
+    def strips_of(layer):
+        """Trocea la hoja de una capa en franjas que caben en el atlas.
+
+        Devuelve [(columna_inicial, num_columnas, ancho_px, alto_px), ...].
+        Una hoja normal cabe en una sola franja."""
+        geo = layer.geometry
+        fw = geo.frame_width
+        cols = geo.cols
+        if fw <= 0:
+            return [(0, max(1, cols), geo.sheet_width, geo.sheet_height)]
+        per_strip = max(1, atlas_width // fw)
+        if cols <= per_strip:
+            return [(0, cols, cols * fw, geo.sheet_height)]
+        strips = []
+        start_col = 0
+        while start_col < cols:
+            count = min(per_strip, cols - start_col)
+            strips.append((start_col, count, count * fw, geo.sheet_height))
+            start_col += count
+        return strips
+
+    def plan_for():
+        """Empaqueta las hojas de todas las capas incluidas."""
         rects = []
-        frame_plan = []
         for entity in entities:
             if entity.omitted:
                 continue
@@ -2520,24 +2663,20 @@ def main(argv=None):
                 if layer.omitted:
                     continue
                 geo = layer.geometry
-                count = min(geo.cells, cap)
-                for k in range(count):
-                    key = (entity.name, layer.index, k)
-                    col = k % geo.cols
-                    row = k // geo.cols
-                    sx = geo.offset_x + col * geo.frame_width
-                    sy = geo.offset_y + row * geo.frame_height
-                    rects.append((geo.frame_width, geo.frame_height, key))
-                    frame_plan.append((layer, k, sx, sy))
+                if geo.sheet_height > max_height:
+                    layer.omitted = "atlas-corta"
+                    continue
+                for start_col, count, w, h in strips_of(layer):
+                    rects.append((w, h, (entity.name, layer.index, start_col)))
         if not rects:
-            return None, None, None, []
+            return None, None, None
         try:
             placements, aw, ah = pack_skyline(rects, atlas_width)
         except ExtractError:
-            return None, None, None, []
-        return placements, aw, ah, frame_plan
+            return None, None, None
+        return placements, aw, ah
 
-    def area_for(cap):
+    def area_for():
         total = 0
         for entity in entities:
             if entity.omitted:
@@ -2545,40 +2684,10 @@ def main(argv=None):
             for layer in entity.layers:
                 if layer.omitted:
                     continue
-                cells = min(layer.geometry.cells, cap)
-                total += cells * layer.geometry.frame_pixels
+                total += (layer.geometry.sheet_width *
+                          layer.geometry.sheet_height)
         return total
 
-    # --- eleccion del limite de frames por capa --------------------------
-    # El arte completo de Factorio son miles de millones de pixeles, muy por
-    # encima de lo que cabe en un unico atlas.  Se elige la mayor cantidad de
-    # frames por capa que aun quepa, y si no cabe se descartan entidades
-    # enteras empezando por las menos importantes (prioridad baja).
-    if args.max_frames_per_layer > 0:
-        caps = [args.max_frames_per_layer]
-        chosen_by = "opcion --max-frames-per-layer"
-    else:
-        caps = list(FRAME_CAP_LADDER)
-        chosen_by = "automatico"
-
-    budget = atlas_width * max_height
-    # estimacion: el skyline suele aprovechar ~90% del area
-    caps = [c for c in caps if area_for(c) <= budget * 0.90] or [caps[-1]]
-
-    placements = atlas_w = atlas_h = None
-    frame_plan = []
-    cap = caps[0]
-    for candidate in caps:
-        placements, atlas_w, atlas_h, frame_plan = plan_for(candidate)
-        cap = candidate
-        if placements is not None and atlas_h <= max_height:
-            break
-
-    if placements is None:
-        sys.stderr.write("ERROR: no se pudo colocar ningun frame en el atlas\n")
-        return 1
-
-    # si aun no cabe, descarta entidades enteras por importancia ascendente
     dropped_entities = 0
     dropped_layers = 0
 
@@ -2594,8 +2703,8 @@ def main(argv=None):
             for layer in entity.layers:
                 if layer.omitted:
                     continue
-                cells = min(layer.geometry.cells, cap)
-                area += cells * layer.geometry.frame_pixels
+                area += (layer.geometry.sheet_width *
+                         layer.geometry.sheet_height)
                 # la capa principal (la de mayor area) define la prioridad real
                 # de la entidad: el reflejo o las luces de conexion no deben
                 # decidir el destino de la entidad entera
@@ -2620,12 +2729,12 @@ def main(argv=None):
         for layer in entity.layers:
             layer.omitted = "atlas-pleno"
 
-    # 1) descarte barato por estimacion de area (sin empaquetar)
+    # 1) descarte por estimacion de area (sin empaquetar)
     while True:
         droppable = [c for c in rank_entities() if c[0] > 0]
         if not droppable:
             break
-        if area_for(cap) <= budget * 0.90:
+        if area_for() <= budget * 0.92:
             break
         victim = droppable[0][4]
         drop_entity(victim)
@@ -2633,7 +2742,7 @@ def main(argv=None):
         dropped_layers += len(victim.layers)
 
     # 2) empaquetado real; si aun no cabe se descarta algo mas
-    placements, atlas_w, atlas_h, frame_plan = plan_for(cap)
+    placements, atlas_w, atlas_h = plan_for()
     while placements is not None and atlas_h > max_height:
         droppable = [c for c in rank_entities() if c[0] > 0]
         if not droppable:
@@ -2642,70 +2751,87 @@ def main(argv=None):
         drop_entity(victim)
         dropped_entities += 1
         dropped_layers += len(victim.layers)
-        placements, atlas_w, atlas_h, frame_plan = plan_for(cap)
+        placements, atlas_w, atlas_h = plan_for()
 
-    if placements is None or not frame_plan:
-        sys.stderr.write("ERROR: el atlas no cabe; baja --max-atlas-height o "
-                         "usa --types para filtrar entidades\n")
+    if placements is None:
+        sys.stderr.write("ERROR: no se pudo colocar ninguna hoja en el atlas\n")
         return 1
     if atlas_h > max_height:
         sys.stderr.write("ERROR: el atlas necesitaria %d px de alto (maximo %d). "
-                         "Reduce --max-frames-per-layer.\n" % (atlas_h, max_height))
+                         "Sube --max-atlas-height o usa --types para filtrar.\n"
+                         % (atlas_h, max_height))
         return 1
     used_area = atlas_w * atlas_h
 
     # --- render del atlas ------------------------------------------------
     atlas = bytearray(atlas_w * atlas_h * 4)
-    # agrupa por PNG para decodificar cada fichero una sola vez
-    by_file = {}
-    for layer, k, sx, sy in frame_plan:
-        by_file.setdefault(layer.abs_path, []).append((layer, k, sx, sy))
 
-    decoded = 0
-    for path, items in by_file.items():
-        wanted_rows = set()
-        for layer, k, sx, sy in items:
-            geo = layer.geometry
-            for r in range(geo.frame_height):
-                wanted_rows.add(sy + r)
-        try:
-            rows = dict(decode_png_rows(path, wanted_rows))
-        except (PngError, OSError) as exc:
-            warnings.append("png: %s (%s)" % (os.path.basename(path), exc))
-            for layer, k, sx, sy in items:
-                layer.omitted = "decode-error"
+    for entity in entities:
+        if entity.omitted:
             continue
-        for layer, k, sx, sy in items:
+        for layer in entity.layers:
+            if layer.omitted:
+                continue
             geo = layer.geometry
-            dx, dy = placements[(layer.entity, layer.index, k)]
+            strips = strips_of(layer)
+            layer.strips = []
+            try:
+                for row_index, row in enumerate(decode_png_rows(layer.abs_path)):
+                    if row_index >= geo.sheet_height:
+                        break
+                    for start_col, count, strip_w, _strip_h in strips:
+                        src_off = start_col * geo.frame_width * 4
+                        dst_x, dst_y = placements[(entity.name, layer.index,
+                                                   start_col)]
+                        length = min(strip_w, geo.sheet_width -
+                                      start_col * geo.frame_width) * 4
+                        if length <= 0:
+                            continue
+                        dst_off = ((dst_y + row_index) * atlas_w + dst_x) * 4
+                        if src_off + length <= len(row):
+                            atlas[dst_off:dst_off + length] = \
+                                row[src_off:src_off + length]
+            except (PngError, OSError) as exc:
+                warnings.append("png: %s (%s)" %
+                                (os.path.relpath(layer.abs_path, data_dir), exc))
+                layer.omitted = "decode-error"
+                continue
+            for start_col, count, strip_w, strip_h in strips:
+                dst_x, dst_y = placements[(entity.name, layer.index, start_col)]
+                layer.strips.append({
+                    "atlas_x": dst_x, "atlas_y": dst_y,
+                    "width": strip_w, "height": strip_h,
+                    "first_col": start_col, "cols": count,
+                })
+            layer.atlas_x = layer.strips[0]["atlas_x"] if layer.strips else 0
+            layer.atlas_y = layer.strips[0]["atlas_y"] if layer.strips else 0
+            # frames: un rectangulo por celda de la rejilla, en orden de fila
             fw, fh = geo.frame_width, geo.frame_height
-            for r in range(fh):
-                src = rows.get(sy + r)
-                if src is None:
-                    continue
-                src_off = (sx) * 4
-                dst_off = ((dy + r) * atlas_w + dx) * 4
-                if src_off + fw * 4 <= len(src):
-                    atlas[dst_off:dst_off + fw * 4] = src[src_off:src_off + fw * 4]
-                else:
-                    # recorte parcial (el frame se sale del PNG)
-                    avail = max(0, (len(src) - src_off) // 4)
-                    if avail > 0:
-                        atlas[dst_off:dst_off + avail * 4] = \
-                            src[src_off:src_off + avail * 4]
-            layer.frames.append({
-                "index": k,
-                "x": dx,
-                "y": dy,
-                "w": fw,
-                "h": fh,
-            })
-        decoded += len(items)
+            for row in range(geo.rows):
+                for col in range(geo.cols):
+                    strip = None
+                    for st in layer.strips:
+                        if st["first_col"] <= col < st["first_col"] + st["cols"]:
+                            strip = st
+                            break
+                    if strip is None:
+                        continue
+                    x = strip["atlas_x"] + (col - strip["first_col"]) * fw
+                    y = strip["atlas_y"] + row * fh
+                    layer.frames.append({
+                        "index": len(layer.frames),
+                        "x": x,
+                        "y": y,
+                        "w": fw,
+                        "h": fh,
+                        "sheet_x": geo.offset_x + col * fw,
+                        "sheet_y": geo.offset_y + row * fh,
+                    })
 
-    # ordena los frames de cada capa por indice
     for entity in entities:
         for layer in entity.layers:
             layer.frames.sort(key=lambda f: f["index"])
+            layer.z_order = layer.index
 
     atlas_path = os.path.join(out_dir, "atlas.png")
     try:
@@ -2714,12 +2840,33 @@ def main(argv=None):
     except (OSError, PngError) as exc:
         sys.stderr.write("ERROR: no se pudo escribir %s: %s\n" % (atlas_path, exc))
         return 1
+    atlas_png_size = os.path.getsize(atlas_path)
+
+    # --- atlas en RAW (el motor Android no decodifica PNG) ---------------
+    raw_path = os.path.join(out_dir, "atlas.rgba")
+    raw_size = 0
+    if not args.no_raw:
+        try:
+            with open(raw_path, "wb") as fh:
+                fh.write(atlas)
+            raw_size = os.path.getsize(raw_path)
+        except OSError as exc:
+            sys.stderr.write("ERROR: no se pudo escribir %s: %s\n" % (raw_path, exc))
+            return 1
 
     # --- manifest --------------------------------------------------------
+    atlas_info = {
+        "file": "atlas.png",
+        "width": atlas_w,
+        "height": atlas_h,
+        "pixel_format": "RGBA8",
+    }
+    if not args.no_raw:
+        atlas_info["raw_file"] = "atlas.rgba"
     manifest = {
         "version": version,
         "graphics_layout": layout,
-        "atlas": {"file": "atlas.png", "width": atlas_w, "height": atlas_h},
+        "atlas": atlas_info,
         "entities": {},
         "icons": {},
         "sounds": {},
@@ -2733,6 +2880,12 @@ def main(argv=None):
             "layers": [],
             "draw_order": entity.draw_order,
         }
+        if entity.variants:
+            entry["variants"] = dict(sorted(entity.variants.items()))
+        if entity.flipped:
+            entry["flipped"] = dict(sorted(entity.flipped.items()))
+        if entity.omitted:
+            entry["omitted"] = entity.omitted
         for layer in entity.layers:
             geo = layer.geometry
             layer_entry = {
@@ -2742,9 +2895,22 @@ def main(argv=None):
                 "frame_height": geo.frame_height,
                 "frame_count": layer.frame_count,
                 "direction_count": layer.direction_count,
+                "animation_frames": layer.animation_frames,
                 "animation": {"frames": geo.anim_frames, "speed": layer.anim_speed},
+                "cols": geo.cols,
+                "rows": geo.rows,
+                "layer_order": layer.index,
+                "z_order": layer.z_order,
+                "is_body": layer.is_body,
+                "atlas_x": layer.atlas_x,
+                "atlas_y": layer.atlas_y,
                 "frames": layer.frames,
             }
+            if len(layer.strips) > 1:
+                layer_entry["split"] = True
+                layer_entry["strips"] = layer.strips
+            if geo.grid_mismatch:
+                layer_entry["grid_mismatch"] = True
             if layer.flags:
                 layer_entry["flags"] = layer.flags
             if layer.shift is not None:
@@ -2819,6 +2985,12 @@ def main(argv=None):
     # --- resumen ---------------------------------------------------------
     total_layers = sum(len(e.layers) for e in entities)
     total_frames = sum(len(l.frames) for e in entities for l in e.layers)
+    included_layers = sum(1 for e in entities for l in e.layers
+                          if not l.omitted)
+    split_layers = sum(1 for e in entities for l in e.layers
+                       if len(l.strips) > 1)
+    mismatch_layers = sum(1 for e in entities for l in e.layers
+                          if l.geometry.grid_mismatch)
     if not args.quiet:
         print("=== Extraccion de assets de Factorio %s ===" % version)
         print("Datos      : %s" % data_dir)
@@ -2826,12 +2998,22 @@ def main(argv=None):
         print("Layout     : sprites %s" % layout)
         print("Entidades  : %d (con sprite)  |  %d sin sprite local"
               % (len(entities), len(no_sprite)))
-        print("Capas      : %d" % total_layers)
-        print("Frames     : %d de %d celdas disponibles (cap=%d, %s)"
-              % (total_frames, total_cells, cap, chosen_by))
-        print("Atlas      : %s  %dx%d px  (%.1f MB RGBA, limite %d px de alto)"
-              % (atlas_path, atlas_w, atlas_h,
-                 atlas_w * atlas_h * 4 / 1e6, max_height))
+        print("Capas      : %d (en el atlas: %d)" % (total_layers, included_layers))
+        print("Frames     : %d celdas (de %d disponibles en las hojas)"
+              % (total_frames, total_cells))
+        print("Atlas      : %s  %dx%d px" % (atlas_path, atlas_w, atlas_h))
+        print("             atlas.png  %.1f MB" % (atlas_png_size / 1e6))
+        if args.no_raw:
+            print("             atlas.rgba omitido (--no-raw)")
+        else:
+            print("             atlas.rgba %.1f MB (RGBA8 crudo)"
+                  % (raw_size / 1e6))
+        if split_layers:
+            print("             %d capas divididas en franjas (mas anchas que el "
+                  "atlas)" % split_layers)
+        if mismatch_layers:
+            print("             %d capas con rejilla no exacta (grid_mismatch)"
+                  % mismatch_layers)
         if dropped_entities:
             print("Descartadas: %d entidades (%d capas) por falta de espacio en "
                   "el atlas" % (dropped_entities, dropped_layers))

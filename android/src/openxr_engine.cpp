@@ -502,6 +502,8 @@ struct LiveEntity {
     float animation_progress;
     float health_ratio;
     float arm_angle;   // angulo del brazo en radianes (solo insertadores)
+    uint32_t sprite_id;  // sprite real de Factorio en el atlas (0 = sin sprite)
+    uint32_t anim_frame;  // frame de animacion actual
 };
 
 // Tabla de tipos de entidad. Debe coincidir con src/tabletop.rs y con el mod
@@ -543,6 +545,26 @@ typedef bool (*pfn_xfactorvr_get_live_entities)(LiveEntity* out_entities, int ma
 typedef bool (*pfn_xfactorvr_place_or_update_entity)(uint32_t entity_type, float tile_x, float tile_y, float orientation);
 typedef bool (*pfn_xfactorvr_mine_entity)(float tile_x, float tile_y);
 typedef void (*pfn_xfactorvr_update_simulation)(float delta_time);
+
+// --- Atlas de sprites reales de Factorio -------------------------------------
+// El renderer deja de inventar primitivas: dibuja los sprites que usa el juego,
+// recortados del atlas que extrae scripts/extract_factorio_assets.py.
+typedef bool (*pfn_xfactorvr_get_atlas_size)(int* out_w, int* out_h);
+typedef int  (*pfn_xfactorvr_get_atlas_pixels)(uint8_t* out, int max_len);
+typedef bool (*pfn_xfactorvr_get_sprite_frame)(uint32_t sprite_id, uint32_t anim_frame,
+                                               float orientation, float* out);
+
+static pfn_xfactorvr_get_atlas_size   s_get_atlas_size   = nullptr;
+static pfn_xfactorvr_get_atlas_pixels s_get_atlas_pixels = nullptr;
+static pfn_xfactorvr_get_sprite_frame s_get_sprite_frame = nullptr;
+
+static GLuint s_tex_atlas = 0;
+static int    s_atlas_w = 0;
+static int    s_atlas_h = 0;
+static bool   s_atlas_probed = false;
+static GLuint s_sprite_vao = 0;
+static GLuint s_sprite_vbo = 0;
+static int    s_sprite_vertex_count = 0;
 typedef bool (*pfn_xfactorvr_get_player_inventory)(PlayerItemFfi* out_items, uint32_t max_items, uint32_t* out_count);
 typedef bool (*pfn_xfactorvr_craft_item)(uint32_t item_id, uint32_t count);
 typedef bool (*pfn_xfactorvr_get_resource_patches)(ResourcePatchFfi* out_patches, uint32_t max_patches, uint32_t* out_count);
@@ -1004,6 +1026,106 @@ static GLuint create_mesh_vao(const std::vector<DioramaVertex>& verts, GLuint& o
     return vao;
 }
 
+// --- Atlas de sprites reales de Factorio -------------------------------------
+// Los pixeles llegan en RGBA8 crudo desde Rust: el extractor escribe el atlas
+// en crudo porque en Android no hay decodificador de PNG.
+static bool ensure_atlas_texture() {
+    if (s_atlas_probed) return s_tex_atlas != 0;
+    s_atlas_probed = true;
+    if (!s_get_atlas_size || !s_get_atlas_pixels) return false;
+
+    int w = 0, h = 0;
+    if (!s_get_atlas_size(&w, &h) || w <= 0 || h <= 0) {
+        LOGI("openxr_engine: no hay atlas de sprites desplegado (mismo texto procedural)");
+        return false;
+    }
+    size_t bytes = (size_t)w * (size_t)h * 4u;
+    std::vector<uint8_t> pixels(bytes);
+    int written = s_get_atlas_pixels(pixels.data(), (int)bytes);
+    if (written <= 0) {
+        LOGI("openxr_engine: no se pudieron leer los pixeles del atlas");
+        return false;
+    }
+
+    glGenTextures(1, &s_tex_atlas);
+    glBindTexture(GL_TEXTURE_2D, s_tex_atlas);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, pixels.data());
+    s_atlas_w = w;
+    s_atlas_h = h;
+    LOGI("openxr_engine: atlas de sprites de Factorio cargado (%dx%d)", w, h);
+    return true;
+}
+
+// Anade al lote un quad plano: el sprite tumbado sobre la mesa. El arte de
+// Factorio es una vista cenital, asi que tumbado es la proyeccion correcta.
+static void add_sprite_quad(std::vector<DioramaVertex>& verts,
+                            float cx, float cz, float y,
+                            float half_w, float half_d,
+                            float u0, float v0, float u1, float v1,
+                            float r, float g, float b, float a) {
+    const float xs[4] = { cx + half_w, cx + half_w, cx - half_w, cx - half_w };
+    const float zs[4] = { cz - half_d, cz + half_d, cz + half_d, cz - half_d };
+    const float us[4] = { u1, u1, u0, u0 };
+    const float vs[4] = { v0, v1, v1, v0 };
+    static const int idx[6] = { 0, 1, 2, 0, 2, 3 };
+    for (int k = 0; k < 6; ++k) {
+        int i = idx[k];
+        DioramaVertex v;
+        v.x = xs[i];
+        v.y = y;
+        v.z = zs[i];
+        v.nx = 0.0f;
+        v.ny = 1.0f;
+        v.nz = 0.0f;
+        v.u = us[i];
+        v.v = vs[i];
+        v.r = r;
+        v.g = g;
+        v.b = b;
+        v.a = a;
+        verts.push_back(v);
+    }
+}
+
+// Sube el lote de sprites a la GPU y lo dibuja tumbado sobre la mesa.
+static void draw_sprite_batch(const std::vector<DioramaVertex>& verts,
+                              const float* model, const float* mvp) {
+    if (verts.empty() || s_tex_atlas == 0) return;
+
+    if (s_sprite_vao == 0) {
+        s_sprite_vao = create_mesh_vao(verts, s_sprite_vbo);
+    } else {
+        glBindBuffer(GL_ARRAY_BUFFER, s_sprite_vbo);
+        glBufferData(GL_ARRAY_BUFFER, verts.size() * sizeof(DioramaVertex),
+                     verts.data(), GL_DYNAMIC_DRAW);
+    }
+    s_sprite_vertex_count = (int)verts.size();
+
+    glUseProgram(s_program);
+    glUniformMatrix4fv(s_model_loc, 1, GL_FALSE, model);
+    glUniformMatrix4fv(s_mvp_loc, 1, GL_FALSE, mvp);
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, s_tex_atlas);
+    glUniform1i(s_tex_loc, 0);
+    glUniform1f(s_use_tex_loc, 1.0f);
+    glUniform1f(s_lit_loc, 1.0f);
+
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    glDepthMask(GL_FALSE);
+    glBindVertexArray(s_sprite_vao);
+    glDrawArrays(GL_TRIANGLES, 0, s_sprite_vertex_count);
+    glDepthMask(GL_TRUE);
+    glDisable(GL_BLEND);
+
+    glUniform1f(s_use_tex_loc, 0.0f);
+    glBindVertexArray(0);
+}
+
 static void init_glb_loader() {
     if (s_load_glb && s_get_live_entities) return;
     void* handle = RTLD_DEFAULT;
@@ -1025,6 +1147,9 @@ static void init_glb_loader() {
     s_get_carried_item = (pfn_xfactorvr_get_carried_item)dlsym(handle, "xfactorvr_get_carried_item");
     s_pan_view = (pfn_xfactorvr_pan_view)dlsym(handle, "xfactorvr_pan_view");
     s_get_view_center = (pfn_xfactorvr_get_view_center)dlsym(handle, "xfactorvr_get_view_center");
+    s_get_atlas_size = (pfn_xfactorvr_get_atlas_size)dlsym(handle, "xfactorvr_get_atlas_size");
+    s_get_atlas_pixels = (pfn_xfactorvr_get_atlas_pixels)dlsym(handle, "xfactorvr_get_atlas_pixels");
+    s_get_sprite_frame = (pfn_xfactorvr_get_sprite_frame)dlsym(handle, "xfactorvr_get_sprite_frame");
 
     if (!s_load_glb || !s_get_live_entities) {
         void* mod_handle = dlopen("libxfactorvr.so", RTLD_NOW | RTLD_GLOBAL);
@@ -1401,6 +1526,8 @@ static void draw_tabletop_scene(const float* vp_mat,
     glUniform3f(s_emissive_loc, 0.0f, 0.0f, 0.0f);
 
     std::vector<LiveEntity> electric_poles;
+    std::vector<DioramaVertex> sprite_verts;
+    sprite_verts.reserve((size_t)entity_count * 6);
 
     for (int i = 0; i < entity_count; ++i) {
         const LiveEntity& ent = live_entities[i];
@@ -1408,6 +1535,27 @@ static void draw_tabletop_scene(const float* vp_mat,
 
         if (ent.entity_type == ENTITY_ELECTRIC_POLE) {
             electric_poles.push_back(ent);
+        }
+
+        // Si el juego tiene sprite para este tipo, se dibuja el sprite REAL
+        // tumbado sobre la mesa en lugar de una primitiva inventada.
+        if (ent.sprite_id != 0 && s_get_sprite_frame && ensure_atlas_texture()) {
+            float rect[9];
+            if (s_get_sprite_frame(ent.sprite_id, ent.anim_frame, ent.orientation, rect)) {
+                float mx = (ent.tile_x - s_view_pan_x) * 0.04f;
+                float mz = (ent.tile_y - s_view_pan_y) * 0.04f;
+                // El sprite mide frame_width px a escala s; en el juego una
+                // casilla son 32 px y aqui una casilla son 0.04 m.
+                float tiles = rect[4] * rect[8] / 32.0f;
+                float half = tiles * 0.04f * 0.5f;
+                float u0 = rect[0] / (float)s_atlas_w;
+                float v0 = rect[1] / (float)s_atlas_h;
+                float u1 = (rect[0] + rect[2]) / (float)s_atlas_w;
+                float v1 = (rect[1] + rect[3]) / (float)s_atlas_h;
+                add_sprite_quad(sprite_verts, mx, mz, 0.0012f, half, half,
+                                u0, v0, u1, v1, 1.0f, 1.0f, 1.0f, 1.0f);
+                continue;  // sprite real: no se dibuja la malla primitiva
+            }
         }
 
         const ModelMesh& mesh = s_entity_meshes[ent.entity_type];
@@ -1476,6 +1624,11 @@ static void draw_tabletop_scene(const float* vp_mat,
                 }
             }
         }
+    }
+
+    // Lote de sprites reales de Factorio, tumbados sobre la mesa.
+    if (!sprite_verts.empty()) {
+        draw_sprite_batch(sprite_verts, active_model, vp_mat);
     }
 
     // F) Consola UI Holográfica Espacial (Generals XR pattern)

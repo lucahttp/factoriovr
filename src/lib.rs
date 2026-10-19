@@ -727,12 +727,50 @@ pub unsafe extern "C" fn xfactorvr_is_rcon_connected() -> bool {
     }
 }
 
+/// Pixeles del atlas de sprites en RGBA8 crudo, listos para subir a la GPU.
+///
+/// `out` recibe los pixeles (RGBA8, en orden de filas). Devuelve el numero de
+/// bytes escritos, o 0 si no hay atlas desplegado. Android no trae
+/// decodificador de PNG, por eso el extractor escribe tambien el atlas en crudo.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn xfactorvr_get_atlas_size(out_w: *mut i32, out_h: *mut i32) -> bool {
+    if out_w.is_null() || out_h.is_null() {
+        return false;
+    }
+    match assets::atlas_pixels() {
+        Some((_, w, h)) => {
+            *out_w = *w as i32;
+            *out_h = *h as i32;
+            true
+        }
+        None => false,
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn xfactorvr_get_atlas_pixels(out: *mut u8, max_len: i32) -> i32 {
+    if out.is_null() || max_len <= 0 {
+        return 0;
+    }
+    match assets::atlas_pixels() {
+        Some((data, _, _)) => {
+            if (data.len() as i64) > max_len as i64 {
+                return 0;
+            }
+            std::ptr::copy_nonoverlapping(data.as_ptr(), out, data.len());
+            data.len() as i32
+        }
+        None => 0,
+    }
+}
+
 /// Rectangulo del frame de un sprite real de Factorio dentro del atlas.
 ///
 /// Lo consume el motor C++ para dibujar el sprite en vez de una primitiva.
-/// `out` recibe 6 floats: x, y, w, h (pixeles del atlas) y el ancho y alto
-/// logicos del frame. Devuelve false si no hay sprite (se dibuja la
-/// primitiva de siempre).
+/// `out` recibe 9 floats: x, y, w, h (pixeles del atlas), el ancho y alto
+/// logicos del frame, el numero de direcciones de la capa, los frames de
+/// animacion y la escala del sprite en el juego. Devuelve false si no hay sprite (se dibuja la primitiva de
+/// siempre).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn xfactorvr_get_sprite_frame(
     sprite_id: u32,
@@ -754,6 +792,9 @@ pub unsafe extern "C" fn xfactorvr_get_sprite_frame(
             *out.add(3) = f.h;
             *out.add(4) = f.frame_width;
             *out.add(5) = f.frame_height;
+            *out.add(6) = f.direction_count as f32;
+            *out.add(7) = f.animation_frames as f32;
+            *out.add(8) = f.scale;
             true
         }
         None => false,

@@ -136,18 +136,40 @@ fi
 # 5. Mod puente
 # El nombre de la carpeta DEBE coincidir con <nombre>_<version> de info.json
 # o Factorio no carga el mod y el puente RCON no existe.
-echo "[5/6] Instalando el mod puente $MOD_ID..."
+echo "[5/7] Instalando el mod puente $MOD_ID..."
 "$ADB" shell "mkdir -p $REMOTE_FACTORIO/mods/$MOD_ID"
 "$ADB" push "$LOCAL_MOD/control.lua" "$REMOTE_FACTORIO/mods/$MOD_ID/control.lua"
 "$ADB" push "$LOCAL_MOD/info.json" "$REMOTE_FACTORIO/mods/$MOD_ID/info.json"
 "$ADB" shell "chmod 644 $REMOTE_FACTORIO/mods/$MOD_ID/control.lua $REMOTE_FACTORIO/mods/$MOD_ID/info.json"
 
-# 6. Script de arranque standalone
-echo "[6/6] Subiendo el script de arranque standalone..."
+# 6. Assets reales del juego (atlas de sprites, iconos y textos).
+# El motor VR dibuja los sprites que usa Factorio: sin el atlas se dibujan
+# primitivas y la escena parece una maqueta.
+LOCAL_ASSETS="$PROJECT_ROOT/build/factorio_assets"
+if [ ! -f "$LOCAL_ASSETS/manifest.json" ]; then
+    echo "    Generando el atlas de sprites desde la instalacion de Factorio..."
+    FACTIO_DATA="${FACTORIO_DATA:-/Volumes/X10Pro/SteamLibrary/steamapps/common/Factorio/factorio.app/Contents/data}"
+    python3 "$PROJECT_ROOT/scripts/extract_factorio_assets.py" --data "$FACTORIO_DATA" --out "$LOCAL_ASSETS" --quiet || true
+fi
+if [ -f "$LOCAL_ASSETS/manifest.json" ]; then
+    echo "[6/7] Subiendo los assets reales del juego..."
+    "$ADB" shell "mkdir -p $REMOTE_DATA/assets"
+    for f in manifest.json atlas.rgba atlas.png; do
+        if [ -f "$LOCAL_ASSETS/$f" ]; then
+            "$ADB" push "$LOCAL_ASSETS/$f" "$REMOTE_DATA/assets/$f"
+        fi
+    done
+    "$ADB" shell "chmod 644 $REMOTE_DATA/assets/*" 2>/dev/null || true
+else
+    echo "[6/7] AVISO: sin atlas de sprites; se dibujaran primitivas."
+fi
+
+# 7. Script de arranque standalone
+echo "[7/7] Subiendo el script de arranque standalone..."
 "$ADB" push "$PROJECT_ROOT/scripts/start_factorio_standalone.sh" "$REMOTE_SCRIPT"
 "$ADB" shell "chmod 755 $REMOTE_SCRIPT"
 
-# 7. Arrancar el servidor Factorio
+# 8. Arrancar el servidor Factorio
 if [ "$START_SERVER" -eq 1 ]; then
     echo "Arrancando el servidor Factorio headless..."
     if "$ADB" shell "sh $REMOTE_SCRIPT" 2>&1 | tee /tmp/xfactorvr_standalone.log; then

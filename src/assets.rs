@@ -35,9 +35,16 @@ pub struct SpriteLayer {
     /// Frames de animacion: cuantos dibuja y a que velocidad.
     #[serde(default)]
     pub animation: Option<Animation>,
+    /// Escala del sprite en el juego (0.5 en la plupart de entidades).
+    #[serde(default = "default_scale")]
+    pub scale: f32,
     /// Posicion de cada frame dentro del atlas.
     #[serde(default)]
     pub frames: Vec<AtlasRect>,
+}
+
+fn default_scale() -> f32 {
+    0.5
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -84,6 +91,10 @@ pub struct AssetManifest {
 pub struct AtlasInfo {
     #[serde(default)]
     pub file: String,
+    /// Fichero con los pixeles en crudo (RGBA8 sin cabecera). Lo escribe el
+    /// extractor para que el motor no tenga que decodificar PNG.
+    #[serde(default)]
+    pub raw_file: Option<String>,
     pub width: u32,
     pub height: u32,
 }
@@ -99,19 +110,33 @@ pub struct SpriteFrame {
     pub frame_height: f32,
     pub direction_count: u32,
     pub animation_frames: u32,
+    pub scale: f32,
 }
 
 static MANIFEST: OnceLock<Option<AssetManifest>> = OnceLock::new();
 static SPRITE_IDS: OnceLock<HashMap<String, u32>> = OnceLock::new();
 
-/// Directorio donde vive el atlas ya desplegado. Se puede forzar con la
-/// variable de entorno XFACTORVR_ASSETS_DIR.
+/// Directorio donde vive el atlas ya desplegado.
+///
+/// Se puede forzar con XFACTORVR_ASSETS_DIR. Si no, se buscan las rutas
+/// habituales: el despliegue deja los assets en /sdcard/XFactorVR/assets y
+/// el motor tambien puede copiarlos al almacenamiento interno de la app.
 pub fn assets_dir() -> PathBuf {
     if let Ok(dir) = std::env::var("XFACTORVR_ASSETS_DIR") {
         return PathBuf::from(dir);
     }
-    // En el visor el APK se despliega en /sdcard/XFactorVR.
-    PathBuf::from("/sdcard/XFactorVR/assets")
+    const CANDIDATOS: &[&str] = &[
+        "/sdcard/XFactorVR/assets",
+        "/storage/emulated/0/XFactorVR/assets",
+        "/data/local/tmp/XFactorVR/assets",
+    ];
+    for c in CANDIDATOS {
+        let p = PathBuf::from(c);
+        if p.join("manifest.json").exists() {
+            return p;
+        }
+    }
+    PathBuf::from(CANDIDATOS[0])
 }
 
 /// Carga (una sola vez) el manifiesto del atlas.
@@ -135,16 +160,21 @@ pub fn manifest() -> Option<&'static AssetManifest> {
 /// (orden alfabetico) para que el C++ y Rust coincidan siempre.
 fn sprite_ids() -> &'static HashMap<String, u32> {
     SPRITE_IDS.get_or_init(|| {
-        let mut names: Vec<String> = manifest()
-            .map(|m| m.entities.keys().cloned().collect())
-            .unwrap_or_default();
-        names.sort();
-        names
-            .iter()
-            .enumerate()
-            .map(|(i, n)| (n.clone(), i as u32 + 1))
-            .collect()
+        manifest()
+            .map(sprite_ids_for)
+            .unwrap_or_default()
     })
+}
+
+/// Mapa nombre -> id de sprite a partir de un manifiesto concreto.
+pub fn sprite_ids_for(m: &AssetManifest) -> HashMap<String, u32> {
+    let mut names: Vec<String> = m.entities.keys().cloned().collect();
+    names.sort();
+    names
+        .iter()
+        .enumerate()
+        .map(|(i, n)| (n.clone(), i as u32 + 1))
+        .collect()
 }
 
 /// Id de sprite de un tipo de entidad de Factorio. 0 = sin sprite.
@@ -157,14 +187,24 @@ pub fn sprite_id_for_type(type_name: &str) -> u32 {
 /// `frame` es el frame de animacion del motor. `direction` es la direccion de
 /// Factorio (0..15) que elige la fila del sprite girado.
 pub fn sprite_frame(sprite_id: u32, frame: u32, direction: u8) -> Option<SpriteFrame> {
+    let m = manifest()?;
+    sprite_frame_in(m, sprite_id, frame, direction)
+}
+
+/// Resolucion del frame contra un manifiesto concreto (version testeable).
+pub fn sprite_frame_in(
+    m: &AssetManifest,
+    sprite_id: u32,
+    frame: u32,
+    direction: u8,
+) -> Option<SpriteFrame> {
     if sprite_id == 0 {
         return None;
     }
-    let manifest = manifest()?;
-    let mut names: Vec<&String> = manifest.entities.keys().collect();
+    let mut names: Vec<&String> = m.entities.keys().collect();
     names.sort();
     let name = names.get((sprite_id - 1) as usize)?;
-    let entity = manifest.entities.get(*name)?;
+    let entity = m.entities.get(*name)?;
     let layer = entity.layers.first()?;
 
     let anim = layer.animation.as_ref().map(|a| a.frames).unwrap_or(1).max(1);
@@ -196,6 +236,7 @@ pub fn sprite_frame(sprite_id: u32, frame: u32, direction: u8) -> Option<SpriteF
         frame_height: layer.frame_height,
         direction_count: dirs,
         animation_frames: anim,
+        scale: layer.scale,
     })
 }
 
@@ -209,6 +250,38 @@ pub fn atlas_file() -> Option<PathBuf> {
         atlas.file.clone()
     };
     Some(assets_dir().join(file))
+}
+
+static ATLAS_PIXELS: OnceLock<Option<(Vec<u8>, u32, u32)>> = OnceLock::new();
+
+/// Pixeles del atlas en RGBA8 crudo, listos para subir a la GPU.
+///
+/// Android no trae decodificador de PNG, asi que el extractor escribe
+/// ademas el atlas en crudo (`atlas.rgba`): son width*height*4 bytes en
+/// orden de filas, sin cabecera. Aqui solo se lee el fichero.
+pub fn atlas_pixels() -> Option<&'static (Vec<u8>, u32, u32)> {
+    ATLAS_PIXELS
+        .get_or_init(|| {
+            let m = manifest()?;
+            let atlas = m.atlas.as_ref()?;
+            let raw_name = atlas
+                .raw_file
+                .clone()
+                .unwrap_or_else(|| "atlas.rgba".to_string());
+            let path = assets_dir().join(raw_name);
+            let data = std::fs::read(&path).ok()?;
+            let expected = (atlas.width as usize) * (atlas.height as usize) * 4;
+            if data.len() != expected {
+                log::warn!(
+                    "Atlas crudo con tamano inesperado ({} != {} bytes)",
+                    data.len(),
+                    expected
+                );
+                return None;
+            }
+            Some((data, atlas.width, atlas.height))
+        })
+        .as_ref()
 }
 
 #[cfg(test)]
@@ -273,6 +346,7 @@ mod tests {
             frame_count: 8,
             direction_count: 4,
             animation: Some(Animation { frames: 2, speed: 0.1 }),
+            scale: 0.5,
             frames,
         };
         let per_row = (layer.frame_count / layer.direction_count).max(1);
@@ -290,6 +364,36 @@ mod tests {
         // Direccion norte (0) -> fila 0.
         let row = (0 * layer.direction_count) / 16;
         assert_eq!(row, 0);
+    }
+
+    #[test]
+    fn test_manifiesto_real_si_existe() {
+        // Si el atlas ya esta generado, se comprueba que el motor sabria
+        // dibujar los tipos principales del juego.
+        let dir = std::path::Path::new("build/factorio_assets");
+        let manifest_path = dir.join("manifest.json");
+        if !manifest_path.exists() {
+            eprintln!("sin atlas generado; se omite la comprobacion");
+            return;
+        }
+        let text = std::fs::read_to_string(&manifest_path).unwrap();
+        let m: AssetManifest = serde_json::from_str(&text).expect("manifiesto real valido");
+        let ids = sprite_ids_for(&m);
+
+        for tipo in [
+            "assembling-machine-1",
+            "transport-belt",
+            "stone-furnace",
+            "burner-mining-drill",
+            "inserter",
+        ] {
+            let id = ids.get(tipo).copied().unwrap_or(0);
+            assert!(id > 0, "{} deberia tener sprite en el manifiesto", tipo);
+            let f = sprite_frame_in(&m, id, 0, 0)
+                .unwrap_or_else(|| panic!("{} deberia tener un frame resoluble", tipo));
+            assert!(f.w > 0.0 && f.h > 0.0, "{} con frame vacio", tipo);
+            assert!(f.scale > 0.0, "{} con escala nula", tipo);
+        }
     }
 
     #[test]

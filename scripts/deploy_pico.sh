@@ -15,6 +15,8 @@ set -euo pipefail
 # Opciones:
 #   --stream    sigue los logs en vivo (Ctrl+C para salir)
 #   --no-start  no arranca el servidor (solo deja todo listo)
+#   --strip     recorta el binario del motor (249 MB -> 62 MB) para acelerar
+#               la transferencia. Opcional: el motor funciona igual sin depurar.
 
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ADB="${ADB:-/Volumes/X10Pro/Android/sdk/platform-tools/adb}"
@@ -34,10 +36,12 @@ MOD_ID="xfactorvr_bridge_0.1.0"
 
 STREAM=0
 START_SERVER=1
+STRIP=0
 for arg in "$@"; do
     case "$arg" in
         --stream)   STREAM=1 ;;
         --no-start) START_SERVER=0 ;;
+        --strip)    STRIP=1 ;;
     esac
 done
 
@@ -76,8 +80,30 @@ if [ ! -d "$LOCAL_FACTORIO/bin/arm64" ]; then
 fi
 
 PAYLOAD_TAR="$PROJECT_ROOT/build/factorio_arm64.tar"
+STAGE_DIR="$PROJECT_ROOT/build/factorio_stage"
 mkdir -p "$PROJECT_ROOT/build"
-tar -cf "$PAYLOAD_TAR" -C "$LOCAL_FACTORIO" bin data config-path.cfg
+
+# COPYFILE_DISABLE evita que bsdtar meta los metadatos de macOS (AppleDouble)
+# dentro del tar: en Linux aparecerian como ficheros basura ._* al extraer.
+COPYFILE_DISABLE=1 tar -cf "$PAYLOAD_TAR" -C "$LOCAL_FACTORIO" data config-path.cfg
+
+if [ "$STRIP" -eq 1 ]; then
+    echo "    recortando el binario del motor..."
+    rm -rf "$STAGE_DIR"
+    mkdir -p "$STAGE_DIR/bin/arm64"
+    cp "$LOCAL_FACTORIO/bin/arm64/factorio" "$STAGE_DIR/bin/arm64/factorio"
+    STRIP_BIN="/Volumes/X10Pro/Android/sdk/ndk/27.0.11718014/toolchains/llvm/prebuilt/darwin-x86_64/bin/llvm-strip"
+    if [ -x "$STRIP_BIN" ]; then
+        "$STRIP_BIN" --strip-unneeded "$STAGE_DIR/bin/arm64/factorio"
+    else
+        echo "    llvm-strip no disponible; se envia el binario sin recortar."
+    fi
+    COPYFILE_DISABLE=1 tar -rf "$PAYLOAD_TAR" -C "$STAGE_DIR" bin
+    rm -rf "$STAGE_DIR"
+else
+    COPYFILE_DISABLE=1 tar -rf "$PAYLOAD_TAR" -C "$LOCAL_FACTORIO" bin
+fi
+
 echo "    payload: $(du -h "$PAYLOAD_TAR" | cut -f1)"
 
 echo "[3/6] Copiando el motor a $REMOTE_FACTORIO ..."

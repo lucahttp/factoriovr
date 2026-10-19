@@ -875,6 +875,23 @@ impl RconClient {
         }
     }
 
+    /// Envia un comando y reintenta una vez si la respuesta llega vacia.
+    ///
+    /// Factorio rechaza el PRIMER comando de consola de cada sesion con el
+    /// aviso "Using Lua console commands will disable achievements. Please
+    /// repeat the command to proceed": la respuesta llega vacia y el comando NO
+    /// se ejecuta. Hay que repetirlo con el mismo texto. Verificado contra el
+    /// servidor real en scripts/local_rcon_check.sh.
+    pub fn execute_collect_retry(&mut self, command: &str, max_packets: usize) -> Option<String> {
+        let first = self.execute_collect(command, max_packets);
+        if let Some(ref body) = first {
+            if !body.trim().is_empty() {
+                return first;
+            }
+        }
+        self.execute_collect(command, max_packets)
+    }
+
     /// Envia un comando y extrae el JSON de la respuesta.
     pub fn execute_json(&mut self, command: &str) -> Option<serde_json::Value> {
         let body = self.execute_collect(command, 3)?;
@@ -1107,8 +1124,10 @@ pub fn poll_rcon_sync(dt: f32, view_center: (f32, f32)) -> RconPoll {
     );
     let inv_cmd = format!("{}remote.call('xfactorvr', 'get_inventory')", prefix);
 
-    let snapshot = rcon.execute_collect(&snap_cmd, 3);
-    let inventory = rcon.execute_collect(&inv_cmd, 2);
+    // Factorio rechaza el primer comando de consola de la sesion (ver
+    // execute_collect_retry), asi que ambos comandos se lanzan con reintento.
+    let snapshot = rcon.execute_collect_retry(&snap_cmd, 3);
+    let inventory = rcon.execute_collect_retry(&inv_cmd, 2);
 
     // Si el comando silencioso no trae carga util, se prueba con el comando
     // normal, que ademas imprime el valor de retorno en la consola.

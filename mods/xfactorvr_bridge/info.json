@@ -1,8 +1,8 @@
 {
   "name": "xfactorvr_bridge",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "title": "XFactorVR Tabletop Bridge Mod",
   "author": "Luca",
-  "factorio_version": "2.0",
+  "factorio_version": "2.1",
   "description": "Puente entre el motor real de Factorio 2.0 y el tabletop OpenXR de XFactorVR: serializa el estado de la fabrica por RCON y ejecuta las acciones de construccion, minado y fabricacion."
 }

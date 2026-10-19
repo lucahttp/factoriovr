@@ -28,7 +28,9 @@ rcon = {
 }
 
 -- Tabla global de Factorio (persiste entre guardados).
-global = {}
+-- Factorio 2.0 elimino la tabla `global` en favor de `storage`.
+-- El mock replica la API real: si el mod vuelve a usar `global`, este banco falla.
+storage = {}
 
 local interface = nil
 remote = {
@@ -57,13 +59,19 @@ local function make_entity(spec)
         direction = spec.direction,
         status = spec.status,
         health = spec.health or 100,
-        health_max = spec.health_max or 100,
+        -- En Factorio 2.0 el maximo de vida es `max_health` (no `health_max`).
+        max_health = spec.max_health or 100,
         amount = spec.amount,
         crafting_progress = spec.crafting_progress,
         held_stack_position = spec.held_stack_position,
-        recipe = spec.recipe,
+        held_stack = spec.held_stack,
+        current_recipe = spec.recipe,
         valid = true,
     }
+    e.get_health_ratio = function()
+        if not e.max_health or e.max_health <= 0 then return 1.0 end
+        return e.health / e.max_health
+    end
     e.get_output_inventory = function()
         if spec.type ~= "assembling-machine" and spec.type ~= "furnace" then
             error("no output inventory")
@@ -83,7 +91,13 @@ local function make_entity(spec)
     end
     -- En Factorio los metodos de LuaEntity se invocan con notacion de punto:
     -- e.set_recipe("iron-gear-wheel").
-    e.set_recipe = function(r) e.recipe = r end
+    -- En 2.0 la receta actual se lee con get_recipe(), que devuelve un
+    -- prototipo con campo `name`.
+    e.set_recipe = function(r) e.current_recipe = r end
+    e.get_recipe = function()
+        if not e.current_recipe then return nil end
+        return { name = e.current_recipe }
+    end
     e.destroy = function() e.valid = false end
     return e
 end
@@ -134,21 +148,40 @@ local surface = {
     end,
 }
 
+-- En Factorio 2.0 las recetas NO cuelgan de `game.recipe_prototypes`: viven en
+-- `force.recipes`, indexadas por nombre. El mock replica esa forma real.
+-- IMPORTANTE: un LuaRecipe NO tiene `main_product` (eso pertenece al
+-- LuaRecipePrototype). El motor real falla con "LuaRecipe doesn't contain key
+-- main_product" si el mod lo usa, asi que el mock tampoco lo expone: si el mod
+-- vuelve a depender de `main_product`, este banco lo detecta.
+local RECIPES = {
+    ["iron-gear-wheel"] = {
+        name = "iron-gear-wheel",
+        ingredients = { { type = "item", name = "iron-plate", amount = 2 } },
+        products = { { type = "item", name = "iron-gear-wheel", amount = 1 } },
+    },
+    ["transport-belt"] = {
+        name = "transport-belt",
+        ingredients = { { type = "item", name = "iron-plate", amount = 1 },
+                        { type = "item", name = "iron-gear-wheel", amount = 1 } },
+        products = { { type = "item", name = "transport-belt", amount = 2 } },
+    },
+    ["inserter"] = {
+        name = "inserter",
+        ingredients = { { type = "item", name = "iron-plate", amount = 1 },
+                        { type = "item", name = "iron-gear-wheel", amount = 1 },
+                        { type = "item", name = "electronic-circuit", amount = 1 } },
+        products = { { type = "item", name = "inserter", amount = 1 } },
+    },
+}
+
 game = {
     surfaces = { surface },
     players = {}, -- servidor headless: sin jugador conectado
-    recipe_prototypes = {
-        ["iron-gear-wheel"] = {
-            ingredients = { { name = "iron-plate", amount = 2 } },
-            result = { name = "iron-gear-wheel", amount = 1 },
-        },
-        ["transport-belt"] = {
-            ingredients = { { name = "iron-plate", amount = 1 }, { name = "iron-gear-wheel", amount = 1 } },
-            result = { name = "transport-belt", amount = 2 },
-        },
-        ["inserter"] = {
-            ingredients = { { name = "iron-plate", amount = 1 }, { name = "iron-gear-wheel", amount = 1 }, { name = "electronic-circuit", amount = 1 } },
-            result = { name = "inserter", amount = 1 },
+    forces = {
+        {
+            name = "player",
+            recipes = RECIPES,
         },
     },
     tick = 1,
@@ -258,7 +291,7 @@ check("dos parches en total", select(2, json:gsub('"t":%d,"x":%d+%.%d+,"y":%d+%.
 
 print("\n== Colocacion de entidades con orientacion ==")
 entities = {}
-global.xfactorvr_inventory["transport-belt"] = 5
+storage.xfactorvr_inventory["transport-belt"] = 5
 printed = {}
 local ok = interface.place_entity("transport-belt", 3.0, 4.0, math.pi * 0.5) -- este
 check("place_entity devuelve true", ok == true)
@@ -269,19 +302,19 @@ check("direccion este (4)", created.created_with.direction == 4, created.created
 check("posicion correcta", created.created_with.position[1] == 3.0 and created.created_with.position[2] == 4.0)
 check("fuerza player", created.created_with.force == "player")
 check("raise_built activo", created.created_with.raise_built == true)
-check("consumo 1 del inventario", global.xfactorvr_inventory["transport-belt"] == 4,
-    global.xfactorvr_inventory["transport-belt"])
+check("consumo 1 del inventario", storage.xfactorvr_inventory["transport-belt"] == 4,
+    storage.xfactorvr_inventory["transport-belt"])
 
 -- Rotacion: 180 grados -> sur (8)
 entities = {}
-global.xfactorvr_inventory["transport-belt"] = 5
+storage.xfactorvr_inventory["transport-belt"] = 5
 interface.place_entity("transport-belt", 0.0, 0.0, math.pi)
 check("rotacion 180 -> sur (8)", entities[1].created_with.direction == 8, entities[1].created_with.direction)
 
 -- Sin item en inventario: cae a la alternativa (quemador)
 entities = {}
-global.xfactorvr_inventory["electric-mining-drill"] = nil
-global.xfactorvr_inventory["burner-mining-drill"] = 1
+storage.xfactorvr_inventory["electric-mining-drill"] = nil
+storage.xfactorvr_inventory["burner-mining-drill"] = 1
 interface.place_entity("electric-mining-drill", 1.0, 1.0, 0)
 check("perforadora electrica cae a quemador", entities[1].created_with.name == "burner-mining-drill",
     entities[1].created_with.name)
@@ -293,8 +326,8 @@ printed = {}
 local ore = interface.manual_mine(2.0, 2.0)
 check("minado devuelve id de mineral", ore == 1, ore)
 check("veta reducida", entities[1].amount == 9, entities[1].amount)
-check("mineral al inventario", global.xfactorvr_inventory["iron-ore"] == 1,
-    global.xfactorvr_inventory["iron-ore"])
+check("mineral al inventario", storage.xfactorvr_inventory["iron-ore"] == 1,
+    storage.xfactorvr_inventory["iron-ore"])
 check("respuesta numerica", last_print() == "1", last_print())
 
 print("\n== Interaccion con maquinas ==")
@@ -307,7 +340,7 @@ table.insert(entities, make_entity({
 printed = {}
 local looted = interface.interact_machine(0, 0)
 check("recoge 3 engranajes", looted == 3, looted)
-check("engranajes al inventario", global.xfactorvr_inventory["iron-gear-wheel"] == 3)
+check("engranajes al inventario", storage.xfactorvr_inventory["iron-gear-wheel"] == 3)
 
 -- Sin nada que recoger -> rota la receta
 entities = {}
@@ -316,27 +349,27 @@ table.insert(entities, make_entity({
     recipe = "iron-gear-wheel", output_contents = {},
 }))
 interface.interact_machine(0, 0)
-check("rota a la siguiente receta", entities[1].recipe == "electronic-circuit", entities[1].recipe)
+check("rota a la siguiente receta", entities[1].current_recipe == "electronic-circuit", entities[1].current_recipe)
 
 print("\n== Fabricacion con recetas reales ==")
-global.xfactorvr_inventory["iron-plate"] = 10
-global.xfactorvr_inventory["iron-gear-wheel"] = 0
-global.xfactorvr_inventory["electronic-circuit"] = 0
+storage.xfactorvr_inventory["iron-plate"] = 10
+storage.xfactorvr_inventory["iron-gear-wheel"] = 0
+storage.xfactorvr_inventory["electronic-circuit"] = 0
 printed = {}
 ok = interface.craft("iron-gear-wheel", 1)
 check("craft devuelve true", ok == true)
-check("consume 2 planchas", global.xfactorvr_inventory["iron-plate"] == 8, global.xfactorvr_inventory["iron-plate"])
-check("produce 1 engranaje", global.xfactorvr_inventory["iron-gear-wheel"] == 1)
+check("consume 2 planchas", storage.xfactorvr_inventory["iron-plate"] == 8, storage.xfactorvr_inventory["iron-plate"])
+check("produce 1 engranaje", storage.xfactorvr_inventory["iron-gear-wheel"] == 1)
 
 -- Falta un ingrediente -> no fabrica y no consume
-global.xfactorvr_inventory["iron-plate"] = 0
-global.xfactorvr_inventory["iron-gear-wheel"] = 1
+storage.xfactorvr_inventory["iron-plate"] = 0
+storage.xfactorvr_inventory["iron-gear-wheel"] = 1
 ok = interface.craft("iron-gear-wheel", 1)
 check("craft sin ingredientes falla", ok == false)
-check("no altera el inventario", global.xfactorvr_inventory["iron-gear-wheel"] == 1)
+check("no altera el inventario", storage.xfactorvr_inventory["iron-gear-wheel"] == 1)
 
 print("\n== Inventario ==")
-global.xfactorvr_inventory = { ["iron-plate"] = 5, ["coal"] = 2, ["desconocido"] = 9 }
+storage.xfactorvr_inventory = { ["iron-plate"] = 5, ["coal"] = 2, ["desconocido"] = 9 }
 printed = {}
 local inv_json = interface.get_inventory()
 check("devuelve JSON de array", inv_json:sub(1, 1) == "[", inv_json)
@@ -344,12 +377,60 @@ check("planchas de hierro id=5", inv_json:find('{"id":5,"count":5}') ~= nil, inv
 check("carbon id=3", inv_json:find('{"id":3,"count":2}') ~= nil, inv_json)
 check("items desconocidos omitidos", inv_json:find("desconocido") == nil, inv_json)
 
+-- ---------------------------------------------------------------------------
+-- Inventario de un jugador real conectado.
+--
+-- Este camino es el que estaba roto: el mod llamaba a `inv.remove_item`, que
+-- no existe en Factorio 2.0. El pcall lo silenciaba y los ingredientes nunca
+-- se consumian, con lo que se podian fabricar items sin limite.
+-- ---------------------------------------------------------------------------
+
+print("\n== Fabricacion con jugador conectado ==")
+local player_items = { ["iron-plate"] = 5, ["iron-gear-wheel"] = 0 }
+local mock_player = {
+    valid = true,
+    force = game.forces[1],
+    get_main_inventory = function()
+        return {
+            get_item_count = function(name) return player_items[name] or 0 end,
+            get_contents = function() return player_items end,
+            insert = function(item)
+                player_items[item.name] = (player_items[item.name] or 0) + item.count
+                return item.count
+            end,
+            -- Factorio 2.0: remove(nombre, cantidad). Devuelve lo quitado.
+            remove = function(name, count)
+                local have = player_items[name] or 0
+                local take = math.min(have, count)
+                player_items[name] = have - take
+                return take
+            end,
+        }
+    end,
+    mine_entity = function(e, _force) e.destroy() end,
+}
+game.players = { mock_player }
+
+ok = interface.craft("iron-gear-wheel", 1)
+check("craft con jugador devuelve true", ok == true)
+check("consume las planchas del jugador", player_items["iron-plate"] == 3, player_items["iron-plate"])
+check("entrega el engranaje al jugador", player_items["iron-gear-wheel"] == 1, player_items["iron-gear-wheel"])
+
+-- Sin ingredientes suficientes no se fabrica ni se consume nada.
+player_items["iron-plate"] = 0
+ok = interface.craft("iron-gear-wheel", 1)
+check("craft sin planchas falla", ok == false)
+check("no toca el inventario del jugador", player_items["iron-gear-wheel"] == 1, player_items["iron-gear-wheel"])
+
+-- Volvemos al modo servidor headless (sin jugador) para el resto de pruebas.
+game.players = {}
+
 print("\n== set_recipe ==")
 entities = {}
 table.insert(entities, make_entity({ name = "assembling-machine-1", type = "assembling-machine", x = 0, y = 0 }))
 ok = interface.set_recipe(0, 0, "transport-belt")
 check("set_recipe devuelve true", ok == true)
-check("receta aplicada", entities[1].recipe == "transport-belt", entities[1].recipe)
+check("receta aplicada", entities[1].current_recipe == "transport-belt", entities[1].current_recipe)
 
 -- ---------------------------------------------------------------------------
 

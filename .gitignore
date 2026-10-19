@@ -36,3 +36,5 @@ Generals-Zero-Hour-XR/
 
 # Local IDE & Cargo config
 .cargo/
+__pycache__/
+*.pyc

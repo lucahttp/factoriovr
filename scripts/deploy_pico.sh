@@ -32,7 +32,13 @@ REMOTE_SCRIPT="/data/local/tmp/start_factorio_standalone.sh"
 # Payload local del motor headless ARM64.
 LOCAL_FACTORIO="$PROJECT_ROOT/factorio_arm64"
 LOCAL_MOD="$PROJECT_ROOT/mods/xfactorvr_bridge"
-MOD_ID="xfactorvr_bridge_0.1.0"
+# La carpeta del mod debe llamarse <nombre>_<version> de info.json, o Factorio
+# no lo carga. Se deriva del propio info.json para que no se desincronice.
+MOD_ID=$(python3 -c "
+import json
+d = json.load(open('$LOCAL_MOD/info.json'))
+print(d['name'] + '_' + d['version'])
+")
 
 STREAM=0
 START_SERVER=1

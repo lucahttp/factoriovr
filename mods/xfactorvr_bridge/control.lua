@@ -136,7 +136,7 @@ end
 --
 -- El servidor headless arranca sin jugador conectado, asi que game.players[1]
 -- suele ser nil. Para que el juego sea jugable igual, el modulo mantiene un
--- inventario propio persistido en `global`. Si alguien conecta un cliente
+-- inventario propio persistido en `storage`. Si alguien conecta un cliente
 -- real, se usa el inventario de ese jugador.
 -- ---------------------------------------------------------------------------
 
@@ -153,14 +153,32 @@ local function real_player()
     return nil
 end
 
+--- Fuerza activa: la del jugador si hay alguno conectado, si no la primera
+--- del juego. En Factorio 2.0 las recetas ya no cuelgan de `game.recipe_prototypes`
+--- sino de `force.recipes`, asi que hace falta una fuerza de referencia.
+local function active_force()
+    local p = real_player()
+    if p and p.valid and p.force then return p.force end
+    return game.forces[1]
+end
+
+--- Estado persistente del mod.
+--- Factorio 2.0 elimino la tabla global en favor de storage; usar `global`
+--- en 2.x provoca un error no recuperable en on_init que impide arrancar la
+--- partida (detectado con el servidor real en contenedor ARM64).
+local function state()
+    return storage
+end
+
 local function virtual_inventory()
-    if not global.xfactorvr_inventory then
-        global.xfactorvr_inventory = {}
+    local st = state()
+    if not st.xfactorvr_inventory then
+        st.xfactorvr_inventory = {}
         for name, count in pairs(START_INVENTORY) do
-            global.xfactorvr_inventory[name] = count
+            st.xfactorvr_inventory[name] = count
         end
     end
-    return global.xfactorvr_inventory
+    return st.xfactorvr_inventory
 end
 
 --- Cantidad de un item en el inventario activo.
@@ -204,8 +222,11 @@ local function inv_remove(name, count)
             local have = inv_get(name)
             local take = math.min(have, count)
             if take > 0 then
-                local ok = pcall(function() inv.remove_item({ name = name, count = take }) end)
-                if ok then return take end
+                -- En Factorio 2.0 el metodo es `remove(nombre, cantidad)`.
+                -- Antes se usaba `remove_item`, que no existe: el pcall lo
+                -- silenciaba y los items nunca se consumian del inventario.
+                local ok, removed = pcall(function() return inv.remove(name, take) end)
+                if ok and removed and removed > 0 then return removed end
             end
         end
     end
@@ -237,8 +258,10 @@ local MAX_ENTITIES = 3000
 local RESOURCE_CELL = 4.0
 
 local function status_of(e)
-    if not e.status then return 0 end
-    local s = e.status
+    -- `status` solo existe en algunas entidades y leerlo puede fallar; se
+    -- protege igual que el resto de propiedades opcionales.
+    local ok, s = pcall(function() return e.status end)
+    if not ok or not s then return 0 end
     if s == defines.entity_status.working then return 1 end
     if s == defines.entity_status.low_power then return 2 end
     if s == defines.entity_status.no_fuel then return 3 end
@@ -248,12 +271,20 @@ local function status_of(e)
 end
 
 local function health_of(e)
-    local max = e.health_max
-    local cur = e.health
-    if max and cur and max > 0 then
-        local ratio = cur / max
+    -- En Factorio 2.0 el maximo de vida es `max_health`; `health_max` ya no
+    -- existe y devolvia nil, dejando siempre la salud al 100%.
+    local ok_ratio, ratio = pcall(function() return e.get_health_ratio() end)
+    if ok_ratio and ratio then
         if ratio < 0 then ratio = 0 elseif ratio > 1 then ratio = 1 end
         return ratio
+    end
+
+    local max = e.max_health
+    local cur = e.health
+    if max and cur and max > 0 then
+        local r = cur / max
+        if r < 0 then r = 0 elseif r > 1 then r = 1 end
+        return r
     end
     return 1.0
 end
@@ -294,10 +325,21 @@ local function serialize_entity(e)
             progress = math.min(1.0, len)
             arm_angle = math.atan2(dx, -dy)
         end
-    elseif e.crafting_progress then
-        progress = e.crafting_progress
-    elseif e.rotation then
-        progress = (e.rotation or 0.0) / (TAU / 16.0)
+    else
+        -- En Factorio 2.x leer `crafting_progress` en una entidad que no es
+        -- ensambladora LANZA ERROR ("Entity is not crafting-machine"), no
+        -- devuelve nil. Sin pcall, una sola piedra en el mapa abortaba la
+        -- instantanea entera.
+        local ok_cp, cp = pcall(function() return e.crafting_progress end)
+        if ok_cp and cp then progress = cp end
+    end
+
+    if type_id == 9 then
+        -- Cinta: la API Lua de Factorio 2.0 no expone la posicion de los
+        -- items sobre la banda, asi que la fase de avance se sintetiza con
+        -- el tick del juego. La direccion de flujo si viene del motor real.
+        local phase = (game.tick + math.floor(e.position.x * 7 + e.position.y * 13)) % 60
+        progress = phase / 60.0
     end
 
     local out = string.format(
@@ -556,8 +598,12 @@ remote.add_interface("xfactorvr", {
 
                 -- 3. Sin nada que recoger: la ensambladora rota de receta.
                 if looted == 0 and e.type == "assembling-machine" then
+                    -- En 2.0 la receta actual se lee con `get_recipe()`.
                     local current = nil
-                    pcall(function() current = e.recipe end)
+                    pcall(function()
+                        local r = e.get_recipe()
+                        if r then current = r.name end
+                    end)
                     local next_recipe = RECIPE_ROTATION[1]
                     for i, r in ipairs(RECIPE_ROTATION) do
                         if r == current then
@@ -621,7 +667,10 @@ remote.add_interface("xfactorvr", {
     -- Fabrica una receta usando las recetas reales del juego.
     craft = function(recipe_name, count)
         count = count or 1
-        local rp = game.recipe_prototypes[recipe_name]
+        -- En Factorio 2.0 `game.recipe_prototypes` ya no existe: las recetas
+        -- viven en `force.recipes`, indexadas por nombre.
+        local f = active_force()
+        local rp = f and f.recipes and f.recipes[recipe_name] or nil
         if not rp then
             rcon.print("ERR|unknown_recipe")
             return false
@@ -640,9 +689,24 @@ remote.add_interface("xfactorvr", {
             inv_remove(ing.name, ing.amount * count)
         end
 
-        local result = rp.result
-        if result and result.name then
-            inv_add(result.name, (result.amount or 1) * count)
+        -- En Factorio 2.x `force.recipes[nombre]` devuelve un LuaRecipe (el
+        -- objeto de recipes de la fuerza), NO un LuaRecipePrototype: LuaRecipe
+        -- no tiene `main_product`, solo `products` (array de Product). El
+        -- prototipo sigue disponible en `rp.prototype`, pero `products` es
+        -- valido en ambos casos.
+        local product = nil
+        local best = -1
+        for _, p in pairs(rp.products or {}) do
+            if p and p.name and p.type ~= "fluid" then
+                local amount = p.amount or 1
+                if amount > best then
+                    best = amount
+                    product = p
+                end
+            end
+        end
+        if product and product.name then
+            inv_add(product.name, (product.amount or 1) * count)
         end
 
         rcon.print("OK")
@@ -679,6 +743,11 @@ remote.add_interface("xfactorvr", {
 
 script.on_init(function()
     virtual_inventory()
-    log("[XFactorVR] Bridge mod initialized. Factorio " .. tostring(game.tick and "2.0" or "?") ..
+    -- La version real del motor se lee del mod "core"; no hay una API directa
+    -- y "2.0" a pelo mentia en cuanto el visor corre Factorio 2.1.
+    local version = "?"
+    local ok, core = pcall(function() return mods["core"] end)
+    if ok and core and core.version then version = tostring(core.version) end
+    log("[XFactorVR] Bridge mod initialized. Factorio " .. version ..
         " con " .. tostring(EAST_STEP) .. " como paso de direccion este.")
 end)

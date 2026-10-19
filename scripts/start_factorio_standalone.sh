@@ -28,7 +28,7 @@ set -u
 FACTORIO_DIR="${FACTORIO_DIR:-/data/local/tmp/factorio_arm64}"
 FACTORIO_BIN="$FACTORIO_DIR/bin/arm64/factorio"
 MOD_DIR="$FACTORIO_DIR/mods"
-MOD_ID="xfactorvr_bridge_0.1.0"
+MOD_NAME="xfactorvr_bridge"
 SAVE_NAME="${SAVE_NAME:-xfactorvr_world.zip}"
 RCON_PORT="${RCON_PORT:-27015}"
 RCON_PASSWORD="${RCON_PASSWORD:-xfactorvr}"
@@ -96,6 +96,56 @@ find_loader() {
 # ---------------------------------------------------------------------------
 mkdir -p "$FACTORIO_DIR/logs" 2>/dev/null || true
 
+# ---------------------------------------------------------------------------
+# 4 bis. Ajustes del servidor: la simulacion debe correr SIN jugadores
+# ---------------------------------------------------------------------------
+# Factorio pausa el juego mientras no haya nadie conectado (auto-pause). En un
+# servidor headless no hay cliente nunca, asi que con el valor por defecto la
+# fabrica se queda CONGELADA: el visor veria un mundo que no avanza. Hay que
+# desactivarlo explicitamente.
+#
+# El motor lee los ajustes de servidor del directorio de configuracion, que
+# con config-path.cfg es <raiz>/config (config-path=__PATH__executable__/../../config).
+CONFIG_DIR="$FACTORIO_DIR/config"
+SETTINGS_FILE="$CONFIG_DIR/server-settings.json"
+mkdir -p "$CONFIG_DIR" 2>/dev/null || true
+
+if [ ! -f "$SETTINGS_FILE" ]; then
+    log "Creando $SETTINGS_FILE con auto_pause desactivado..."
+    cp /data/local/tmp/server-settings.json "$SETTINGS_FILE" 2>/dev/null \
+        || cat > "$SETTINGS_FILE" <<'JSON'
+{
+  "name": "XFactorVR",
+  "description": "Factorio para VR",
+  "visibility": { "public": false, "lan": true },
+  "require_user_verification": false,
+  "auto_pause": false,
+  "auto_pause_when_players_connect": false,
+  "autosave_interval": 10,
+  "autosave_slots": 3
+}
+JSON
+else
+    # Si existe, se asegura de que auto_pause siga desactivado.
+    if ! grep -q '"auto_pause"[[:space:]]*:[[:space:]]*false' "$SETTINGS_FILE" 2>/dev/null; then
+        log "Forzando auto_pause=false en $SETTINGS_FILE"
+        cp "$SETTINGS_FILE" "$SETTINGS_FILE.bak" 2>/dev/null || true
+        cat > "$SETTINGS_FILE" <<'JSON'
+{
+  "name": "XFactorVR",
+  "description": "Factorio para VR",
+  "visibility": { "public": false, "lan": true },
+  "require_user_verification": false,
+  "auto_pause": false,
+  "auto_pause_when_players_connect": false,
+  "autosave_interval": 10,
+  "autosave_slots": 3
+}
+JSON
+    fi
+fi
+log "Ajustes de servidor: $SETTINGS_FILE"
+
 if existing_pid >/dev/null 2>&1; then
     _pid=$(existing_pid)
     log "Ya hay un servidor Factorio en marcha (PID $_pid)."
@@ -128,10 +178,20 @@ log "Linker de glibc: $LOADER"
 
 # El mod puente es lo que publica el estado del mundo por RCON. Si no esta,
 # el servidor arranca pero el juego seguira viendo solo la simulacion local.
-if [ -f "$MOD_DIR/$MOD_ID/control.lua" ] && [ -f "$MOD_DIR/$MOD_ID/info.json" ]; then
-    log "Mod puente presente: $MOD_DIR/$MOD_ID"
+# La carpeta se localiza por prefijo: la version va en el nombre de la carpeta
+# y cambia con cada entrega, asi que no se fija a mano.
+MOD_PATH=""
+for _d in "$MOD_DIR/$MOD_NAME"_*/; do
+    if [ -f "${_d}control.lua" ] && [ -f "${_d}info.json" ]; then
+        MOD_PATH="${_d%/}"
+        break
+    fi
+done
+
+if [ -n "$MOD_PATH" ]; then
+    log "Mod puente presente: $MOD_PATH"
 else
-    log "AVISO: no se encuentra el mod $MOD_ID en $MOD_DIR."
+    log "AVISO: no se encuentra el mod $MOD_NAME en $MOD_DIR."
     log "        El servidor arrancara, pero sin puente RCON el juego"
     log "        seguira usando la simulacion local de Rust."
 fi

@@ -9,8 +9,8 @@ La fábrica se proyecta sobre tu mesa real como un diorama tridimensional intera
 ## Características Principales
 
 * **Modo Maqueta / Tabletop Diorama (Estilo Generals Zero Hour XR)**: Proyecta la fábrica de Factorio anclada de forma fija al suelo en espacio `XR_REFERENCE_SPACE_TYPE_STAGE` a la altura exacta [...]
-* **Plinto Geológico y Recorte de Borde (`u_board_bounds`)**: El terreno se asienta sobre un zócalo con estratos de tierra/roca y marco biselado, recortando limpiamente la geometría para no desbord[...]
-* **Texturas de Alta Resolución Factorio**: Losas de concreto industrial con juntas de dilatación y pernos de anclaje, franjas diagonales de peligro (hazard stripes a 45°), cintas transportador[...]
+* **Plinto Geológico y Recorte de Borde (`u_board_bounds`)**: El terreno se asienta sobre un zócalo con estratos de tierra/roca y marco biselado, recortando limpiamente la geometría para no des[...]
+* **Texturas de Alta Resolución Factorio**: Losas de concreto industrial con juntas de dilatación y pernos de anclaje, franjas diagonales de peligro (hazard stripes a 45°), cintas transportadoras a[...]
 * **Maquinaria 3D Completa (`factorio-3d-mod`)**: Máquinas de ensamblaje 2 con engranajes giratorios y chimenea de vapor, perforadoras con vástago rotatorio y yacimiento, hornos de acero con fue[...]
 * **Consola de Mando Espacial Holográfica (`XrCommandUI`)**: Panel flotante de cristal desacoplado de la mesa con 5 botones interactivos (`[OBSERVADOR 1:1]`, `[RE-ANCLAR]`, `[ENERGÍA]`, `[ÍTEMS[...]
 * **Manipulación de Mesa 6DoF (`XrSurfaceGrab`)**: Agarra y traslada la maqueta por la habitación manteniendo presionado el botón Grip; ajusta la altura milimétrica y orientación con el joyst[...]

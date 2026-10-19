@@ -105,6 +105,58 @@ impl TabletopManager {
     }
 }
 
+pub const ENTITY_ASSEMBLING_MACHINE: u32 = 1;
+pub const ENTITY_MINING_DRILL: u32 = 2;
+pub const ENTITY_FURNACE: u32 = 3;
+pub const ENTITY_RADAR: u32 = 4;
+pub const ENTITY_ROBOPORT: u32 = 5;
+pub const ENTITY_GUN_TURRET: u32 = 6;
+pub const ENTITY_CHEST: u32 = 7;
+pub const ENTITY_ELECTRIC_POLE: u32 = 8;
+pub const ENTITY_TRANSPORT_BELT: u32 = 9;
+pub const ENTITY_INSERTER: u32 = 10;
+pub const ENTITY_BITER: u32 = 11;
+pub const ENTITY_TREE: u32 = 12;
+pub const ENTITY_PLAYER: u32 = 13;
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct LiveEntity {
+    pub entity_type: u32,
+    pub tile_x: f32,
+    pub tile_y: f32,
+    pub orientation: f32,
+    pub status: u32,
+    pub animation_progress: f32,
+    pub health_ratio: f32,
+}
+
+pub fn init_default_factory_entities() -> Vec<LiveEntity> {
+    vec![
+        // Ensambladora en (-5.5, -5.5) tiles
+        LiveEntity { entity_type: ENTITY_ASSEMBLING_MACHINE, tile_x: -5.5, tile_y: -5.5, orientation: 0.0, status: 1, animation_progress: 0.0, health_ratio: 1.0 },
+        // Minera eléctrica en (6.25, -5.5) tiles
+        LiveEntity { entity_type: ENTITY_MINING_DRILL, tile_x: 6.25, tile_y: -5.5, orientation: 0.0, status: 1, animation_progress: 0.0, health_ratio: 1.0 },
+        // Horno de acero en (11.0, -1.5) tiles
+        LiveEntity { entity_type: ENTITY_FURNACE, tile_x: 11.0, tile_y: -1.5, orientation: 0.0, status: 1, animation_progress: 0.0, health_ratio: 1.0 },
+        // Radar en (-11.0, 5.5) tiles
+        LiveEntity { entity_type: ENTITY_RADAR, tile_x: -11.0, tile_y: 5.5, orientation: 0.0, status: 1, animation_progress: 0.0, health_ratio: 1.0 },
+        // Robopuerto en (6.25, 5.5) tiles
+        LiveEntity { entity_type: ENTITY_ROBOPORT, tile_x: 6.25, tile_y: 5.5, orientation: 0.0, status: 1, animation_progress: 0.0, health_ratio: 1.0 },
+        // Torreta en (-11.0, -5.5) tiles orientada a 45°
+        LiveEntity { entity_type: ENTITY_GUN_TURRET, tile_x: -11.0, tile_y: -5.5, orientation: std::f32::consts::FRAC_PI_4, status: 1, animation_progress: 0.0, health_ratio: 1.0 },
+        // Cofre de acero en (-10.5, -1.5) tiles
+        LiveEntity { entity_type: ENTITY_CHEST, tile_x: -10.5, tile_y: -1.5, orientation: 0.0, status: 1, animation_progress: 0.0, health_ratio: 1.0 },
+        // Postes eléctricos en (0.0, -7.0) y (0.0, 7.0)
+        LiveEntity { entity_type: ENTITY_ELECTRIC_POLE, tile_x: 0.0, tile_y: -7.0, orientation: 0.0, status: 1, animation_progress: 0.0, health_ratio: 1.0 },
+        LiveEntity { entity_type: ENTITY_ELECTRIC_POLE, tile_x: 0.0, tile_y: 7.0, orientation: 0.0, status: 1, animation_progress: 0.0, health_ratio: 1.0 },
+        // Biter hostil en el borde (12.5, 6.25)
+        LiveEntity { entity_type: ENTITY_BITER, tile_x: 12.5, tile_y: 6.25, orientation: -2.0, status: 1, animation_progress: 0.0, health_ratio: 1.0 },
+        // Árbol en (-12.5, 8.0)
+        LiveEntity { entity_type: ENTITY_TREE, tile_x: -12.5, tile_y: 8.0, orientation: 0.5, status: 1, animation_progress: 0.0, health_ratio: 1.0 },
+    ]
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct DioramaVertex {

@@ -168,7 +168,7 @@ static inline void mat4_multiply(const float* a, const float* b, float* out) {
     matMultiply(out, a, b);
 }
 
-static inline void mat4_identity(float* m) {
+[[maybe_unused]] static inline void mat4_identity(float* m) {
     matIdentity(m);
 }
 
@@ -317,7 +317,86 @@ static GLuint s_tex_belt     = 0;
 static GLuint s_tex_soil     = 0;
 static GLuint s_tex_steel    = 0;
 
-// Sub-lotes estáticos de la fábrica
+// ============================================================================
+// SIMULACIÓN EN VIVO FACTORIO, ENTIDADES Y MODELOS 3D (FASE 1, 2, 3)
+// ============================================================================
+
+struct LiveEntity {
+    uint32_t entity_type;
+    float tile_x;
+    float tile_y;
+    float orientation;
+    uint32_t status;
+    float animation_progress;
+    float health_ratio;
+};
+
+enum EntityType {
+    ENTITY_NONE = 0,
+    ENTITY_ASSEMBLING_MACHINE = 1,
+    ENTITY_MINING_DRILL = 2,
+    ENTITY_FURNACE = 3,
+    ENTITY_RADAR = 4,
+    ENTITY_ROBOPORT = 5,
+    ENTITY_GUN_TURRET = 6,
+    ENTITY_CHEST = 7,
+    ENTITY_ELECTRIC_POLE = 8,
+    ENTITY_TRANSPORT_BELT = 9,
+    ENTITY_INSERTER = 10,
+    ENTITY_BITER = 11,
+    ENTITY_TREE = 12,
+    ENTITY_PLAYER = 13,
+    ENTITY_TYPE_COUNT = 14
+};
+
+typedef bool (*pfn_xfactorvr_load_glb)(const char* path, float target_width, DioramaVertex** out_verts, int* out_count);
+typedef void (*pfn_xfactorvr_free_glb)(DioramaVertex* verts, int count);
+typedef bool (*pfn_xfactorvr_get_live_entities)(LiveEntity* out_entities, int max_count, int* out_count);
+typedef bool (*pfn_xfactorvr_place_or_update_entity)(uint32_t entity_type, float tile_x, float tile_y, float orientation);
+typedef bool (*pfn_xfactorvr_mine_entity)(float tile_x, float tile_y);
+typedef void (*pfn_xfactorvr_update_simulation)(float delta_time);
+
+static pfn_xfactorvr_load_glb s_load_glb = nullptr;
+static pfn_xfactorvr_free_glb s_free_glb = nullptr;
+static pfn_xfactorvr_get_live_entities s_get_live_entities = nullptr;
+static pfn_xfactorvr_place_or_update_entity s_place_or_update_entity = nullptr;
+static pfn_xfactorvr_mine_entity s_mine_entity = nullptr;
+static pfn_xfactorvr_update_simulation s_update_simulation = nullptr;
+
+struct ModelMesh {
+    GLuint vao = 0;
+    GLuint vbo = 0;
+    int vertex_count = 0;
+    float width = 0.1f;
+};
+
+static ModelMesh s_entity_meshes[ENTITY_TYPE_COUNT];
+static ModelMesh s_turret_top_mesh;
+
+// Herramientas y Construcción 6DoF (Fase 2)
+static int s_selected_build_tool = ENTITY_ASSEMBLING_MACHINE;
+static float s_placement_yaw = 0.0f;
+static int s_hovered_quickbar_slot = -1;
+static bool s_stick_rotated = false;
+
+// Partículas de humo, vapor, polvo y chispas (Fase 3)
+struct Particle {
+    float x, y, z;
+    float vx, vy, vz;
+    float r, g, b, a;
+    float size;
+    float life;
+    float max_life;
+};
+static std::vector<Particle> s_particles;
+
+static void spawn_particle(float x, float y, float z, float vx, float vy, float vz,
+                           float r, float g, float b, float a, float size, float life) {
+    if (s_particles.size() >= 256) return;
+    s_particles.push_back({x, y, z, vx, vy, vz, r, g, b, a, size, life, life});
+}
+
+// Sub-lotes estáticos de la mesa y diorama
 static GLuint s_vao_soil = 0, s_vbo_soil = 0;
 static int s_count_soil = 0;
 
@@ -327,16 +406,13 @@ static int s_count_concrete = 0;
 static GLuint s_vao_hazard = 0, s_vbo_hazard = 0;
 static int s_count_hazard = 0;
 
-static GLuint s_vao_machines = 0, s_vbo_machines = 0;
-static int s_count_machines = 0;
-
 static GLuint s_vao_belt = 0, s_vbo_belt = 0;
 static int s_count_belt = 0;
 
 static GLuint s_vao_ui = 0, s_vbo_ui = 0;
 static int s_count_ui = 0;
 
-// Lote dinámico (Ítems en cinta, inserters, drones, radar, láser y retículo)
+// Lote dinámico (Ítems en cinta, cables catenarios, inserters, drones, retículos y partículas)
 static GLuint s_dynamic_vao = 0, s_dynamic_vbo = 0;
 
 static bool check_shader_compile(GLuint shader, const char* name) {
@@ -613,36 +689,32 @@ static GLuint create_mesh_vao(const std::vector<DioramaVertex>& verts, GLuint& o
     return vao;
 }
 
-typedef bool (*pfn_xfactorvr_load_glb)(const char* path, float target_width, DioramaVertex** out_verts, int* out_count);
-typedef void (*pfn_xfactorvr_free_glb)(DioramaVertex* verts, int count);
-
-static pfn_xfactorvr_load_glb s_load_glb = nullptr;
-static pfn_xfactorvr_free_glb s_free_glb = nullptr;
-
 static void init_glb_loader() {
-    if (s_load_glb && s_free_glb) return;
+    if (s_load_glb && s_get_live_entities) return;
     void* handle = RTLD_DEFAULT;
     s_load_glb = (pfn_xfactorvr_load_glb)dlsym(handle, "xfactorvr_load_glb");
     s_free_glb = (pfn_xfactorvr_free_glb)dlsym(handle, "xfactorvr_free_glb");
-    if (!s_load_glb) {
+    s_get_live_entities = (pfn_xfactorvr_get_live_entities)dlsym(handle, "xfactorvr_get_live_entities");
+    s_place_or_update_entity = (pfn_xfactorvr_place_or_update_entity)dlsym(handle, "xfactorvr_place_or_update_entity");
+    s_mine_entity = (pfn_xfactorvr_mine_entity)dlsym(handle, "xfactorvr_mine_entity");
+    s_update_simulation = (pfn_xfactorvr_update_simulation)dlsym(handle, "xfactorvr_update_simulation");
+
+    if (!s_load_glb || !s_get_live_entities) {
         void* mod_handle = dlopen("libxfactorvr.so", RTLD_NOW | RTLD_GLOBAL);
         if (mod_handle) {
             s_load_glb = (pfn_xfactorvr_load_glb)dlsym(mod_handle, "xfactorvr_load_glb");
             s_free_glb = (pfn_xfactorvr_free_glb)dlsym(mod_handle, "xfactorvr_free_glb");
+            s_get_live_entities = (pfn_xfactorvr_get_live_entities)dlsym(mod_handle, "xfactorvr_get_live_entities");
+            s_place_or_update_entity = (pfn_xfactorvr_place_or_update_entity)dlsym(mod_handle, "xfactorvr_place_or_update_entity");
+            s_mine_entity = (pfn_xfactorvr_mine_entity)dlsym(mod_handle, "xfactorvr_mine_entity");
+            s_update_simulation = (pfn_xfactorvr_update_simulation)dlsym(mod_handle, "xfactorvr_update_simulation");
         }
     }
-    if (s_load_glb && s_free_glb) {
-        LOGI("openxr_engine: Cargador GLB factorio-3d-mod enlazado exitosamente");
-    } else {
-        LOGE("openxr_engine: No se pudieron resolver símbolos GLB: %s", dlerror());
-    }
+    LOGI("openxr_engine: Cargador GLB y FFI live_entities enlazado (load=%p, get=%p, place=%p, mine=%p, update=%p)",
+         s_load_glb, s_get_live_entities, s_place_or_update_entity, s_mine_entity, s_update_simulation);
 }
 
-static bool append_glb_model(std::vector<DioramaVertex>& out_verts,
-                             const char* path,
-                             float target_width,
-                             float pos_x, float pos_y, float pos_z,
-                             float yaw_deg = 0.0f) {
+static bool load_mesh_from_glb(ModelMesh& out_mesh, const char* path, float target_width) {
     init_glb_loader();
     if (!s_load_glb) return false;
 
@@ -653,32 +725,71 @@ static bool append_glb_model(std::vector<DioramaVertex>& out_verts,
         return false;
     }
 
-    float rad = yaw_deg * (3.14159265f / 180.0f);
-    float cos_y = cosf(rad);
-    float sin_y = sinf(rad);
-
-    out_verts.reserve(out_verts.size() + count);
-    for (int i = 0; i < count; ++i) {
-        DioramaVertex v = raw_verts[i];
-        float rx = v.x * cos_y + v.z * sin_y;
-        float rz = -v.x * sin_y + v.z * cos_y;
-        float rnx = v.nx * cos_y + v.nz * sin_y;
-        float rnz = -v.nx * sin_y + v.nz * cos_y;
-
-        v.x = rx + pos_x;
-        v.y = v.y + pos_y;
-        v.z = rz + pos_z;
-        v.nx = rnx;
-        v.nz = rnz;
-        out_verts.push_back(v);
-    }
-
+    std::vector<DioramaVertex> verts(raw_verts, raw_verts + count);
     if (s_free_glb) {
         s_free_glb(raw_verts, count);
     }
-    LOGI("openxr_engine: Cargado GLB %s (%d verts) en pos (%.2f, %.2f, %.2f) yaw=%.1f",
-         path, count, pos_x, pos_y, pos_z, yaw_deg);
+
+    out_mesh.vao = create_mesh_vao(verts, out_mesh.vbo);
+    out_mesh.vertex_count = (int)verts.size();
+    out_mesh.width = target_width;
+    LOGI("openxr_engine: Modelo GLB cargado individualmente %s (%d verts)", path, count);
     return true;
+}
+
+static void load_or_create_fallback(int type, const char* glb_path, float target_width) {
+    if (glb_path && load_mesh_from_glb(s_entity_meshes[type], glb_path, target_width)) {
+        return;
+    }
+    std::vector<DioramaVertex> verts;
+    switch (type) {
+        case ENTITY_ASSEMBLING_MACHINE:
+            add_box_textured(verts, 0, 0.045f, 0, 0.18f, 0.09f, 0.18f, 2.0f, 1.0f, 0.28f, 0.48f, 0.65f, 1.0f);
+            add_box_textured(verts, 0, 0.10f, 0, 0.14f, 0.03f, 0.14f, 1.0f, 1.0f, 0.20f, 0.25f, 0.30f, 1.0f);
+            add_cylinder_textured(verts, -0.045f, 0.13f, -0.045f, 0.016f, 0.06f, 0.40f, 0.44f, 0.48f, 1.0f);
+            break;
+        case ENTITY_MINING_DRILL:
+            add_box_textured(verts, 0, 0.11f, 0, 0.14f, 0.06f, 0.14f, 1.0f, 1.0f, 0.15f, 0.60f, 0.55f, 1.0f);
+            break;
+        case ENTITY_FURNACE:
+            add_box_textured(verts, 0, 0.05f, 0, 0.12f, 0.10f, 0.12f, 1.0f, 1.0f, 0.48f, 0.46f, 0.44f, 1.0f);
+            add_cylinder_textured(verts, 0, 0.12f, 0, 0.022f, 0.05f, 0.35f, 0.36f, 0.38f, 1.0f);
+            break;
+        case ENTITY_RADAR:
+            add_box_textured(verts, 0, 0.035f, 0, 0.10f, 0.07f, 0.10f, 1.0f, 1.0f, 0.30f, 0.34f, 0.38f, 1.0f);
+            break;
+        case ENTITY_ROBOPORT:
+            add_box_textured(verts, 0, 0.05f, 0, 0.16f, 0.10f, 0.16f, 1.0f, 1.0f, 0.72f, 0.45f, 0.22f, 1.0f);
+            break;
+        case ENTITY_GUN_TURRET:
+            add_cylinder_textured(verts, 0, 0.02f, 0, 0.045f, 0.04f, 0.40f, 0.44f, 0.46f, 1.0f, 8);
+            break;
+        case ENTITY_CHEST:
+            add_box_textured(verts, 0, 0.035f, 0, 0.07f, 0.07f, 0.07f, 1.0f, 1.0f, 0.60f, 0.65f, 0.72f, 1.0f);
+            break;
+        case ENTITY_ELECTRIC_POLE:
+            add_cylinder_textured(verts, 0, 0.11f, 0, 0.008f, 0.22f, 0.45f, 0.36f, 0.28f, 1.0f, 8);
+            break;
+        case ENTITY_TRANSPORT_BELT:
+            add_box_textured(verts, 0, 0.006f, 0, 0.04f, 0.010f, 0.04f, 1.0f, 1.0f, 0.35f, 0.38f, 0.40f, 1.0f);
+            break;
+        case ENTITY_BITER:
+            add_box_textured(verts, 0, 0.03f, 0, 0.08f, 0.05f, 0.08f, 1.0f, 1.0f, 0.65f, 0.18f, 0.20f, 1.0f);
+            break;
+        case ENTITY_TREE:
+            add_cylinder_textured(verts, 0, 0.04f, 0, 0.012f, 0.08f, 0.4f, 0.25f, 0.15f, 1.0f);
+            add_box_textured(verts, 0, 0.09f, 0, 0.09f, 0.08f, 0.09f, 1.0f, 1.0f, 0.18f, 0.65f, 0.22f, 1.0f);
+            break;
+        case ENTITY_PLAYER:
+            add_box_textured(verts, 0, 0.036f, 0, 0.026f, 0.028f, 0.018f, 1.0f, 1.0f, 0.90f, 0.50f, 0.12f, 1.0f);
+            break;
+        default:
+            add_box_textured(verts, 0, 0.03f, 0, 0.06f, 0.06f, 0.06f, 1.0f, 1.0f, 0.8f, 0.8f, 0.8f, 1.0f);
+            break;
+    }
+    s_entity_meshes[type].vao = create_mesh_vao(verts, s_entity_meshes[type].vbo);
+    s_entity_meshes[type].vertex_count = (int)verts.size();
+    s_entity_meshes[type].width = target_width;
 }
 
 static void init_tabletop_scene() {
@@ -745,114 +856,67 @@ static void init_tabletop_scene() {
     s_vao_belt = create_mesh_vao(belt_verts, s_vbo_belt);
     s_count_belt = (int)belt_verts.size();
 
-    // E) Maquinaria Completa Factorio (Modelos 3D de factorio-3d-mod)
-    std::vector<DioramaVertex> machine_verts;
+    // E) Carga individual de Modelos 3D de factorio-3d-mod para Entidades Vivas
+    load_or_create_fallback(ENTITY_ASSEMBLING_MACHINE, "/sdcard/XFactorVR/models/ENTITIES/STRUCTURES/assembling-machine/static.glb", 0.18f);
+    load_or_create_fallback(ENTITY_MINING_DRILL, "/sdcard/XFactorVR/models/ENTITIES/STRUCTURES/electric-mining-drill/static.glb", 0.16f);
+    load_or_create_fallback(ENTITY_FURNACE, "/sdcard/XFactorVR/models/ENTITIES/STRUCTURES/steel-furnace/static.glb", 0.13f);
+    load_or_create_fallback(ENTITY_RADAR, "/sdcard/XFactorVR/models/ENTITIES/STRUCTURES/radar/static1.glb", 0.14f);
+    load_or_create_fallback(ENTITY_ROBOPORT, "/sdcard/XFactorVR/models/ENTITIES/STRUCTURES/roboport/static.glb", 0.18f);
+    load_or_create_fallback(ENTITY_GUN_TURRET, "/sdcard/XFactorVR/models/ENTITIES/STRUCTURES/gun-turret/static1.glb", 0.10f);
+    load_mesh_from_glb(s_turret_top_mesh, "/sdcard/XFactorVR/models/ENTITIES/STRUCTURES/gun-turret/static2.glb", 0.09f);
+    load_or_create_fallback(ENTITY_CHEST, "/sdcard/XFactorVR/models/ENTITIES/STRUCTURES/steel-chest/static.glb", 0.07f);
+    load_or_create_fallback(ENTITY_ELECTRIC_POLE, "/sdcard/XFactorVR/models/ENTITIES/STRUCTURES/medium-electric-pole/static.glb", 0.06f);
+    load_or_create_fallback(ENTITY_TRANSPORT_BELT, nullptr, 0.04f);
+    load_or_create_fallback(ENTITY_BITER, "/sdcard/XFactorVR/models/ENTITIES/ENEMIES/biters/biter_tier1.glb", 0.09f);
+    load_or_create_fallback(ENTITY_TREE, "/sdcard/XFactorVR/models/ENTITIES/FOLIAGE/tree1/static.glb", 0.13f);
+    load_or_create_fallback(ENTITY_PLAYER, "/sdcard/XFactorVR/models/ENTITIES/PLAYER/idle.glb", 0.075f);
 
-    // 1. Assembling Machine (factorio-3d-mod) en (X = -0.22m, Z = -0.22m)
-    float am_x = -0.22f, am_z = -0.22f;
-    if (!append_glb_model(machine_verts, "/sdcard/XFactorVR/models/ENTITIES/STRUCTURES/assembling-machine/static.glb", 0.18f, am_x, 0.0f, am_z, 0.0f)) {
-        add_box_textured(machine_verts, am_x, 0.045f, am_z, 0.18f, 0.09f, 0.18f, 2.0f, 1.0f, 0.28f, 0.48f, 0.65f, 1.0f);
-        add_box_textured(machine_verts, am_x, 0.10f, am_z, 0.14f, 0.03f, 0.14f, 1.0f, 1.0f, 0.20f, 0.25f, 0.30f, 1.0f);
-        add_cylinder_textured(machine_verts, am_x - 0.045f, 0.13f, am_z - 0.045f, 0.016f, 0.06f, 0.40f, 0.44f, 0.48f, 1.0f);
-        add_cylinder_textured(machine_verts, am_x + 0.045f, 0.14f, am_z - 0.035f, 0.018f, 0.08f, 0.40f, 0.44f, 0.48f, 1.0f);
-    }
-
-    // 2. Electric Mining Drill (factorio-3d-mod) en (X = 0.25f, Z = -0.22m)
-    float md_x = 0.25f, md_z = -0.22f;
-    if (!append_glb_model(machine_verts, "/sdcard/XFactorVR/models/ENTITIES/STRUCTURES/electric-mining-drill/static.glb", 0.16f, md_x, 0.0f, md_z, 0.0f)) {
-        add_box_textured(machine_verts, md_x, 0.11f, md_z, 0.14f, 0.06f, 0.14f, 1.0f, 1.0f, 0.15f, 0.60f, 0.55f, 1.0f);
-    }
-
-    // 3. Steel Furnace (factorio-3d-mod) en (X = 0.44m, Z = -0.06m)
-    float sf_x = 0.44f, sf_z = -0.06f;
-    if (!append_glb_model(machine_verts, "/sdcard/XFactorVR/models/ENTITIES/STRUCTURES/steel-furnace/static.glb", 0.13f, sf_x, 0.0f, sf_z, 0.0f)) {
-        add_box_textured(machine_verts, sf_x, 0.05f, sf_z, 0.12f, 0.10f, 0.12f, 1.0f, 1.0f, 0.48f, 0.46f, 0.44f, 1.0f);
-        add_cylinder_textured(machine_verts, sf_x, 0.12f, sf_z, 0.022f, 0.05f, 0.35f, 0.36f, 0.38f, 1.0f);
-    }
-
-    // 4. Radar Station (factorio-3d-mod) en (X = -0.44m, Z = 0.22m)
-    float rad_x = -0.44f, rad_z = 0.22f;
-    if (!append_glb_model(machine_verts, "/sdcard/XFactorVR/models/ENTITIES/STRUCTURES/radar/static1.glb", 0.14f, rad_x, 0.0f, rad_z, 0.0f)) {
-        add_box_textured(machine_verts, rad_x, 0.035f, rad_z, 0.10f, 0.07f, 0.10f, 1.0f, 1.0f, 0.30f, 0.34f, 0.38f, 1.0f);
-    }
-
-    // 5. Roboport (factorio-3d-mod) en (X = 0.25f, Z = 0.22m)
-    float rb_x = 0.25f, rb_z = 0.22f;
-    if (!append_glb_model(machine_verts, "/sdcard/XFactorVR/models/ENTITIES/STRUCTURES/roboport/static.glb", 0.18f, rb_x, 0.0f, rb_z, 0.0f)) {
-        add_box_textured(machine_verts, rb_x, 0.05f, rb_z, 0.16f, 0.10f, 0.16f, 1.0f, 1.0f, 0.72f, 0.45f, 0.22f, 1.0f);
-    }
-
-    // 6. Gun Turret Base y Torreta Superior (factorio-3d-mod) en (X = -0.44m, Z = -0.22m)
-    float gt_x = -0.44f, gt_z = -0.22f;
-    if (!append_glb_model(machine_verts, "/sdcard/XFactorVR/models/ENTITIES/STRUCTURES/gun-turret/static1.glb", 0.10f, gt_x, 0.0f, gt_z, 0.0f)) {
-        add_cylinder_textured(machine_verts, gt_x, 0.02f, gt_z, 0.045f, 0.04f, 0.40f, 0.44f, 0.46f, 1.0f, 8);
-    }
-    append_glb_model(machine_verts, "/sdcard/XFactorVR/models/ENTITIES/STRUCTURES/gun-turret/static2.glb", 0.09f, gt_x, 0.045f, gt_z, 45.0f);
-
-    // 7. Steel Chest (factorio-3d-mod) en (X = -0.42m, Z = -0.06m)
-    float sc_x = -0.42f, sc_z = -0.06f;
-    if (!append_glb_model(machine_verts, "/sdcard/XFactorVR/models/ENTITIES/STRUCTURES/steel-chest/static.glb", 0.07f, sc_x, 0.0f, sc_z, 0.0f)) {
-        add_box_textured(machine_verts, sc_x, 0.035f, sc_z, 0.07f, 0.07f, 0.07f, 1.0f, 1.0f, 0.60f, 0.65f, 0.72f, 1.0f);
-    }
-
-    // 8. Postes Eléctricos Medianos y Cableado Catenario
-    float p1_x = 0.0f, p1_z = -0.28f;
-    float p2_x = 0.0f, p2_z = 0.28f;
-    if (!append_glb_model(machine_verts, "/sdcard/XFactorVR/models/ENTITIES/STRUCTURES/medium-electric-pole/static.glb", 0.06f, p1_x, 0.0f, p1_z, 0.0f)) {
-        add_cylinder_textured(machine_verts, p1_x, 0.11f, p1_z, 0.008f, 0.22f, 0.45f, 0.36f, 0.28f, 1.0f, 8);
-    }
-    if (!append_glb_model(machine_verts, "/sdcard/XFactorVR/models/ENTITIES/STRUCTURES/medium-electric-pole/static.glb", 0.06f, p2_x, 0.0f, p2_z, 0.0f)) {
-        add_cylinder_textured(machine_verts, p2_x, 0.11f, p2_z, 0.008f, 0.22f, 0.45f, 0.36f, 0.28f, 1.0f, 8);
-    }
-
-    // Tendido de cables eléctricos catenarios 3D
-    add_catenary_cable(machine_verts, p1_x - 0.042f, 0.22f, p1_z, p2_x - 0.042f, 0.22f, p2_z, 0.035f, 8, 0.20f, 0.22f, 0.24f, 1.0f);
-    add_catenary_cable(machine_verts, p1_x + 0.042f, 0.22f, p1_z, p2_x + 0.042f, 0.22f, p2_z, 0.035f, 8, 0.20f, 0.22f, 0.24f, 1.0f);
-    add_catenary_cable(machine_verts, p1_x - 0.042f, 0.22f, p1_z, am_x, 0.11f, am_z, 0.025f, 6, 0.20f, 0.22f, 0.24f, 1.0f);
-    add_catenary_cable(machine_verts, p1_x + 0.042f, 0.22f, p1_z, md_x, 0.12f, md_z, 0.025f, 6, 0.20f, 0.22f, 0.24f, 1.0f);
-
-    // 9. Ingeniero Factorio (Avatar 3D oficial de factorio-3d-mod)
-    float eng_x = 0.0f, eng_z = 0.0f;
-    if (!append_glb_model(machine_verts, "/sdcard/XFactorVR/models/ENTITIES/PLAYER/idle.glb", 0.075f, eng_x, 0.0f, eng_z, 0.0f)) {
-        add_box_textured(machine_verts, eng_x, 0.036f, eng_z, 0.026f, 0.028f, 0.018f, 1.0f, 1.0f, 0.90f, 0.50f, 0.12f, 1.0f);
-    }
-
-    // 10. Biter Hostil Fuera del Perímetro (factorio-3d-mod)
-    append_glb_model(machine_verts, "/sdcard/XFactorVR/models/ENTITIES/ENEMIES/biters/biter_tier1.glb", 0.09f, 0.50f, 0.0f, 0.25f, -120.0f);
-
-    // 11. Árbol Alienígena / Vegetación (factorio-3d-mod)
-    append_glb_model(machine_verts, "/sdcard/XFactorVR/models/ENTITIES/FOLIAGE/tree1/static.glb", 0.13f, -0.50f, 0.0f, 0.32f, 30.0f);
-
-    s_vao_machines = create_mesh_vao(machine_verts, s_vbo_machines);
-    s_count_machines = (int)machine_verts.size();
-
-    // F) Consola Holográfica Espacial Flotante (Spatial Command UI, Generals XR pattern)
-    // Angulada 22° hacia los ojos del jugador
+    // F) Consola Holográfica Espacial y Quickbar 6DoF (Generals XR pattern)
+    // Flotante y angulada hacia los ojos del jugador
     std::vector<DioramaVertex> ui_verts;
-    float ui_w = 0.62f, ui_h = 0.26f;
+    float ui_w = 0.62f, ui_h = 0.28f;
     float ui_z = -hd - 0.08f;
-    float ui_y = 0.17f;
+    float ui_y = 0.18f;
 
-    // Panel de cristal oscuro translúcido (#0e141a, alpha 0.92)
+    // Panel de cristal oscuro translúcido (#0e141a, alpha 0.94)
     add_box_textured(ui_verts, 0.0f, ui_y, ui_z, ui_w, ui_h, 0.005f, 1.0f, 1.0f, 0.07f, 0.10f, 0.14f, 0.94f);
     // Barra de título superior naranja Factorio
-    add_box_textured(ui_verts, 0.0f, ui_y + ui_h * 0.42f, ui_z + 0.004f, ui_w * 0.95f, 0.026f, 0.002f, 1.0f, 1.0f, 1.0f, 0.58f, 0.12f, 1.0f);
+    add_box_textured(ui_verts, 0.0f, ui_y + ui_h * 0.44f, ui_z + 0.004f, ui_w * 0.95f, 0.022f, 0.002f, 1.0f, 1.0f, 1.0f, 0.58f, 0.12f, 1.0f);
 
-    // 5 Botones de comando Factorio:
-    // [0: OBSERVER MODE] [1: RECENTER] [2: ENERGÍA] [3: ÍTEMS] [4: TECNOLOGÍA]
-    float btn_w = 0.108f, btn_h = 0.034f;
+    // F.1) 5 Botones de comando Factorio:
+    // [0: OBSERVADOR 1:1] [1: RE-ANCLAR] [2: ENERGÍA] [3: CONSTRUIR] [4: TECNOLOGÍA]
+    float btn_w = 0.108f, btn_h = 0.032f;
     for (int b = -2; b <= 2; ++b) {
         float bx = 0.0f + (float)b * (btn_w + 0.012f);
         float br = (b == -2) ? 0.85f : 0.18f;
         float bg = (b == -2) ? 0.35f : 0.52f;
         float bb = (b == -2) ? 0.20f : 0.70f;
-        add_box_textured(ui_verts, bx, ui_y + 0.045f, ui_z + 0.004f, btn_w, btn_h, 0.003f, 1.0f, 1.0f, br, bg, bb, 1.0f);
+        add_box_textured(ui_verts, bx, ui_y + 0.065f, ui_z + 0.004f, btn_w, btn_h, 0.003f, 1.0f, 1.0f, br, bg, bb, 1.0f);
     }
 
-    // Área de datos dinámicos holográficos del sub-panel
-    add_box_textured(ui_verts, 0.0f, ui_y - 0.045f, ui_z + 0.003f, ui_w * 0.92f, 0.10f, 0.002f, 1.0f, 1.0f, 0.12f, 0.16f, 0.22f, 0.85f);
-    // Barra de progreso de ensamblaje / investigación
-    add_box_textured(ui_verts, 0.0f, ui_y - 0.075f, ui_z + 0.005f, ui_w * 0.85f, 0.015f, 0.002f, 1.0f, 1.0f, 0.20f, 0.75f, 0.95f, 1.0f);
+    // F.2) 9 Ranuras de Construcción 6DoF / Quickbar (Estilo Generals XR Command Palette):
+    // [0: Ensambladora] [1: Minera] [2: Horno] [3: Torreta] [4: Radar] [5: Robopuerto] [6: Cofre] [7: Poste] [8: Demoler]
+    float slot_w = 0.055f, slot_h = 0.038f;
+    for (int s = 0; s < 9; ++s) {
+        float sx = (float)(s - 4) * (slot_w + 0.010f);
+        float sr = 0.25f, sg = 0.45f, sb = 0.65f;
+        switch (s) {
+            case 0: sr = 0.25f; sg = 0.48f; sb = 0.68f; break; // Ensambladora (Azul)
+            case 1: sr = 0.18f; sg = 0.62f; sb = 0.58f; break; // Minera (Teal)
+            case 2: sr = 0.52f; sg = 0.38f; sb = 0.30f; break; // Horno (Terracota)
+            case 3: sr = 0.42f; sg = 0.46f; sb = 0.50f; break; // Torreta (Gris militar)
+            case 4: sr = 0.32f; sg = 0.58f; sb = 0.78f; break; // Radar (Celeste)
+            case 5: sr = 0.78f; sg = 0.48f; sb = 0.22f; break; // Robopuerto (Naranja)
+            case 6: sr = 0.52f; sg = 0.56f; sb = 0.62f; break; // Cofre (Acero)
+            case 7: sr = 0.56f; sg = 0.44f; sb = 0.28f; break; // Poste (Cobre/Madera)
+            case 8: sr = 0.88f; sg = 0.22f; sb = 0.18f; break; // Demolición (Rojo advertencia)
+        }
+        add_box_textured(ui_verts, sx, ui_y - 0.055f, ui_z + 0.004f, slot_w, slot_h, 0.003f, 1.0f, 1.0f, sr, sg, sb, 1.0f);
+    }
+
+    // Barra de estado de producción / investigación activa
+    add_box_textured(ui_verts, 0.0f, ui_y + 0.005f, ui_z + 0.003f, ui_w * 0.92f, 0.045f, 0.002f, 1.0f, 1.0f, 0.12f, 0.16f, 0.22f, 0.85f);
+    add_box_textured(ui_verts, 0.0f, ui_y + 0.005f, ui_z + 0.005f, ui_w * 0.88f, 0.012f, 0.002f, 1.0f, 1.0f, 0.20f, 0.75f, 0.95f, 1.0f);
 
     s_vao_ui = create_mesh_vao(ui_verts, s_vbo_ui);
     s_count_ui = (int)ui_verts.size();
@@ -881,9 +945,12 @@ static void init_tabletop_scene() {
 
 static void draw_tabletop_scene(const float* vp_mat,
                                 float anim_time,
+                                float dt,
                                 const XrPosef& right_aim_pose,
                                 bool right_aim_valid,
-                                bool trigger_clicked) {
+                                bool trigger_clicked,
+                                bool grip_clicked,
+                                bool is_primary_eye) {
     if (s_program == 0) return;
 
     glUseProgram(s_program);
@@ -895,7 +962,6 @@ static void draw_tabletop_scene(const float* vp_mat,
     // Matriz de modelo activa (Diorama de mesa o Modo Observador a escala 1:1)
     float active_model[16];
     if (s_observer_mode) {
-        // En modo observador, escalamos 25x y centramos en s_observer_pos
         float m_trans[16], m_scale[16];
         mat4_scale(m_scale, 25.0f, 25.0f, 25.0f);
         mat4_translate(m_trans, -s_observer_pos.x * 25.0f, 0.0f, -s_observer_pos.z * 25.0f);
@@ -910,7 +976,6 @@ static void draw_tabletop_scene(const float* vp_mat,
     glUniformMatrix4fv(s_mvp_loc, 1, GL_FALSE, mvp_table);
 
     // Límites de mesa para recorte de bordes (Generals XR pattern)
-    // En modo observador se desactiva el recorte para ver el horizonte de la fábrica
     float bounds[4] = { -TABLE_HALF_W, -TABLE_HALF_D, TABLE_HALF_W, TABLE_HALF_D };
     glUniform4fv(s_board_bounds_loc, 1, bounds);
     glUniform1f(s_enable_clipping_loc, s_observer_mode ? 0.0f : 1.0f);
@@ -949,15 +1014,97 @@ static void draw_tabletop_scene(const float* vp_mat,
     glDrawArrays(GL_TRIANGLES, 0, s_count_belt);
     glUniform2f(s_uv_offset_loc, 0.0f, 0.0f);
 
-    // E) Maquinaria y estructuras estáticas (Modelos 3D de factorio-3d-mod)
-    glUniform1f(s_use_tex_loc, 0.0f); // Usar colores de textura 3D originales horneados por vértice
+    // E) RENDERIZADO DINÁMICO DE ENTIDADES VIVAS (FASE 1: SIMULACIÓN EN VIVO)
+    LiveEntity live_entities[128];
+    int entity_count = 0;
+    if (s_get_live_entities) {
+        s_get_live_entities(live_entities, 128, &entity_count);
+    }
+
+    if (is_primary_eye && s_update_simulation) {
+        s_update_simulation(dt);
+    }
+
+    glUniform1f(s_use_tex_loc, 0.0f); // Usar colores vertex-baked originales de factorio-3d-mod
     glUniform1f(s_lit_loc, 1.0f);
-    glBindVertexArray(s_vao_machines);
-    glDrawArrays(GL_TRIANGLES, 0, s_count_machines);
+    glUniform3f(s_emissive_loc, 0.0f, 0.0f, 0.0f);
+
+    std::vector<LiveEntity> electric_poles;
+
+    for (int i = 0; i < entity_count; ++i) {
+        const LiveEntity& ent = live_entities[i];
+        if (ent.entity_type <= 0 || ent.entity_type >= ENTITY_TYPE_COUNT) continue;
+
+        if (ent.entity_type == ENTITY_ELECTRIC_POLE) {
+            electric_poles.push_back(ent);
+        }
+
+        const ModelMesh& mesh = s_entity_meshes[ent.entity_type];
+        if (mesh.vao == 0 || mesh.vertex_count == 0) continue;
+
+        float mx = ent.tile_x * 0.04f;
+        float mz = ent.tile_y * 0.04f;
+
+        float ent_trans[16], ent_rot[16], ent_local[16], ent_world[16], ent_mvp[16];
+        mat4_rotate_y(ent_rot, ent.orientation);
+        mat4_translate(ent_trans, mx, 0.0f, mz);
+        mat4_multiply(ent_trans, ent_rot, ent_local);
+        mat4_multiply(active_model, ent_local, ent_world);
+        mat4_multiply(vp_mat, ent_world, ent_mvp);
+
+        glUniformMatrix4fv(s_model_loc, 1, GL_FALSE, ent_world);
+        glUniformMatrix4fv(s_mvp_loc, 1, GL_FALSE, ent_mvp);
+
+        glBindVertexArray(mesh.vao);
+        glDrawArrays(GL_TRIANGLES, 0, mesh.vertex_count);
+
+        // Si es torreta, dibujar el cañón / torreta superior rotatoria
+        if (ent.entity_type == ENTITY_GUN_TURRET && s_turret_top_mesh.vao != 0) {
+            float top_trans[16], top_rot[16], top_local[16], top_world[16], top_mvp[16];
+            float turret_yaw = ent.orientation + sinf(anim_time * 0.8f + (float)i) * 0.65f;
+            mat4_rotate_y(top_rot, turret_yaw);
+            mat4_translate(top_trans, mx, 0.045f, mz);
+            mat4_multiply(top_trans, top_rot, top_local);
+            mat4_multiply(active_model, top_local, top_world);
+            mat4_multiply(vp_mat, top_world, top_mvp);
+
+            glUniformMatrix4fv(s_model_loc, 1, GL_FALSE, top_world);
+            glUniformMatrix4fv(s_mvp_loc, 1, GL_FALSE, top_mvp);
+
+            glBindVertexArray(s_turret_top_mesh.vao);
+            glDrawArrays(GL_TRIANGLES, 0, s_turret_top_mesh.vertex_count);
+        }
+
+        // Emisión de partículas periódicas por máquina activa (Fase 3)
+        if (is_primary_eye) {
+            if (ent.entity_type == ENTITY_ASSEMBLING_MACHINE && (rand() % 10 == 0)) {
+                spawn_particle(mx - 0.045f, 0.16f, mz - 0.045f,
+                               ((rand() % 100) - 50) * 0.0002f, 0.035f, ((rand() % 100) - 50) * 0.0002f,
+                               0.85f, 0.88f, 0.92f, 0.50f, 0.016f, 1.2f);
+            } else if (ent.entity_type == ENTITY_FURNACE && (rand() % 8 == 0)) {
+                spawn_particle(mx, 0.14f, mz,
+                               ((rand() % 100) - 50) * 0.0002f, 0.030f, ((rand() % 100) - 50) * 0.0002f,
+                               0.95f, 0.60f, 0.25f, 0.65f, 0.012f, 0.9f);
+            } else if (ent.entity_type == ENTITY_MINING_DRILL && (rand() % 6 == 0)) {
+                spawn_particle(mx, 0.02f, mz,
+                               ((rand() % 100) - 50) * 0.0004f, 0.012f, ((rand() % 100) - 50) * 0.0004f,
+                               0.55f, 0.45f, 0.35f, 0.55f, 0.010f, 0.6f);
+            }
+        }
+    }
 
     // F) Consola UI Holográfica Espacial (Generals XR pattern)
+    float hd = TABLE_HALF_D;
+    float ui_z = -hd - 0.08f;
+    float ui_y = 0.18f;
+
     if (!s_observer_mode) {
-        glUniform1f(s_enable_clipping_loc, 0.0f); // Sin recorte para el panel flotante en el aire
+        float ui_mvp[16];
+        mat4_multiply(vp_mat, active_model, ui_mvp);
+        glUniformMatrix4fv(s_model_loc, 1, GL_FALSE, active_model);
+        glUniformMatrix4fv(s_mvp_loc, 1, GL_FALSE, ui_mvp);
+
+        glUniform1f(s_enable_clipping_loc, 0.0f); // Sin recorte para el panel flotante
         glUniform1f(s_use_tex_loc, 0.0f);
         glUniform1f(s_lit_loc, 0.35f);
         glBindVertexArray(s_vao_ui);
@@ -965,120 +1112,127 @@ static void draw_tabletop_scene(const float* vp_mat,
         glUniform1f(s_enable_clipping_loc, 1.0f); // Restaurar recorte de la mesa física
     }
 
-    // 2. Elementos dinámicos animados de la maqueta
+    // G) GEOMETRÍA DINÁMICA DE LA FÁBRICA Y PIEZAS MÓVILES (FASE 3)
     std::vector<DioramaVertex> dyn_verts;
 
-    // A) Inserter 1 (Amarillo estándar) alimentando Assembling Machine 2
-    float ins1_x = -0.08f, ins1_z = -0.13f;
-    float ins1_yaw = sinf(anim_time * 2.2f) * 0.82f;
-    add_cylinder_textured(dyn_verts, ins1_x, 0.02f, ins1_z, 0.025f, 0.04f, 0.95f, 0.68f, 0.12f, 1.0f, 8);
-    float arm1_len = 0.07f;
-    float arm1_pitch = 0.42f + sinf(anim_time * 2.2f) * 0.14f;
-    float elb1_x = ins1_x + sinf(ins1_yaw) * cosf(arm1_pitch) * arm1_len;
-    float elb1_y = 0.04f + sinf(arm1_pitch) * arm1_len;
-    float elb1_z = ins1_z + cosf(ins1_yaw) * cosf(arm1_pitch) * arm1_len;
-    add_box_textured(dyn_verts, (ins1_x + elb1_x) * 0.5f, (0.04f + elb1_y) * 0.5f, (ins1_z + elb1_z) * 0.5f,
-                     0.012f, 0.012f, arm1_len, 1.0f, 1.0f, 0.28f, 0.32f, 0.36f, 1.0f);
-    add_cylinder_textured(dyn_verts, elb1_x, elb1_y, elb1_z, 0.014f, 0.02f, 0.95f, 0.68f, 0.12f, 1.0f, 8);
-    float claw1_x = elb1_x + sinf(ins1_yaw) * 0.045f;
-    float claw1_y = elb1_y - 0.030f;
-    float claw1_z = elb1_z + cosf(ins1_yaw) * 0.045f;
-    add_box_textured(dyn_verts, (elb1_x + claw1_x) * 0.5f, (elb1_y + claw1_y) * 0.5f, (elb1_z + claw1_z) * 0.5f,
-                     0.010f, 0.010f, 0.06f, 1.0f, 1.0f, 0.28f, 0.32f, 0.36f, 1.0f);
-    add_box_textured(dyn_verts, claw1_x - 0.008f, claw1_y - 0.01f, claw1_z, 0.004f, 0.016f, 0.014f, 1.0f, 1.0f, 0.8f, 0.8f, 0.85f, 1.0f);
-    add_box_textured(dyn_verts, claw1_x + 0.008f, claw1_y - 0.01f, claw1_z, 0.004f, 0.016f, 0.014f, 1.0f, 1.0f, 0.8f, 0.8f, 0.85f, 1.0f);
-
-    // B) Inserter 2 (Azul rápido) extrayendo circuitos hacia cinta 2
-    float ins2_x = -0.22f, ins2_z = -0.06f;
-    float ins2_yaw = -cosf(anim_time * 3.4f) * 0.85f;
-    add_cylinder_textured(dyn_verts, ins2_x, 0.02f, ins2_z, 0.025f, 0.04f, 0.20f, 0.55f, 0.95f, 1.0f, 8);
-    float elb2_x = ins2_x + sinf(ins2_yaw) * 0.06f;
-    float elb2_y = 0.055f;
-    float elb2_z = ins2_z + cosf(ins2_yaw) * 0.06f;
-    add_box_textured(dyn_verts, (ins2_x + elb2_x) * 0.5f, (0.04f + elb2_y) * 0.5f, (ins2_z + elb2_z) * 0.5f,
-                     0.012f, 0.012f, 0.065f, 1.0f, 1.0f, 0.22f, 0.26f, 0.30f, 1.0f);
-    add_cylinder_textured(dyn_verts, elb2_x, elb2_y, elb2_z, 0.014f, 0.02f, 0.20f, 0.55f, 0.95f, 1.0f, 8);
-
-    // C) Antena Parabólica de Radar Giratoria (360° continuo)
-    float rad_x = -0.44f, rad_z = 0.22f;
-    float rad_ang = anim_time * 1.5f;
-    float dish_dx = sinf(rad_ang) * 0.04f;
-    float dish_dz = cosf(rad_ang) * 0.04f;
-    add_box_textured(dyn_verts, rad_x, 0.13f, rad_z, 0.08f, 0.018f, 0.025f, 1.0f, 1.0f, 0.82f, 0.85f, 0.88f, 1.0f);
-    add_cylinder_textured(dyn_verts, rad_x + dish_dx, 0.13f, rad_z + dish_dz, 0.035f, 0.010f, 0.92f, 0.94f, 0.96f, 1.0f, 10);
-
-    // D) Drones Logísticos en patrulla aérea sobre el Roboport
-    float rb_x = 0.25f, rb_z = 0.22f;
-    for (int d = 0; d < 2; ++d) {
-        float d_ang = anim_time * 1.8f + (float)d * 3.14159f;
-        float drone_x = rb_x + sinf(d_ang) * 0.08f;
-        float drone_z = rb_z + sinf(d_ang * 2.0f) * 0.05f;
-        float drone_y = 0.18f + cosf(d_ang) * 0.02f;
-        // Chasis del dron
-        add_box_textured(dyn_verts, drone_x, drone_y, drone_z, 0.024f, 0.010f, 0.024f, 1.0f, 1.0f, 0.90f, 0.92f, 0.95f, 1.0f);
-        // 4 Rotores
-        add_cylinder_textured(dyn_verts, drone_x - 0.014f, drone_y + 0.006f, drone_z - 0.014f, 0.008f, 0.002f, 0.2f, 0.2f, 0.2f, 0.8f, 6);
-        add_cylinder_textured(dyn_verts, drone_x + 0.014f, drone_y + 0.006f, drone_z - 0.014f, 0.008f, 0.002f, 0.2f, 0.2f, 0.2f, 0.8f, 6);
-        add_cylinder_textured(dyn_verts, drone_x - 0.014f, drone_y + 0.006f, drone_z + 0.014f, 0.008f, 0.002f, 0.2f, 0.2f, 0.2f, 0.8f, 6);
-        add_cylinder_textured(dyn_verts, drone_x + 0.014f, drone_y + 0.006f, drone_z + 0.014f, 0.008f, 0.002f, 0.2f, 0.2f, 0.2f, 0.8f, 6);
-    }
-
-    // E) Cañón de la Torreta Defensiva girando en guardia
-    float gt_x = -0.44f, gt_z = -0.22f;
-    float gt_yaw = sinf(anim_time * 0.8f) * 0.65f;
-    float b_dx = sinf(gt_yaw) * 0.04f, b_dz = cosf(gt_yaw) * 0.04f;
-    add_box_textured(dyn_verts, gt_x + b_dx * 0.5f - 0.006f, 0.065f, gt_z + b_dz * 0.5f, 0.006f, 0.006f, 0.045f, 1.0f, 1.0f, 0.2f, 0.22f, 0.25f, 1.0f);
-    add_box_textured(dyn_verts, gt_x + b_dx * 0.5f + 0.006f, 0.065f, gt_z + b_dz * 0.5f, 0.006f, 0.006f, 0.045f, 1.0f, 1.0f, 0.2f, 0.22f, 0.25f, 1.0f);
-
-    // F) Vástago giratorio de la perforadora eléctrica
-    float md_x = 0.25f, md_z = -0.22f;
-    add_cylinder_textured(dyn_verts, md_x, 0.05f, md_z, 0.024f, 0.08f, 0.55f, 0.60f, 0.65f, 1.0f, 8);
-
-    // G) Ítems en movimiento fluido sobre las cintas
-    float item_span = TABLE_HALF_W * 1.55f;
-    for (int k = 0; k < 7; ++k) {
-        float offset = fmodf(anim_time * 0.16f + (float)k * (item_span / 7.0f), item_span) - item_span * 0.5f;
-        // Placas de hierro en carril 1
-        add_box_textured(dyn_verts, offset, 0.016f, -0.06f, 0.030f, 0.005f, 0.030f, 1.0f, 1.0f, 0.68f, 0.74f, 0.80f, 1.0f);
-        // Circuitos electrónicos verdes en carril 2
-        add_box_textured(dyn_verts, -offset, 0.016f, 0.06f, 0.026f, 0.004f, 0.026f, 1.0f, 1.0f, 0.16f, 0.82f, 0.35f, 1.0f);
-        // Engranajes de hierro rotando sobre la cinta
-        if (k % 2 == 0) {
-            add_cylinder_textured(dyn_verts, offset * 0.7f, 0.018f, -0.06f, 0.012f, 0.004f, 0.85f, 0.72f, 0.25f, 1.0f, 8);
+    // 1. Cableado catenario entre postes eléctricos existentes
+    for (size_t p1 = 0; p1 < electric_poles.size(); ++p1) {
+        for (size_t p2 = p1 + 1; p2 < electric_poles.size(); ++p2) {
+            float dx = electric_poles[p1].tile_x - electric_poles[p2].tile_x;
+            float dy = electric_poles[p1].tile_y - electric_poles[p2].tile_y;
+            float dist = sqrtf(dx * dx + dy * dy);
+            if (dist < 10.0f) { // Alcance de conexión del poste mediano (10 tiles = 0.40m)
+                float x0 = electric_poles[p1].tile_x * 0.04f;
+                float z0 = electric_poles[p1].tile_y * 0.04f;
+                float x1 = electric_poles[p2].tile_x * 0.04f;
+                float z1 = electric_poles[p2].tile_y * 0.04f;
+                add_catenary_cable(dyn_verts, x0, 0.22f, z0, x1, 0.22f, z1, 0.035f, 8, 0.20f, 0.22f, 0.24f, 1.0f);
+            }
         }
     }
 
-    // H) Baliza titilante en la chimenea de la ensambladora
-    float beacon_r = 1.0f, beacon_g = 0.58f + sinf(anim_time * 5.0f) * 0.38f, beacon_b = 0.1f;
-    add_cylinder_textured(dyn_verts, -0.22f + 0.065f, 0.12f, -0.22f + 0.065f, 0.008f, 0.016f, beacon_r, beacon_g, beacon_b, 1.0f, 6);
+    // 2. Piezas móviles animadas ancladas a entidades vivas activas
+    for (int i = 0; i < entity_count; ++i) {
+        const LiveEntity& ent = live_entities[i];
+        float mx = ent.tile_x * 0.04f;
+        float mz = ent.tile_y * 0.04f;
 
-    // I) Vapor de chimenea en partículas ascendentes
-    float puff_y = 0.18f + fmodf(anim_time * 0.08f, 0.06f);
-    float puff_a = 0.45f * (1.0f - (puff_y - 0.18f) / 0.06f);
-    add_cylinder_textured(dyn_verts, -0.22f - 0.045f, puff_y, -0.22f - 0.045f, 0.014f, 0.015f, 0.90f, 0.92f, 0.95f, puff_a, 6);
+        if (ent.entity_type == ENTITY_RADAR) {
+            // Antena parabólica giratoria continua 360°
+            float rad_ang = anim_time * 1.5f;
+            float dish_dx = sinf(rad_ang) * 0.04f;
+            float dish_dz = cosf(rad_ang) * 0.04f;
+            add_box_textured(dyn_verts, mx, 0.13f, mz, 0.08f, 0.018f, 0.025f, 1.0f, 1.0f, 0.82f, 0.85f, 0.88f, 1.0f);
+            add_cylinder_textured(dyn_verts, mx + dish_dx, 0.13f, mz + dish_dz, 0.035f, 0.010f, 0.92f, 0.94f, 0.96f, 1.0f, 10);
+        } else if (ent.entity_type == ENTITY_ROBOPORT) {
+            // Drones logísticos en patrulla aérea orbital
+            for (int d = 0; d < 2; ++d) {
+                float d_ang = anim_time * 1.8f + (float)d * 3.14159f;
+                float drone_x = mx + sinf(d_ang) * 0.08f;
+                float drone_z = mz + sinf(d_ang * 2.0f) * 0.05f;
+                float drone_y = 0.18f + cosf(d_ang) * 0.02f;
+                add_box_textured(dyn_verts, drone_x, drone_y, drone_z, 0.024f, 0.010f, 0.024f, 1.0f, 1.0f, 0.90f, 0.92f, 0.95f, 1.0f);
+                add_cylinder_textured(dyn_verts, drone_x - 0.014f, drone_y + 0.006f, drone_z - 0.014f, 0.008f, 0.002f, 0.2f, 0.2f, 0.2f, 0.8f, 6);
+                add_cylinder_textured(dyn_verts, drone_x + 0.014f, drone_y + 0.006f, drone_z - 0.014f, 0.008f, 0.002f, 0.2f, 0.2f, 0.2f, 0.8f, 6);
+                add_cylinder_textured(dyn_verts, drone_x - 0.014f, drone_y + 0.006f, drone_z + 0.014f, 0.008f, 0.002f, 0.2f, 0.2f, 0.2f, 0.8f, 6);
+                add_cylinder_textured(dyn_verts, drone_x + 0.014f, drone_y + 0.006f, drone_z + 0.014f, 0.008f, 0.002f, 0.2f, 0.2f, 0.2f, 0.8f, 6);
+            }
+        } else if (ent.entity_type == ENTITY_MINING_DRILL) {
+            // Vástago y broca reciprocante giratoria
+            float drill_y = 0.045f + sinf(anim_time * 8.0f) * 0.012f;
+            add_cylinder_textured(dyn_verts, mx, drill_y, mz, 0.024f, 0.07f, 0.55f, 0.60f, 0.65f, 1.0f, 8);
+        } else if (ent.entity_type == ENTITY_ASSEMBLING_MACHINE) {
+            // Baliza titilante en chimenea
+            float beacon_g = 0.58f + sinf(anim_time * 5.0f) * 0.38f;
+            add_cylinder_textured(dyn_verts, mx + 0.065f, 0.12f, mz + 0.065f, 0.008f, 0.016f, 1.0f, beacon_g, 0.1f, 1.0f, 6);
+        }
+    }
 
-    if (!dyn_verts.empty()) {
-        glUniform1f(s_use_tex_loc, 0.0f);
-        glBindVertexArray(s_dynamic_vao);
-        glBindBuffer(GL_ARRAY_BUFFER, s_dynamic_vbo);
-        glBufferSubData(GL_ARRAY_BUFFER, 0, dyn_verts.size() * sizeof(DioramaVertex), dyn_verts.data());
+    // 3. Inserter articulado estándar (brazo con cinemática oscilante)
+    float ins1_yaw = sinf(anim_time * 2.2f) * 0.82f;
+    add_cylinder_textured(dyn_verts, -0.08f, 0.02f, -0.13f, 0.025f, 0.04f, 0.95f, 0.68f, 0.12f, 1.0f, 8);
+    float elb1_x = -0.08f + sinf(ins1_yaw) * 0.06f;
+    float elb1_z = -0.13f + cosf(ins1_yaw) * 0.06f;
+    add_box_textured(dyn_verts, (-0.08f + elb1_x) * 0.5f, 0.04f, (-0.13f + elb1_z) * 0.5f, 0.012f, 0.012f, 0.07f, 1.0f, 1.0f, 0.28f, 0.32f, 0.36f, 1.0f);
 
-        glUniform1f(s_lit_loc, 1.0f);
-        glDrawArrays(GL_TRIANGLES, 0, (GLsizei)dyn_verts.size());
+    // 4. Ítems transportados sobre las cintas
+    float item_span = TABLE_HALF_W * 1.55f;
+    for (int k = 0; k < 7; ++k) {
+        float offset = fmodf(anim_time * 0.16f + (float)k * (item_span / 7.0f), item_span) - item_span * 0.5f;
+        add_box_textured(dyn_verts, offset, 0.016f, -0.06f, 0.030f, 0.005f, 0.030f, 1.0f, 1.0f, 0.68f, 0.74f, 0.80f, 1.0f);
+        add_box_textured(dyn_verts, -offset, 0.016f, 0.06f, 0.026f, 0.004f, 0.026f, 1.0f, 1.0f, 0.16f, 0.82f, 0.35f, 1.0f);
+    }
+
+    // 5. Partículas activas (Fase 3: Humo, Vapor, Polvo y Chispas)
+    for (size_t p = 0; p < s_particles.size(); ) {
+        Particle& part = s_particles[p];
+        if (is_primary_eye) {
+            part.life -= dt;
+            part.x += part.vx * dt;
+            part.y += part.vy * dt;
+            part.z += part.vz * dt;
+        }
+        if (part.life <= 0.0f) {
+            s_particles[p] = s_particles.back();
+            s_particles.pop_back();
+            continue;
+        }
+        float alpha = part.a * (part.life / part.max_life);
+        add_box_textured(dyn_verts, part.x, part.y, part.z, part.size, part.size, part.size,
+                         1.0f, 1.0f, part.r, part.g, part.b, alpha);
+        ++p;
+    }
+
+    // 6. Resaltado de la ranura Quickbar seleccionada activa en la consola UI
+    if (!s_observer_mode) {
+        int selected_slot = -1;
+        const int slot_to_entity[9] = {
+            ENTITY_ASSEMBLING_MACHINE, ENTITY_MINING_DRILL, ENTITY_FURNACE,
+            ENTITY_GUN_TURRET, ENTITY_RADAR, ENTITY_ROBOPORT,
+            ENTITY_CHEST, ENTITY_ELECTRIC_POLE, ENTITY_NONE
+        };
+        for (int s = 0; s < 9; ++s) {
+            if (slot_to_entity[s] == s_selected_build_tool) {
+                selected_slot = s;
+                break;
+            }
+        }
+        float slot_w = 0.055f, slot_h = 0.038f;
+        if (selected_slot >= 0) {
+            float sx = (float)(selected_slot - 4) * (slot_w + 0.010f);
+            // Marco de selección dorado brillante (#ffd700)
+            add_box_textured(dyn_verts, sx, ui_y - 0.055f, ui_z + 0.007f, slot_w + 0.006f, slot_h + 0.006f, 0.002f, 1.0f, 1.0f, 1.0f, 0.84f, 0.10f, 0.95f);
+        }
+        if (s_hovered_quickbar_slot >= 0 && s_hovered_quickbar_slot != selected_slot) {
+            float hx = (float)(s_hovered_quickbar_slot - 4) * (slot_w + 0.010f);
+            add_box_textured(dyn_verts, hx, ui_y - 0.055f, ui_z + 0.006f, slot_w + 0.004f, slot_h + 0.004f, 0.002f, 1.0f, 1.0f, 0.20f, 0.95f, 1.00f, 0.85f);
+        }
     }
 
     // ========================================================================
-    // 3. RAYO LÁSER 6DoF, RETÍCULO Y CLIC EN CONSOLA UI
+    // H) RAYO LÁSER 6DoF, RETÍCULO Y CONSTRUCCIÓN / MINADO (FASE 2)
     // ========================================================================
     if (right_aim_valid) {
-        float ident_mat[16];
-        matIdentity(ident_mat);
-        glUniformMatrix4fv(s_model_loc, 1, GL_FALSE, ident_mat);
-        glUniformMatrix4fv(s_mvp_loc, 1, GL_FALSE, vp_mat);
-        glUniform1f(s_enable_clipping_loc, 0.0f);
-        glUniform1f(s_lit_loc, 0.0f);
-        glUniform3f(s_emissive_loc, 0.2f, 0.8f, 1.0f);
-
         float rx = right_aim_pose.position.x;
         float ry = right_aim_pose.position.y;
         float rz = right_aim_pose.position.z;
@@ -1092,11 +1246,12 @@ static void draw_tabletop_scene(const float* vp_mat,
         float dz = -(1.0f - 2.0f * (qx * qx + qy * qy));
 
         float hit_stage_x = 0.0f, hit_stage_z = 0.0f;
+        float loc_x = 0.0f, loc_z = 0.0f;
         bool has_table_hit = false;
         bool has_ui_hit = false;
         float ray_len = 1.6f;
 
-        // A) Raycast contra el plano físico de la mesa en STAGE (Y = s_table_pos.y)
+        // 1. Raycast contra el plano físico de la mesa en STAGE (Y = s_table_pos.y)
         if (fabsf(dy) > 1e-4f) {
             float t = (s_table_pos.y - ry) / dy;
             if (t > 0.0f && t < 4.0f) {
@@ -1107,8 +1262,8 @@ static void draw_tabletop_scene(const float* vp_mat,
                 float rel_z = cand_z - s_table_pos.z;
                 float cos_y = cosf(-s_table_yaw);
                 float sin_y = sinf(-s_table_yaw);
-                float loc_x = (rel_x * cos_y - rel_z * sin_y) / s_table_scale;
-                float loc_z = (rel_x * sin_y + rel_z * cos_y) / s_table_scale;
+                loc_x = (rel_x * cos_y - rel_z * sin_y) / s_table_scale;
+                loc_z = (rel_x * sin_y + rel_z * cos_y) / s_table_scale;
 
                 if (fabsf(loc_x) <= TABLE_HALF_W && fabsf(loc_z) <= TABLE_HALF_D) {
                     has_table_hit = true;
@@ -1119,8 +1274,9 @@ static void draw_tabletop_scene(const float* vp_mat,
             }
         }
 
-        // B) Raycast contra la Consola UI Holográfica y botones
+        // 2. Raycast contra la Consola UI Holográfica y Quickbar
         s_hovered_ui_btn = -1;
+        s_hovered_quickbar_slot = -1;
         float ui_plane_z = -TABLE_HALF_D - 0.08f;
         float ui_world_z = s_table_pos.z + (ui_plane_z * cosf(s_table_yaw));
         float t_ui = (ui_world_z - rz) / (dz != 0 ? dz : 1e-4f);
@@ -1128,41 +1284,148 @@ static void draw_tabletop_scene(const float* vp_mat,
             float ui_hit_x = rx + dx * t_ui;
             float ui_hit_y = ry + dy * t_ui;
             float rel_x = ui_hit_x - s_table_pos.x;
-            float rel_y = ui_hit_y - (s_table_pos.y + 0.17f);
-            if (fabsf(rel_x) < 0.31f && fabsf(rel_y) < 0.13f) {
+            float rel_y = ui_hit_y - (s_table_pos.y + 0.18f);
+
+            if (fabsf(rel_x) < 0.31f && fabsf(rel_y) < 0.14f) {
                 has_ui_hit = true;
                 ray_len = t_ui;
 
-                // Identificar qué botón está apuntado
-                float btn_w = 0.108f;
-                for (int b = -2; b <= 2; ++b) {
-                    float bx = (float)b * (btn_w + 0.012f);
-                    if (fabsf(rel_x - bx) < btn_w * 0.5f && fabsf(rel_y - 0.045f) < 0.018f) {
-                        s_hovered_ui_btn = b + 2; // 0..4
-                        break;
+                // Botones de comando superiores (rel_y > 0.02)
+                if (rel_y > 0.02f) {
+                    float btn_w = 0.108f;
+                    for (int b = -2; b <= 2; ++b) {
+                        float bx = (float)b * (btn_w + 0.012f);
+                        if (fabsf(rel_x - bx) < btn_w * 0.5f && fabsf(rel_y - 0.065f) < 0.018f) {
+                            s_hovered_ui_btn = b + 2; // 0..4
+                            break;
+                        }
+                    }
+
+                    if (is_primary_eye && trigger_clicked && s_hovered_ui_btn >= 0) {
+                        if (s_hovered_ui_btn == 0) {
+                            s_observer_mode = !s_observer_mode;
+                            LOGI("Modo cambiado: %s", s_observer_mode ? "OBSERVADOR 1:1" : "TABLETOP DIORAMA");
+                        } else if (s_hovered_ui_btn == 1) {
+                            s_table_placed = false;
+                            LOGI("Re-anclando mesa...");
+                        } else {
+                            s_active_ui_tab = s_hovered_ui_btn - 2;
+                        }
                     }
                 }
+                // Ranuras de Quickbar / Construcción 6DoF (rel_y <= 0.0)
+                else if (rel_y <= 0.0f && rel_y >= -0.10f) {
+                    float slot_w = 0.055f;
+                    for (int s = 0; s < 9; ++s) {
+                        float sx = (float)(s - 4) * (slot_w + 0.010f);
+                        if (fabsf(rel_x - sx) < slot_w * 0.5f && fabsf(rel_y - (-0.055f)) < 0.022f) {
+                            s_hovered_quickbar_slot = s;
+                            break;
+                        }
+                    }
 
-                // Clic en botón de la interfaz con el gatillo Trigger
-                if (trigger_clicked && s_hovered_ui_btn >= 0) {
-                    if (s_hovered_ui_btn == 0) {
-                        // Alternar Modo Observador a escala 1:1 vs Modo Diorama Tabletop
-                        s_observer_mode = !s_observer_mode;
-                        LOGI("Modo cambiado: %s", s_observer_mode ? "OBSERVADOR 1:1" : "TABLETOP DIORAMA");
-                    } else if (s_hovered_ui_btn == 1) {
-                        // Re-anclar mesa frente al usuario
-                        s_table_placed = false;
-                        LOGI("Re-anclando mesa...");
-                    } else {
-                        // Cambiar sub-panel activo
-                        s_active_ui_tab = s_hovered_ui_btn - 2;
-                        LOGI("Sub-panel activo: %d", s_active_ui_tab);
+                    if (is_primary_eye && trigger_clicked && s_hovered_quickbar_slot >= 0) {
+                        const int slot_to_entity[9] = {
+                            ENTITY_ASSEMBLING_MACHINE, ENTITY_MINING_DRILL, ENTITY_FURNACE,
+                            ENTITY_GUN_TURRET, ENTITY_RADAR, ENTITY_ROBOPORT,
+                            ENTITY_CHEST, ENTITY_ELECTRIC_POLE, ENTITY_NONE
+                        };
+                        s_selected_build_tool = slot_to_entity[s_hovered_quickbar_slot];
+                        LOGI("Quickbar: Herramienta seleccionada = %d (slot %d)", s_selected_build_tool, s_hovered_quickbar_slot);
+                        for (int k = 0; k < 12; ++k) {
+                            spawn_particle(ui_hit_x, ui_hit_y, ui_hit_x,
+                                           ((rand() % 100) - 50) * 0.001f, ((rand() % 100) - 50) * 0.001f, 0.02f,
+                                           0.20f, 0.95f, 1.0f, 0.9f, 0.008f, 0.4f);
+                        }
                     }
                 }
             }
         }
 
-        std::vector<DioramaVertex> laser_verts;
+        // 3. Rejilla Magnética (Grid Snapping) y Ghost Preview 6DoF sobre la mesa (Fase 2)
+        if (has_table_hit && !has_ui_hit) {
+            float hover_tile_x = roundf(loc_x / 0.04f);
+            float hover_tile_y = roundf(loc_z / 0.04f);
+            hover_tile_x = std::clamp(hover_tile_x, -14.0f, 14.0f);
+            hover_tile_y = std::clamp(hover_tile_y, -9.0f, 9.0f);
+
+            bool is_occupied = false;
+            for (int i = 0; i < entity_count; ++i) {
+                float dx = fabsf(live_entities[i].tile_x - hover_tile_x);
+                float dy = fabsf(live_entities[i].tile_y - hover_tile_y);
+                float thresh = (live_entities[i].entity_type == ENTITY_ELECTRIC_POLE || 
+                                live_entities[i].entity_type == ENTITY_CHEST) ? 0.8f : 1.3f;
+                if (dx < thresh && dy < thresh) {
+                    is_occupied = true;
+                    break;
+                }
+            }
+
+            // Cuadrado de la celda de rejilla magnética 4cm x 4cm
+            float snap_mx = hover_tile_x * 0.04f;
+            float snap_mz = hover_tile_y * 0.04f;
+            float g_r = is_occupied ? 0.95f : 0.20f;
+            float g_g = is_occupied ? 0.25f : 0.95f;
+            float g_b = is_occupied ? 0.20f : 0.35f;
+
+            float hw_tile = 0.02f;
+            add_box_textured(dyn_verts, snap_mx, 0.002f, snap_mz - hw_tile, 0.04f, 0.001f, 0.002f, 1.0f, 1.0f, g_r, g_g, g_b, 0.8f);
+            add_box_textured(dyn_verts, snap_mx, 0.002f, snap_mz + hw_tile, 0.04f, 0.001f, 0.002f, 1.0f, 1.0f, g_r, g_g, g_b, 0.8f);
+            add_box_textured(dyn_verts, snap_mx - hw_tile, 0.002f, snap_mz, 0.002f, 0.001f, 0.04f, 1.0f, 1.0f, g_r, g_g, g_b, 0.8f);
+            add_box_textured(dyn_verts, snap_mx + hw_tile, 0.002f, snap_mz, 0.002f, 0.001f, 0.04f, 1.0f, 1.0f, g_r, g_g, g_b, 0.8f);
+
+            // GHOST PREVIEW holográfico del edificio seleccionado
+            if (s_selected_build_tool != ENTITY_NONE && s_entity_meshes[s_selected_build_tool].vao != 0) {
+                float ghost_trans[16], ghost_rot[16], ghost_local[16], ghost_world[16], ghost_mvp[16];
+                mat4_rotate_y(ghost_rot, s_placement_yaw);
+                mat4_translate(ghost_trans, snap_mx, 0.004f + sinf(anim_time * 4.0f) * 0.002f, snap_mz);
+                mat4_multiply(ghost_trans, ghost_rot, ghost_local);
+                mat4_multiply(active_model, ghost_local, ghost_world);
+                mat4_multiply(vp_mat, ghost_world, ghost_mvp);
+
+                glUniformMatrix4fv(s_model_loc, 1, GL_FALSE, ghost_world);
+                glUniformMatrix4fv(s_mvp_loc, 1, GL_FALSE, ghost_mvp);
+                glUniform1f(s_use_tex_loc, 0.0f);
+                glUniform1f(s_lit_loc, 0.0f);
+                glUniform3f(s_emissive_loc, g_r * 0.9f, g_g * 0.9f, g_b * 0.9f);
+
+                glBindVertexArray(s_entity_meshes[s_selected_build_tool].vao);
+                glDrawArrays(GL_TRIANGLES, 0, s_entity_meshes[s_selected_build_tool].vertex_count);
+                glUniform3f(s_emissive_loc, 0.0f, 0.0f, 0.0f);
+            }
+
+            // ACCIONES DE CONSTRUCCIÓN Y MINADO (Fase 2)
+            if (is_primary_eye) {
+                // Colocar edificio con gatillo
+                if (trigger_clicked && s_selected_build_tool != ENTITY_NONE && !is_occupied) {
+                    if (s_place_or_update_entity) {
+                        s_place_or_update_entity(s_selected_build_tool, hover_tile_x, hover_tile_y, s_placement_yaw);
+                        LOGI("Construido tipo=%d en tile (%.1f, %.1f) yaw=%.2f",
+                             s_selected_build_tool, hover_tile_x, hover_tile_y, s_placement_yaw);
+                        for (int k = 0; k < 20; ++k) {
+                            spawn_particle(snap_mx, 0.05f, snap_mz,
+                                           ((rand() % 100) - 50) * 0.001f, 0.04f + (rand() % 50) * 0.0005f, ((rand() % 100) - 50) * 0.001f,
+                                           0.20f, 0.95f, 0.40f, 0.95f, 0.010f, 0.8f);
+                        }
+                    }
+                }
+                // Minar / Deconstruir con Modo Demoler o con botón Grip
+                else if ((trigger_clicked && s_selected_build_tool == ENTITY_NONE && is_occupied) ||
+                         (grip_clicked && is_occupied)) {
+                    if (s_mine_entity) {
+                        s_mine_entity(hover_tile_x, hover_tile_y);
+                        LOGI("Minado/Deconstruido en tile (%.1f, %.1f)", hover_tile_x, hover_tile_y);
+                        for (int k = 0; k < 24; ++k) {
+                            spawn_particle(snap_mx, 0.04f, snap_mz,
+                                           ((rand() % 100) - 50) * 0.0015f, 0.05f + (rand() % 60) * 0.0008f, ((rand() % 100) - 50) * 0.0015f,
+                                           0.95f, 0.45f, 0.15f, 0.95f, 0.012f, 0.9f);
+                        }
+                    }
+                }
+            }
+        }
+
+        // 4. Geometría del rayo láser
         float end_x = rx + dx * ray_len;
         float end_y = ry + dy * ray_len;
         float end_z = rz + dz * ray_len;
@@ -1170,19 +1433,28 @@ static void draw_tabletop_scene(const float* vp_mat,
         float l_g = (has_ui_hit || has_table_hit) ? 0.95f : 0.35f;
         float l_b = (has_ui_hit || has_table_hit) ? 1.00f : 0.20f;
 
+        std::vector<DioramaVertex> laser_verts;
         add_box_textured(laser_verts, (rx + end_x) * 0.5f, (ry + end_y) * 0.5f, (rz + end_z) * 0.5f,
                          0.003f, 0.003f, ray_len, 1.0f, 1.0f, l_r, l_g, l_b, 0.92f);
 
-        // Retículo pulsante en la mesa
         if (has_table_hit) {
             float ret_rad = 0.032f + sinf(anim_time * 6.5f) * 0.004f;
             for (int s = 0; s < 16; ++s) {
                 float a0 = (float)s * 6.2831853f / 16.0f;
                 float a1 = (float)(s + 1) * 6.2831853f / 16.0f;
-                laser_verts.push_back({hit_stage_x + cosf(a0) * ret_rad, s_table_pos.y + 0.003f, hit_stage_z + sinf(a0) * ret_rad, 0, 1, 0, 0, 0, 0.2f, 0.95f, 1.0f, 0.95f});
-                laser_verts.push_back({hit_stage_x + cosf(a1) * ret_rad, s_table_pos.y + 0.003f, hit_stage_z + sinf(a1) * ret_rad, 0, 1, 0, 0, 0, 0.2f, 0.95f, 1.0f, 0.95f});
+                laser_verts.push_back({hit_stage_x + cosf(a0) * ret_rad, s_table_pos.y + 0.003f, hit_stage_z + sinf(a0) * ret_rad, 0, 1, 0, 0, 0, l_r, l_g, l_b, 0.95f});
+                laser_verts.push_back({hit_stage_x + cosf(a1) * ret_rad, s_table_pos.y + 0.003f, hit_stage_z + sinf(a1) * ret_rad, 0, 1, 0, 0, 0, l_r, l_g, l_b, 0.95f});
             }
         }
+
+        // Renderizar láser con MVP de mundo
+        float ident_mat[16];
+        matIdentity(ident_mat);
+        glUniformMatrix4fv(s_model_loc, 1, GL_FALSE, ident_mat);
+        glUniformMatrix4fv(s_mvp_loc, 1, GL_FALSE, vp_mat);
+        glUniform1f(s_enable_clipping_loc, 0.0f);
+        glUniform1f(s_lit_loc, 0.0f);
+        glUniform3f(s_emissive_loc, l_r, l_g, l_b);
 
         if (!laser_verts.empty()) {
             glBindVertexArray(s_dynamic_vao);
@@ -1190,6 +1462,23 @@ static void draw_tabletop_scene(const float* vp_mat,
             glBufferSubData(GL_ARRAY_BUFFER, 0, laser_verts.size() * sizeof(DioramaVertex), laser_verts.data());
             glDrawArrays(GL_TRIANGLES, 0, (GLsizei)laser_verts.size());
         }
+    }
+
+    // Renderizar elementos dinámicos de la mesa (cables, piezas móviles, partículas)
+    if (!dyn_verts.empty()) {
+        float dyn_mvp[16];
+        mat4_multiply(vp_mat, active_model, dyn_mvp);
+        glUniformMatrix4fv(s_model_loc, 1, GL_FALSE, active_model);
+        glUniformMatrix4fv(s_mvp_loc, 1, GL_FALSE, dyn_mvp);
+        glUniform1f(s_enable_clipping_loc, s_observer_mode ? 0.0f : 1.0f);
+        glUniform1f(s_use_tex_loc, 0.0f);
+        glUniform1f(s_lit_loc, 1.0f);
+        glUniform3f(s_emissive_loc, 0.0f, 0.0f, 0.0f);
+
+        glBindVertexArray(s_dynamic_vao);
+        glBindBuffer(GL_ARRAY_BUFFER, s_dynamic_vbo);
+        glBufferSubData(GL_ARRAY_BUFFER, 0, dyn_verts.size() * sizeof(DioramaVertex), dyn_verts.data());
+        glDrawArrays(GL_TRIANGLES, 0, (GLsizei)dyn_verts.size());
     }
 
     glBindVertexArray(0);
@@ -1535,6 +1824,7 @@ static void* openxr_thread_main(void* arg) {
     uint64_t frame_index = 0;
     float anim_time = 0.0f;
     bool prev_trigger = false;
+    bool prev_grip = false;
 
     while (s_running) {
         pump_android_input_queue();
@@ -1664,13 +1954,15 @@ static void* openxr_thread_main(void* arg) {
         XrActionStateFloat gripState = { .type = XR_TYPE_ACTION_STATE_FLOAT };
         XrActionStateGetInfo getGrip = { .type = XR_TYPE_ACTION_STATE_GET_INFO, .action = rightGripAction };
         xrGetActionStateFloat(session, &getGrip, &gripState);
+        bool grip_clicked = (gripState.currentState > 0.5f) && !prev_grip;
+        prev_grip = (gripState.currentState > 0.5f);
 
         XrActionStateVector2f stickState = { .type = XR_TYPE_ACTION_STATE_VECTOR2F };
         XrActionStateGetInfo getStick = { .type = XR_TYPE_ACTION_STATE_GET_INFO, .action = rightStickAction };
         xrGetActionStateVector2f(session, &getStick, &stickState);
 
         // 1. Agarre y arrastre de la mesa con el gatillo Grip (XrSurfaceGrab)
-        if (rightAimValid && gripState.currentState > 0.5f) {
+        if (rightAimValid && gripState.currentState > 0.5f && !grip_clicked) {
             if (!s_table_grabbed) {
                 s_table_grabbed = true;
                 s_grab_start_hand = rightAimLoc.pose.position;
@@ -1685,11 +1977,11 @@ static void* openxr_thread_main(void* arg) {
                 mat4_translate(trans, s_table_pos.x, s_table_pos.y, s_table_pos.z);
                 mat4_multiply(trans, rot, s_table_model_mat);
             }
-        } else {
+        } else if (gripState.currentState <= 0.5f) {
             s_table_grabbed = false;
         }
 
-        // 2. Ajuste fino de altura y orientación con el Joystick cuando no se arrastra
+        // 2. Rotación de herramienta de colocación con Joystick X o ajuste de altura con Y
         if (!s_table_grabbed && !s_observer_mode) {
             if (fabsf(stickState.currentState.y) > 0.2f) {
                 s_table_pos.y += stickState.currentState.y * 0.004f;
@@ -1698,12 +1990,12 @@ static void* openxr_thread_main(void* arg) {
                 mat4_translate(trans, s_table_pos.x, s_table_pos.y, s_table_pos.z);
                 mat4_multiply(trans, rot, s_table_model_mat);
             }
-            if (fabsf(stickState.currentState.x) > 0.2f) {
-                s_table_yaw -= stickState.currentState.x * 0.02f;
-                float rot[16], trans[16];
-                mat4_rotate_y(rot, s_table_yaw);
-                mat4_translate(trans, s_table_pos.x, s_table_pos.y, s_table_pos.z);
-                mat4_multiply(trans, rot, s_table_model_mat);
+            if (fabsf(stickState.currentState.x) > 0.6f && !s_stick_rotated) {
+                s_placement_yaw += (stickState.currentState.x > 0.0f) ? 1.5707963f : -1.5707963f;
+                s_stick_rotated = true;
+                LOGI("Rotación de colocación 6DoF: yaw=%.2f", s_placement_yaw);
+            } else if (fabsf(stickState.currentState.x) < 0.2f) {
+                s_stick_rotated = false;
             }
         } else if (s_observer_mode) {
             // Desplazamiento a pie en modo observador humano
@@ -1736,7 +2028,7 @@ static void* openxr_thread_main(void* arg) {
             mat4_view_from_pose(views[i].pose, viewMat);
             mat4_multiply(proj, viewMat, vp_mat);
 
-            draw_tabletop_scene(vp_mat, anim_time, rightAimLoc.pose, rightAimValid, trigger_clicked);
+            draw_tabletop_scene(vp_mat, anim_time, 0.016f, rightAimLoc.pose, rightAimValid, trigger_clicked, grip_clicked, (i == 0));
 
             XrSwapchainImageReleaseInfo relInfo = { .type = XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO };
             xrReleaseSwapchainImage(swapchains[i].handle, &relInfo);

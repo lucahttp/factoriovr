@@ -8,13 +8,26 @@ La fábrica se proyecta sobre tu mesa real como un diorama tridimensional intera
 
 ## Características Principales
 
-* **Modo Maqueta / Tabletop Diorama (Estilo Generals Zero Hour XR)**: Proyecta la fábrica de Factorio anclada de forma fija al suelo en espacio `XR_REFERENCE_SPACE_TYPE_STAGE` a la altura exacta [...]
-* **Plinto Geológico y Recorte de Borde (`u_board_bounds`)**: El terreno se asienta sobre un zócalo con estratos de tierra/roca y marco biselado, recortando limpiamente la geometría para no des[...]
-* **Texturas de Alta Resolución Factorio**: Losas de concreto industrial con juntas de dilatación y pernos de anclaje, franjas diagonales de peligro (hazard stripes a 45°), cintas transportadoras a[...]
-* **Maquinaria 3D Completa (`factorio-3d-mod`)**: Máquinas de ensamblaje 2 con engranajes giratorios y chimenea de vapor, perforadoras con vástago rotatorio y yacimiento, hornos de acero con fue[...]
-* **Consola de Mando Espacial Holográfica (`XrCommandUI`)**: Panel flotante de cristal desacoplado de la mesa con 5 botones interactivos (`[OBSERVADOR 1:1]`, `[RE-ANCLAR]`, `[ENERGÍA]`, `[ÍTEMS[...]
-* **Manipulación de Mesa 6DoF (`XrSurfaceGrab`)**: Agarra y traslada la maqueta por la habitación manteniendo presionado el botón Grip; ajusta la altura milimétrica y orientación con el joyst[...]
-* **Modo Observador Humano a Escala 1:1 (`XrWorld::observer`)**: Cambia entre la perspectiva de diorama táctico y la vista del ingeniero caminando directamente sobre el hormigón de la fábrica c[...]
+* **Modo Maqueta / Tabletop Diorama (Estilo Generals Zero Hour XR)**: Proyecta la fábrica de Factorio anclada de forma fija al suelo en espacio `XR_REFERENCE_SPACE_TYPE_STAGE` a la altura exacta del escritorio físico (~0.74m), eliminando la flotación frente a la cara.
+* **Plinto Geológico y Recorte de Borde (`u_board_bounds`)**: El terreno se asienta sobre un zócalo con estratos de tierra/roca y marco biselado, recortando limpiamente la geometría para no desbordar en la habitación física.
+* **Simulación en Vivo y Puente Bidireccional (`xfactorvr_get_live_entities`)**: Conexión directa con la simulación C++/ARM64 de Factorio y ticks en tiempo real para reflejar el estado vivo de la fábrica.
+* **Construcción y Deconstrucción 6DoF**:
+  * **Quickbar Holográfica de 9 Ranuras**: Barra interactiva (Ensambladora, Minera, Horno, Torreta, Radar, Robopuerto, Cofre, Poste, Demolición) seleccionable con puntero láser.
+  * **Rejilla Magnética y Holograma Fantasma (Ghost Preview)**: Proyección 3D translúcida con detección de ocupación (verde para casilla libre, rojo para casilla ocupada).
+  * **Rotación y Orientación**: Giro instantáneo en incrementos de 90° usando el stick analógico.
+  * **Colocación y Minado**: Colocación con disparador derecho (Trigger) y demolición con botón lateral (Grip) o herramienta de demolición.
+* **Animaciones de Maquinaria y Partículas 3D (`factorio-3d-mod`)**:
+  * Antena de radar con rotación continua de 360°.
+  * Torreta defensiva con rotación y seguimiento independiente del cabezal superior.
+  * Perforadora minera con pistón/broca vertical reciprocante.
+  * Robopuerto con drones de patrulla aérea orbitando en 3D.
+  * Máquina de ensamblaje con baliza titilante en la chimenea y bocanadas de vapor.
+  * Postes de tendido eléctrico con cables catenarios tridimensionales autogenerados entre postes contiguos.
+  * Cintas transportadoras con desplazamiento UV animado e ítems en tránsito.
+  * Sistema de partículas 3D para humo, vapor, chispas de colocación y escombros de minado.
+* **Consola de Mando Espacial Holográfica (`XrCommandUI`)**: Panel flotante de cristal desacoplado de la mesa con 5 botones interactivos (`[OBSERVADOR 1:1]`, `[RE-ANCLAR]`, `[ENERGÍA]`, `[ÍTEMS]`, `[TECNOLOGÍA]`), apuntable con rayo láser y activable con el gatillo.
+* **Manipulación de Mesa 6DoF (`XrSurfaceGrab`)**: Agarra y traslada la maqueta por la habitación manteniendo presionado el botón Grip; ajusta la altura milimétrica y orientación con el joystick.
+* **Modo Observador Humano a Escala 1:1 (`XrWorld::observer`)**: Cambia entre la perspectiva de diorama táctico y la vista del ingeniero caminando directamente sobre el hormigón de la fábrica con navegación fluida mediante el stick analógico.
 
 ---
 
@@ -51,11 +64,14 @@ Este proyecto utiliza y se inspira en los siguientes repositorios como referenci
 
 | Acción | Mando Pico | Función en Factorio XR |
 |---|---|---|
-| **Puntero Láser & Retículo** | Mando derecho (6DoF Aim) | Apunta a casillas de la fábrica o botones de la consola holográfica |
-| **Gatillo Índice (Trigger)** | Presionar / Clic | Seleccionar / Interactuar con botones de la interfaz espacial |
-| **Gatillo Lateral (Grip)** | Mantener presionado (`XrSurfaceGrab`) | Agarrar y arrastrar la mesa para reubicarla libremente en tu habitación |
-| **Joystick (Modo Diorama)** | Arriba / Abajo | Ajuste fino de altura de la mesa ($\pm4\text{mm}$ por paso) |
-| **Joystick (Modo Diorama)** | Izquierda / Derecha | Rotar la orientación de la mesa sobre su eje vertical (Yaw) |
+| **Puntero Láser & Retículo** | Mando derecho (6DoF Aim) | Apunta a casillas de la fábrica, Quickbar o botones de la consola |
+| **Gatillo Índice (Trigger)** | Clic sobre ranura Quickbar | Selecciona la herramienta/entidad activa a construir |
+| **Gatillo Índice (Trigger)** | Clic sobre casilla vacía | Construir entidad seleccionada (Ghost verde) |
+| **Gatillo Lateral (Grip)** | Clic sobre entidad existente | Minar / Deconstruir entidad apuntada |
+| **Gatillo Índice (Trigger)** | Clic con herramienta Demoler | Minar / Deconstruir entidad apuntada |
+| **Joystick X (Thumbstick)** | Izquierda / Derecha | Rotar orientación de colocación de la entidad en 90° |
+| **Gatillo Lateral (Grip)** | Mantener sobre borde mesa | Agarrar y arrastrar la mesa (`XrSurfaceGrab`) para reubicarla |
+| **Joystick Y (Modo Mesa)** | Arriba / Abajo | Ajuste fino de altura de la mesa ($\pm4\text{mm}$ por paso) |
 | **Joystick (Modo Observador)** | 2D Stick | Desplazamiento a pie en escala 1:1 por el suelo de la fábrica |
 | **Consola Holográfica** | Botón [OBSERVADOR 1:1] | Alternar entre vista de maqueta táctica y vista de suelo en 1:1 |
 

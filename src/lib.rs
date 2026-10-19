@@ -10,9 +10,16 @@ pub mod symbols;
 pub mod tabletop;
 
 use anyhow::Result;
-use std::sync::OnceLock;
+use std::sync::{OnceLock, RwLock};
 
 static TABLETOP: OnceLock<tabletop::TabletopManager> = OnceLock::new();
+static LIVE_ENTITIES: OnceLock<RwLock<Vec<tabletop::LiveEntity>>> = OnceLock::new();
+
+pub fn get_live_entities_lock() -> &'static RwLock<Vec<tabletop::LiveEntity>> {
+    LIVE_ENTITIES.get_or_init(|| {
+        RwLock::new(tabletop::init_default_factory_entities())
+    })
+}
 
 #[cfg(target_os = "android")]
 struct AndroidLogger;
@@ -152,6 +159,129 @@ pub unsafe extern "C" fn xfactorvr_free_glb(
     }
 }
 
+/// Obtiene una copia de las entidades vivas actuales para renderizarlas en OpenXR
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn xfactorvr_get_live_entities(
+    out_entities: *mut tabletop::LiveEntity,
+    max_count: i32,
+    out_count: *mut i32,
+) -> bool {
+    if out_entities.is_null() || out_count.is_null() || max_count <= 0 {
+        return false;
+    }
+    let lock = get_live_entities_lock();
+    if let Ok(entities) = lock.read() {
+        let count = entities.len().min(max_count as usize);
+        std::ptr::copy_nonoverlapping(entities.as_ptr(), out_entities, count);
+        *out_count = count as i32;
+        true
+    } else {
+        *out_count = 0;
+        false
+    }
+}
+
+/// Registra o actualiza una entidad viva (llamado desde hooks o UI de colocación 6DoF)
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn xfactorvr_place_or_update_entity(
+    entity_type: u32,
+    tile_x: f32,
+    tile_y: f32,
+    orientation: f32,
+) -> bool {
+    let lock = get_live_entities_lock();
+    if let Ok(mut entities) = lock.write() {
+        if let Some(existing) = entities.iter_mut().find(|e| (e.tile_x - tile_x).abs() < 0.5 && (e.tile_y - tile_y).abs() < 0.5) {
+            existing.entity_type = entity_type;
+            existing.orientation = orientation;
+        } else {
+            entities.push(tabletop::LiveEntity {
+                entity_type,
+                tile_x,
+                tile_y,
+                orientation,
+                status: 1,
+                animation_progress: 0.0,
+                health_ratio: 1.0,
+            });
+        }
+        true
+    } else {
+        false
+    }
+}
+
+/// Elimina / mina una entidad en las coordenadas de tile dadas (Mining / Deconstrucción 6DoF)
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn xfactorvr_mine_entity(
+    tile_x: f32,
+    tile_y: f32,
+) -> bool {
+    let lock = get_live_entities_lock();
+    if let Ok(mut entities) = lock.write() {
+        if let Some(pos) = entities.iter().position(|e| (e.tile_x - tile_x).abs() < 1.0 && (e.tile_y - tile_y).abs() < 1.0) {
+            entities.remove(pos);
+            true
+        } else {
+            false
+        }
+    } else {
+        false
+    }
+}
+
+/// Actualiza el ciclo de simulación y animaciones continuas de las entidades vivas
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn xfactorvr_update_simulation(delta_time: f32) {
+    let lock = get_live_entities_lock();
+    if let Ok(mut entities) = lock.write() {
+        for entity in entities.iter_mut() {
+            if entity.status == 1 {
+                let speed = match entity.entity_type {
+                    tabletop::ENTITY_ASSEMBLING_MACHINE => 1.2,
+                    tabletop::ENTITY_MINING_DRILL => 0.8,
+                    tabletop::ENTITY_RADAR => 0.5,
+                    tabletop::ENTITY_GUN_TURRET => 0.4,
+                    tabletop::ENTITY_INSERTER => 1.5,
+                    _ => 0.2,
+                };
+                entity.animation_progress = (entity.animation_progress + delta_time * speed).rem_euclid(1.0);
+            }
+        }
+    }
+}
+
+/// Hook invocado cuando una entidad de Factorio se dibuja en el motor original (ELF Hook bridge)
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn xfactorvr_on_entity_draw(
+    entity_type: u32,
+    x_fp: i32,
+    y_fp: i32,
+    orientation: f32,
+    status: u32,
+) {
+    let tile_x = x_fp as f32 / offsets::RECT_FP;
+    let tile_y = y_fp as f32 / offsets::RECT_FP;
+    let lock = get_live_entities_lock();
+    if let Ok(mut entities) = lock.write() {
+        if let Some(existing) = entities.iter_mut().find(|e| (e.tile_x - tile_x).abs() < 0.5 && (e.tile_y - tile_y).abs() < 0.5) {
+            existing.entity_type = entity_type;
+            existing.orientation = orientation;
+            existing.status = status;
+        } else {
+            entities.push(tabletop::LiveEntity {
+                entity_type,
+                tile_x,
+                tile_y,
+                orientation,
+                status,
+                animation_progress: 0.0,
+                health_ratio: 1.0,
+            });
+        }
+    }
+}
+
 // Constructor ejecutado automáticamente por el linker dinámico en Linux / Android
 #[cfg(any(target_os = "linux", target_os = "android"))]
 #[unsafe(export_name = "_init")]
@@ -176,5 +306,81 @@ mod tests {
         let (tile_x, tile_y) = hit.unwrap();
         assert!((tile_x - 0.0).abs() < 1e-4);
         assert!((tile_y - 0.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn test_live_entities_management() {
+        let mut buffer = [tabletop::LiveEntity {
+            entity_type: 0,
+            tile_x: 0.0,
+            tile_y: 0.0,
+            orientation: 0.0,
+            status: 0,
+            animation_progress: 0.0,
+            health_ratio: 0.0,
+        }; 64];
+        let mut count = 0;
+
+        // 1. Obtener entidades iniciales
+        let ok = unsafe { xfactorvr_get_live_entities(buffer.as_mut_ptr(), 64, &mut count) };
+        assert!(ok);
+        assert!(count > 0, "Debe haber entidades iniciales en la fábrica");
+        let initial_count = count;
+
+        // 2. Colocar una nueva ensambladora en (15.0, 15.0)
+        let placed = unsafe { xfactorvr_place_or_update_entity(tabletop::ENTITY_ASSEMBLING_MACHINE, 15.0, 15.0, 0.0) };
+        assert!(placed);
+
+        // 3. Verificar que la cuenta aumentó
+        let ok2 = unsafe { xfactorvr_get_live_entities(buffer.as_mut_ptr(), 64, &mut count) };
+        assert!(ok2);
+        assert_eq!(count, initial_count + 1);
+
+        // 4. Minar / deconstruir la entidad colocada
+        let mined = unsafe { xfactorvr_mine_entity(15.0, 15.0) };
+        assert!(mined);
+
+        // 5. Verificar que regresó a la cuenta original
+        let ok3 = unsafe { xfactorvr_get_live_entities(buffer.as_mut_ptr(), 64, &mut count) };
+        assert!(ok3);
+        assert_eq!(count, initial_count);
+    }
+
+    #[test]
+    fn test_simulation_progression_and_hook() {
+        let mut buffer = [tabletop::LiveEntity {
+            entity_type: 0,
+            tile_x: 0.0,
+            tile_y: 0.0,
+            orientation: 0.0,
+            status: 0,
+            animation_progress: 0.0,
+            health_ratio: 0.0,
+        }; 64];
+        let mut count = 0;
+
+        // Probar hook de Factorio C++
+        unsafe {
+            xfactorvr_on_entity_draw(tabletop::ENTITY_GUN_TURRET, (5.0 * 256.0) as i32, (5.0 * 256.0) as i32, 1.57, 1);
+        }
+        let ok = unsafe { xfactorvr_get_live_entities(buffer.as_mut_ptr(), 64, &mut count) };
+        assert!(ok);
+        let turret = buffer[..count as usize].iter().find(|e| (e.tile_x - 5.0).abs() < 0.1 && (e.tile_y - 5.0).abs() < 0.1);
+        assert!(turret.is_some(), "La torreta agregada por el hook debe existir");
+        let initial_progress = turret.unwrap().animation_progress;
+
+        // Avanzar simulación
+        unsafe {
+            xfactorvr_update_simulation(0.1);
+        }
+        let ok2 = unsafe { xfactorvr_get_live_entities(buffer.as_mut_ptr(), 64, &mut count) };
+        assert!(ok2);
+        let updated_turret = buffer[..count as usize].iter().find(|e| (e.tile_x - 5.0).abs() < 0.1 && (e.tile_y - 5.0).abs() < 0.1).unwrap();
+        assert!(updated_turret.animation_progress > initial_progress, "El progreso de animación debe avanzar");
+
+        // Limpiar
+        unsafe {
+            xfactorvr_mine_entity(5.0, 5.0);
+        }
     }
 }

@@ -133,6 +133,61 @@ PROTECTED_ENTITIES = {
 }
 
 
+# Tipos de entidad que el motor VR dibuja realmente (los que le envia el
+# juego).  Con --only-listed el atlas se reduce a lo que hace falta.
+LISTED_ENTITY_TYPES = [
+    "assembling-machine-1", "assembling-machine-2", "assembling-machine-3",
+    "big-electric-pole", "burner-mining-drill", "campfire", "electric-furnace",
+    "electric-mining-drill", "express-transport-belt", "fast-inserter",
+    "fast-transport-belt", "gun-turret", "inserter", "iron-chest",
+    "laser-turret", "long-handed-inserter", "medium-electric-pole",
+    "offshore-mining-drill", "radar", "resource", "roboport",
+    "small-electric-pole", "splitter", "steel-chest", "steel-furnace",
+    "stone-furnace", "substation", "transport-belt", "transport-chest",
+    "underground-belt", "wooden-chest",
+    # recursos y decoracion que tambien se dibujan
+    "tree", "iron-ore", "copper-ore", "coal", "uranium-ore", "stone",
+    "crude-oil", "water",
+    # y las variantes de bitero
+    "small-biter", "medium-biter", "big-biter", "boss-biter",
+]
+
+
+def _avg2(a, b):
+    """Promedio de dos cadenas de bytes, byte a byte, sin acarreo entre bytes."""
+    n = len(a)
+    if n == 0:
+        return b""
+    mask = int.from_bytes(b"\x7f" * n, "big")
+    x = int.from_bytes(a, "big") & mask
+    y = int.from_bytes(b, "big") & mask
+    return (((x + y) >> 1) & mask).to_bytes(n, "big")
+
+
+def downscale_2x2(row0, row1, dest_width):
+    """Reduce una fila RGBA a la mitad con filtro de caja 2x2."""
+    out = bytearray(dest_width * 4)
+    for c in range(4):
+        even = row0[c::8]
+        odd = row0[4 + c::8]
+        top = _avg2(even, odd)
+        if row1 is not None:
+            merged = _avg2(top, _avg2(row1[c::8], row1[4 + c::8]))
+        else:
+            merged = top
+        out[c::4] = merged[:dest_width]
+    return bytes(out)
+
+
+def downscale_nearest(row, dest_width, factor):
+    """Reduce una fila RGBA tomando un pixel de cada `factor`."""
+    out = bytearray(dest_width * 4)
+    stride = 4 * factor
+    for c in range(4):
+        out[c::4] = row[c::stride][:dest_width]
+    return bytes(out)
+
+
 class ExtractError(Exception):
     """Error fatal del extractor."""
 
@@ -2352,7 +2407,7 @@ class LayerAsset(object):
                  "geometry", "header", "frames", "omitted", "flags", "shift",
                  "scale", "anim_speed", "frame_count", "direction_count",
                  "table", "is_body", "z_order", "atlas_x", "atlas_y",
-                 "animation_frames", "strips")
+                 "animation_frames", "blocks", "grid_cols", "grid_rows")
 
     def __init__(self):
         self.entity = ""
@@ -2377,7 +2432,9 @@ class LayerAsset(object):
         self.atlas_x = 0
         self.atlas_y = 0
         self.animation_frames = 1
-        self.strips = []
+        self.blocks = []
+        self.grid_cols = 1
+        self.grid_rows = 1
 
 
 def _lua_to_json(value):
@@ -2586,10 +2643,27 @@ def build_arg_parser():
                         help="detecta y reporta la version de Factorio")
     parser.add_argument("--atlas-size", type=int, default=2048,
                         help="ancho maximo del atlas en pixeles (por defecto 2048)")
-    parser.add_argument("--max-atlas-height", type=int, default=32768,
-                        help="alto maximo del atlas en pixeles (por defecto 32768)")
+    parser.add_argument("--page-size", type=int, default=2048,
+                        help="lado de cada pagina del atlas en pixeles "
+                             "(por defecto 2048, el limite de OpenGL ES)")
+    parser.add_argument("--max-pages", type=int, default=32,
+                        help="numero maximo de paginas del atlas (por defecto 32)")
+    parser.add_argument("--frames-per-layer", type=int, default=0,
+                        help="frames por capa en el atlas (0 = todos). "
+                             "Recorta los sprites para conseguir un atlas "
+                             "pequeno; la rejilla sigue siendo rectangular")
+    parser.add_argument("--scale", type=float, default=0.5,
+                        help="escala de los pixeles del atlas (por defecto 0.5). "
+                             "NO cambia el tamano logico del frame")
+    parser.add_argument("--capas", choices=("cuerpo", "todas"), default="cuerpo",
+                        help="que capas meter: 'cuerpo' (cuerpo y animacion) o "
+                             "'todas' (sombra, luces y reflejos tambien)")
+    parser.add_argument("--only-listed", action="store_true",
+                        help="extraer solo los tipos de entidad que el motor VR "
+                             "dibuja (fabrica, recursos y arboles)")
     parser.add_argument("--no-raw", action="store_true",
-                        help="no escribir atlas.rgba (el motor lo sube crudo a la GPU)")
+                        help="no escribir los atlas_N.rgba (el motor los sube "
+                             "crudos a la GPU)")
     parser.add_argument("--skip-icons", action="store_true",
                         help="no copiar los iconos de items")
     parser.add_argument("--skip-locale", action="store_true",
@@ -2646,15 +2720,17 @@ def main(argv=None):
                          % proto_dir)
         return 1
 
-    # filtro --types
+    # filtro --types / --only-listed
     wanted = [t.strip() for t in args.types.split(",") if t.strip()]
+    if args.only_listed:
+        wanted = wanted + LISTED_ENTITY_TYPES
     if wanted:
         wset = set(wanted)
         entities = [e for e in entities
                     if e.name in wset or e.ptype in wset]
         if not entities:
-            sys.stderr.write("ERROR: el filtro --types %s no coincide con ninguna "
-                             "entidad\n" % args.types)
+            sys.stderr.write("ERROR: el filtro %s no coincide con ninguna "
+                             "entidad\n" % (args.types or "--only-listed"))
             return 1
 
     # segunda pasada: geometria de cada capa (cabeceras PNG + definicion de tira)
@@ -2672,15 +2748,41 @@ def main(argv=None):
             sys.stderr.write("         - %s (en %s)\n" % (ref, ename))
         return 1
 
-    # --- presupuesto del atlas -----------------------------------------
-    # El atlas guarda las HOJAS COMPLETAS de cada capa: asi los frames de una
-    # capa quedan contiguos en la textura y el motor puede calcular cualquier
-    # celda con cols/rows.  El arte completo de Factorio son ~1000 Mpx, muy
-    # por encima de lo que cabe en un unico atlas, asi que se descartan
-    # entidades enteras empezando por las menos importantes.
-    atlas_width = max(1, args.atlas_size)
-    max_height = max(1, min(args.max_atlas_height, PNG_MAX_DIMENSION))
-    budget = atlas_width * max_height
+    # --- que capas se quedan ----------------------------------------------
+    # Por defecto solo el cuerpo y la animacion: la sombra se simula con un
+    # quad oscuro en el motor y las luces de conexion/estado no se pintan.
+    if args.capas == "cuerpo":
+        for entity in entities:
+            kept = []
+            for layer in entity.layers:
+                name = layer.rel_path.lower()
+                if any(mark in name for mark in
+                       ("-shadow", "-light", "-lights", "-reflection",
+                        "-reflections", "-mask", "-glow")):
+                    layer.omitted = "capa-no-dibujada"
+                    continue
+                if "shadow" in layer.flags or "mask" in layer.flags or \
+                        "light" in layer.flags:
+                    layer.omitted = "capa-no-dibujada"
+                    continue
+                # las variantes reflejadas se descartan: el motor puede
+                # espejar la normal
+                _direction, flipped = detect_variant(layer.ref)
+                if flipped:
+                    layer.omitted = "capa-no-dibujada"
+                    continue
+                kept.append(layer)
+            entity.layers = kept
+            entity.flipped = {}
+        entities = [e for e in entities if e.layers]
+
+    # --- paginacion del atlas --------------------------------------------
+    # Cada pagina mide como maximo page_size x page_size.  OpenGL ES
+    # garantiza GL_MAX_TEXTURE_SIZE = 2048, asi que una textura mas alta
+    # no se puede subir a la GPU: por eso el atlas se pagina.
+    page_size = max(64, args.page_size)
+    max_pages = max(1, args.max_pages)
+    budget = max_pages * page_size * page_size
 
     total_cells = 0
     total_sheets = 0
@@ -2690,49 +2792,53 @@ def main(argv=None):
             total_sheets += (layer.geometry.sheet_width *
                              layer.geometry.sheet_height)
 
-    def strips_of(layer):
-        """Trocea la hoja de una capa en franjas que caben en el atlas.
+    def used_grid(layer):
+        """Rejilla que se mete en el atlas: (columnas, filas).
 
-        Devuelve [(columna_inicial, num_columnas, ancho_px, alto_px), ...].
-        Una hoja normal cabe en una sola franja."""
+        Sin limite son todas las celdas de la hoja.  Con --frames-per-layer
+        se recortan las primeras celdas en orden de fila, pero la rejilla
+        sigue siendo rectangular, de forma que len(frames) == cols*rows
+        siempre se cumple."""
         geo = layer.geometry
-        fw = geo.frame_width
-        cols = geo.cols
-        if fw <= 0:
-            return [(0, max(1, cols), geo.sheet_width, geo.sheet_height)]
-        per_strip = max(1, atlas_width // fw)
-        if cols <= per_strip:
-            return [(0, cols, cols * fw, geo.sheet_height)]
-        strips = []
-        start_col = 0
-        while start_col < cols:
-            count = min(per_strip, cols - start_col)
-            strips.append((start_col, count, count * fw, geo.sheet_height))
-            start_col += count
-        return strips
+        cols, rows = geo.cols, geo.rows
+        limit = args.frames_per_layer
+        if limit <= 0:
+            return cols, rows
+        if cols * rows <= limit:
+            return cols, rows
+        used_cols = min(cols, limit)
+        used_rows = min(rows, (limit + used_cols - 1) // used_cols)
+        return used_cols, used_rows
 
-    def plan_for():
-        """Empaqueta las hojas de todas las capas incluidas."""
-        rects = []
-        for entity in entities:
-            if entity.omitted:
-                continue
-            for layer in entity.layers:
-                if layer.omitted:
-                    continue
-                geo = layer.geometry
-                if geo.sheet_height > max_height:
-                    layer.omitted = "atlas-corta"
-                    continue
-                for start_col, count, w, h in strips_of(layer):
-                    rects.append((w, h, (entity.name, layer.index, start_col)))
-        if not rects:
-            return None, None, None
-        try:
-            placements, aw, ah = pack_skyline(rects, atlas_width)
-        except ExtractError:
-            return None, None, None
-        return placements, aw, ah
+    def scaled_cell(layer):
+        """Tamano del frame DENTRO del atlas (puede estar reescalado)."""
+        geo = layer.geometry
+        w = max(1, int(round(geo.frame_width * args.scale)))
+        h = max(1, int(round(geo.frame_height * args.scale)))
+        return w, h
+
+    def blocks_of(layer):
+        """Trocea la hoja de la capa en bloques que caben en una pagina."""
+        geo = layer.geometry
+        fw, fh = geo.frame_width, geo.frame_height
+        if fw <= 0 or fh <= 0:
+            return []
+        cols, rows = used_grid(layer)
+        cell_w, cell_h = scaled_cell(layer)
+        cols_per = max(1, page_size // cell_w)
+        rows_per = max(1, page_size // cell_h)
+        blocks = []
+        r0 = 0
+        while r0 < rows:
+            n_rows = min(rows_per, rows - r0)
+            c0 = 0
+            while c0 < cols:
+                n_cols = min(cols_per, cols - c0)
+                blocks.append((c0, r0, n_cols, n_rows,
+                               n_cols * cell_w, n_rows * cell_h))
+                c0 += n_cols
+            r0 += n_rows
+        return blocks
 
     def area_for():
         total = 0
@@ -2787,21 +2893,61 @@ def main(argv=None):
         for layer in entity.layers:
             layer.omitted = "atlas-pleno"
 
-    # 1) descarte por estimacion de area (sin empaquetar)
+    # 1) descarte por estimacion de area (sin empaquetar).  El skyline
+    #    aprovecha ~78% de la pagina, asi que se estima con ese margen.
     while True:
         droppable = [c for c in rank_entities() if c[0] > 0]
         if not droppable:
             break
-        if area_for() <= budget * 0.92:
+        if area_for() <= budget * 0.78:
             break
         victim = droppable[0][4]
         drop_entity(victim)
         dropped_entities += 1
         dropped_layers += len(victim.layers)
 
-    # 2) empaquetado real; si aun no cabe se descarta algo mas
-    placements, atlas_w, atlas_h = plan_for()
-    while placements is not None and atlas_h > max_height:
+    # 2) empaquetado real en paginas
+    def pack_all():
+        packer = PagePacker(page_size)
+        # se recoge todo y se ordena por altura: empaquetar primero los
+        # bloques mas altos deja los huecos Pequenios para los pequenos y
+        # mejora mucho el aprovechamiento de las paginas
+        pending = []
+        for entity in entities:
+            if entity.omitted:
+                continue
+            for layer in entity.layers:
+                if layer.omitted:
+                    continue
+                layer.blocks = []
+                for (c0, r0, n_cols, n_rows, bw, bh) in blocks_of(layer):
+                    pending.append((bh, bw, entity, layer, c0, r0, n_cols, n_rows))
+        pending.sort(key=lambda t: (-t[0], -t[1], t[2].name, t[3].index))
+        for (_bh, _bw, entity, layer, c0, r0, n_cols, n_rows) in pending:
+            if entity.omitted or layer.omitted:
+                continue
+            key = (entity.name, layer.index, c0, r0)
+            placed = packer.add(key, n_cols * layer.geometry.frame_width,
+                                n_rows * layer.geometry.frame_height)
+            if placed is None:
+                layer.omitted = "atlas-corta"
+                layer.blocks = []
+                continue
+            page, px, py = placed
+            layer.blocks.append({
+                "page": page, "atlas_x": px, "atlas_y": py,
+                "width": n_cols * layer.geometry.frame_width,
+                "height": n_rows * layer.geometry.frame_height,
+                "first_col": c0, "first_row": r0,
+                "cols": n_cols, "rows": n_rows,
+            })
+        for entity in entities:
+            for layer in entity.layers:
+                layer.blocks.sort(key=lambda b: (b["first_row"], b["first_col"]))
+        return packer
+
+    packer = pack_all()
+    while packer.page_count() > max_pages:
         droppable = [c for c in rank_entities() if c[0] > 0]
         if not droppable:
             break
@@ -2809,20 +2955,24 @@ def main(argv=None):
         drop_entity(victim)
         dropped_entities += 1
         dropped_layers += len(victim.layers)
-        placements, atlas_w, atlas_h = plan_for()
+        packer = pack_all()
 
-    if placements is None:
+    if packer.page_count() == 0:
         sys.stderr.write("ERROR: no se pudo colocar ninguna hoja en el atlas\n")
         return 1
-    if atlas_h > max_height:
-        sys.stderr.write("ERROR: el atlas necesitaria %d px de alto (maximo %d). "
-                         "Sube --max-atlas-height o usa --types para filtrar.\n"
-                         % (atlas_h, max_height))
+    if packer.page_count() > max_pages:
+        sys.stderr.write("ERROR: hacen falta %d paginas de %d px (maximo %d). "
+                         "Sube --max-pages o usa --types para filtrar.\n"
+                         % (packer.page_count(), page_size, max_pages))
         return 1
-    used_area = atlas_w * atlas_h
 
-    # --- render del atlas ------------------------------------------------
-    atlas = bytearray(atlas_w * atlas_h * 4)
+    # --- render de las paginas --------------------------------------------
+    page_count = packer.page_count()
+    pages = [bytearray(page_size * page_size * 4) for _ in range(page_count)]
+
+    for entity in entities:
+        for layer in entity.layers:
+            layer.grid_cols, layer.grid_rows = used_grid(layer)
 
     for entity in entities:
         if entity.omitted:
@@ -2831,53 +2981,59 @@ def main(argv=None):
             if layer.omitted:
                 continue
             geo = layer.geometry
-            strips = strips_of(layer)
-            layer.strips = []
+            if not layer.blocks:
+                continue
+            wanted = set()
+            for blk in layer.blocks:
+                for r in range(blk["first_row"] * geo.frame_height,
+                               (blk["first_row"] + blk["rows"]) * geo.frame_height):
+                    wanted.add(r)
             try:
-                for row_index, row in enumerate(decode_png_rows(layer.abs_path)):
-                    if row_index >= geo.sheet_height:
-                        break
-                    for start_col, count, strip_w, _strip_h in strips:
-                        src_off = start_col * geo.frame_width * 4
-                        dst_x, dst_y = placements[(entity.name, layer.index,
-                                                   start_col)]
-                        length = min(strip_w, geo.sheet_width -
-                                      start_col * geo.frame_width) * 4
-                        if length <= 0:
-                            continue
-                        dst_off = ((dst_y + row_index) * atlas_w + dst_x) * 4
-                        if src_off + length <= len(row):
-                            atlas[dst_off:dst_off + length] = \
-                                row[src_off:src_off + length]
+                rows = dict(decode_png_rows(layer.abs_path, wanted))
             except (PngError, OSError) as exc:
                 warnings.append("png: %s (%s)" %
                                 (os.path.relpath(layer.abs_path, data_dir), exc))
                 layer.omitted = "decode-error"
                 continue
-            for start_col, count, strip_w, strip_h in strips:
-                dst_x, dst_y = placements[(entity.name, layer.index, start_col)]
-                layer.strips.append({
-                    "atlas_x": dst_x, "atlas_y": dst_y,
-                    "width": strip_w, "height": strip_h,
-                    "first_col": start_col, "cols": count,
-                })
-            layer.atlas_x = layer.strips[0]["atlas_x"] if layer.strips else 0
-            layer.atlas_y = layer.strips[0]["atlas_y"] if layer.strips else 0
+            for blk in layer.blocks:
+                page = pages[blk["page"]]
+                src_x0 = blk["first_col"] * geo.frame_width
+                src_y0 = blk["first_row"] * geo.frame_height
+                for r in range(blk["rows"] * geo.frame_height):
+                    src = rows.get(src_y0 + r)
+                    if src is None:
+                        continue
+                    src_off = src_x0 * 4
+                    length = blk["width"] * 4
+                    if src_off + length > len(src):
+                        length = max(0, len(src) - src_off)
+                    if length <= 0:
+                        continue
+                    dst_off = ((blk["atlas_y"] + r) * page_size +
+                               blk["atlas_x"]) * 4
+                    page[dst_off:dst_off + length] = src[src_off:src_off + length]
             # frames: un rectangulo por celda de la rejilla, en orden de fila
             fw, fh = geo.frame_width, geo.frame_height
-            for row in range(geo.rows):
-                for col in range(geo.cols):
-                    strip = None
-                    for st in layer.strips:
-                        if st["first_col"] <= col < st["first_col"] + st["cols"]:
-                            strip = st
+            grid_cols, grid_rows = used_grid(layer)
+            layer.grid_cols = grid_cols
+            layer.grid_rows = grid_rows
+            for row in range(grid_rows):
+                for col in range(grid_cols):
+                    blk = None
+                    for candidate in layer.blocks:
+                        if (candidate["first_col"] <= col <
+                                candidate["first_col"] + candidate["cols"] and
+                                candidate["first_row"] <= row <
+                                candidate["first_row"] + candidate["rows"]):
+                            blk = candidate
                             break
-                    if strip is None:
+                    if blk is None:
                         continue
-                    x = strip["atlas_x"] + (col - strip["first_col"]) * fw
-                    y = strip["atlas_y"] + row * fh
+                    x = blk["atlas_x"] + (col - blk["first_col"]) * fw
+                    y = blk["atlas_y"] + (row - blk["first_row"]) * fh
                     layer.frames.append({
                         "index": len(layer.frames),
+                        "page": blk["page"],
                         "x": x,
                         "y": y,
                         "w": fw,
@@ -2891,36 +3047,54 @@ def main(argv=None):
             layer.frames.sort(key=lambda f: f["index"])
             layer.z_order = layer.index
 
-    atlas_path = os.path.join(out_dir, "atlas.png")
-    try:
-        with open(atlas_path, "wb") as fh:
-            fh.write(png_encode_rgba(atlas_w, atlas_h, atlas))
-    except (OSError, PngError) as exc:
-        sys.stderr.write("ERROR: no se pudo escribir %s: %s\n" % (atlas_path, exc))
-        return 1
-    atlas_png_size = os.path.getsize(atlas_path)
-
-    # --- atlas en RAW (el motor Android no decodifica PNG) ---------------
-    raw_path = os.path.join(out_dir, "atlas.rgba")
-    raw_size = 0
-    if not args.no_raw:
+    # --- escritura de las paginas ----------------------------------------
+    # Cada pagina se escribe en RAW (el motor Android no decodifica PNG) y
+    # tambien en PNG, que sirve para inspeccion y para las texturas que no
+    # van en el atlas.
+    raw_files = []
+    png_files = []
+    pages_info = []
+    total_raw = 0
+    for index, page in enumerate(pages):
+        base = "atlas_%d" % index
+        raw_path = os.path.join(out_dir, base + ".rgba")
+        png_path = os.path.join(out_dir, base + ".png")
+        if not args.no_raw:
+            try:
+                with open(raw_path, "wb") as fh:
+                    fh.write(page)
+            except OSError as exc:
+                sys.stderr.write("ERROR: no se pudo escribir %s: %s\\n"
+                                 % (raw_path, exc))
+                return 1
+            raw_files.append(base + ".rgba")
+            total_raw += len(page)
         try:
-            with open(raw_path, "wb") as fh:
-                fh.write(atlas)
-            raw_size = os.path.getsize(raw_path)
-        except OSError as exc:
-            sys.stderr.write("ERROR: no se pudo escribir %s: %s\n" % (raw_path, exc))
+            with open(png_path, "wb") as fh:
+                fh.write(png_encode_rgba(page_size, page_size, page))
+        except (OSError, PngError) as exc:
+            sys.stderr.write("ERROR: no se pudo escribir %s: %s\\n"
+                             % (png_path, exc))
             return 1
+        png_files.append(base + ".png")
+        pages_info.append({
+            "file": base + (".rgba" if not args.no_raw else ".png"),
+            "width": page_size,
+            "height": page_size,
+        })
 
     # --- manifest --------------------------------------------------------
     atlas_info = {
-        "file": "atlas.png",
-        "width": atlas_w,
-        "height": atlas_h,
+        "page_size": page_size,
+        "width": page_size,
+        "height": page_size * page_count,
+        "page_count": page_count,
         "pixel_format": "RGBA8",
+        "pages": pages_info,
     }
     if not args.no_raw:
-        atlas_info["raw_file"] = "atlas.rgba"
+        atlas_info["raw_files"] = raw_files
+    atlas_info["png_files"] = png_files
     manifest = {
         "version": version,
         "graphics_layout": layout,
@@ -2955,8 +3129,10 @@ def main(argv=None):
                 "direction_count": layer.direction_count,
                 "animation_frames": layer.animation_frames,
                 "animation": {"frames": geo.anim_frames, "speed": layer.anim_speed},
-                "cols": geo.cols,
-                "rows": geo.rows,
+                "cols": layer.grid_cols,
+                "rows": layer.grid_rows,
+                "source_cols": geo.cols,
+                "source_rows": geo.rows,
                 "layer_order": layer.index,
                 "z_order": layer.z_order,
                 "is_body": layer.is_body,
@@ -2964,9 +3140,9 @@ def main(argv=None):
                 "atlas_y": layer.atlas_y,
                 "frames": layer.frames,
             }
-            if len(layer.strips) > 1:
-                layer_entry["split"] = True
-                layer_entry["strips"] = layer.strips
+            if len(layer.blocks) > 1:
+                layer_entry["blocks"] = layer.blocks
+                layer_entry["pages"] = sorted(set(b["page"] for b in layer.blocks))
             if geo.grid_mismatch:
                 layer_entry["grid_mismatch"] = True
             if layer.flags:
@@ -3046,9 +3222,11 @@ def main(argv=None):
     included_layers = sum(1 for e in entities for l in e.layers
                           if not l.omitted)
     split_layers = sum(1 for e in entities for l in e.layers
-                       if len(l.strips) > 1)
+                       if len(l.blocks) > 1)
     mismatch_layers = sum(1 for e in entities for l in e.layers
                           if l.geometry.grid_mismatch)
+    png_total = sum(os.path.getsize(os.path.join(out_dir, name))
+                    for name in png_files)
     if not args.quiet:
         print("=== Extraccion de assets de Factorio %s ===" % version)
         print("Datos      : %s" % data_dir)
@@ -3059,16 +3237,16 @@ def main(argv=None):
         print("Capas      : %d (en el atlas: %d)" % (total_layers, included_layers))
         print("Frames     : %d celdas (de %d disponibles en las hojas)"
               % (total_frames, total_cells))
-        print("Atlas      : %s  %dx%d px" % (atlas_path, atlas_w, atlas_h))
-        print("             atlas.png  %.1f MB" % (atlas_png_size / 1e6))
+        print("Atlas      : %d paginas de %dx%d px" %
+              (page_count, page_size, page_size))
+        print("             atlas_N.png  %.1f MB en total" % (png_total / 1e6))
         if args.no_raw:
-            print("             atlas.rgba omitido (--no-raw)")
+            print("             atlas_N.rgba omitido (--no-raw)")
         else:
-            print("             atlas.rgba %.1f MB (RGBA8 crudo)"
-                  % (raw_size / 1e6))
+            print("             atlas_N.rgba %.1f MB en total (RGBA8 crudo)"
+                  % (total_raw / 1e6))
         if split_layers:
-            print("             %d capas divididas en franjas (mas anchas que el "
-                  "atlas)" % split_layers)
+            print("             %d capas troceadas en varios bloques" % split_layers)
         if mismatch_layers:
             print("             %d capas con rejilla no exacta (grid_mismatch)"
                   % mismatch_layers)

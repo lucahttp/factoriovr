@@ -365,13 +365,13 @@ class TestAtlasPacking(unittest.TestCase):
         self.assertGreater(height, 0)
         self.assertEqual(len(placements), len(rects))
         for w, h, key in rects:
-            x, y = placements[key]
+            _page, x, y = placements[key]
             self.assertGreaterEqual(x, 0)
             self.assertGreaterEqual(y, 0)
             self.assertLessEqual(x + w, max_width)
             self.assertLessEqual(y + h, height)
         # ningun par se solapa
-        items = [(placements[k][0], placements[k][1], w, h)
+        items = [(placements[k][1], placements[k][2], w, h)
                  for w, h, k in rects]
         for i in range(len(items)):
             for j in range(i + 1, len(items)):
@@ -388,19 +388,119 @@ class TestAtlasPacking(unittest.TestCase):
             for j in range(i + 1, len(items)):
                 self.assertFalse(self.overlaps(items[i], items[j]))
 
-    def test_rectangle_wider_than_atlas_is_rejected(self):
-        with self.assertRaises(ex.ExtractError):
-            ex.pack_skyline([(500, 10, "ancho")], 256)
+    def test_rectangle_wider_than_atlas_is_not_placed(self):
+        placements, _width, _height = ex.pack_skyline([(500, 10, "ancho")], 256)
+        self.assertNotIn("ancho", placements)
 
     def test_priority_maps_to_draw_order(self):
-        self.assertEqual(ex.PRIORITY_DRAW_ORDER["terrain-low"], 0)
-        self.assertEqual(ex.PRIORITY_DRAW_ORDER["terrain"], 1)
-        self.assertEqual(ex.PRIORITY_DRAW_ORDER["low"], 2)
-        self.assertEqual(ex.PRIORITY_DRAW_ORDER["normal"], 3)
-        self.assertEqual(ex.PRIORITY_DRAW_ORDER["high"], 4)
-        self.assertEqual(ex.PRIORITY_DRAW_ORDER["train"], 5)
-        self.assertGreater(ex.PRIORITY_DRAW_ORDER["extra-high"],
-                           ex.PRIORITY_DRAW_ORDER["train"])
+        # escala de Factorio: extra-low < low < terrain < terrain-high <
+        # object < high < extra-high
+        self.assertEqual(ex.PRIORITY_DRAW_ORDER["extra-low"], 0)
+        self.assertEqual(ex.PRIORITY_DRAW_ORDER["low"], 1)
+        self.assertEqual(ex.PRIORITY_DRAW_ORDER["terrain"], 2)
+        self.assertEqual(ex.PRIORITY_DRAW_ORDER["terrain-high"], 3)
+        self.assertEqual(ex.PRIORITY_DRAW_ORDER["object"], 4)
+        self.assertEqual(ex.PRIORITY_DRAW_ORDER["high"], 5)
+        self.assertEqual(ex.PRIORITY_DRAW_ORDER["extra-high"], 6)
+        self.assertLess(ex.PRIORITY_DRAW_ORDER["terrain"],
+                        ex.PRIORITY_DRAW_ORDER["object"])
+        self.assertLess(ex.PRIORITY_DRAW_ORDER["object"],
+                        ex.PRIORITY_DRAW_ORDER["high"])
+        self.assertLess(ex.PRIORITY_DRAW_ORDER["high"],
+                        ex.PRIORITY_DRAW_ORDER["extra-high"])
+
+
+# ===========================================================================
+# 3.b Paginacion del atlas
+# ===========================================================================
+
+class TestPagePacker(unittest.TestCase):
+
+    def test_pages_never_exceed_page_size(self):
+        packer = ex.PagePacker(256)
+        for i in range(40):
+            packer.add(("k", i), 100, 120)
+        self.assertGreater(packer.page_count(), 1)
+        for key, (page, x, y) in packer.placements().items():
+            self.assertLessEqual(x + 100, 256)
+            self.assertLessEqual(y + 120, 256)
+            self.assertLess(page, packer.page_count())
+
+    def test_rectangles_do_not_overlap_inside_a_page(self):
+        packer = ex.PagePacker(256)
+        for i in range(30):
+            packer.add(("k", i), 64, 48)
+        by_page = {}
+        for key, (page, x, y) in packer.placements().items():
+            by_page.setdefault(page, []).append((x, y, 64, 48))
+        for page, rects in by_page.items():
+            for i in range(len(rects)):
+                ax, ay, aw, ah = rects[i]
+                for j in range(i + 1, len(rects)):
+                    bx, by, bw, bh = rects[j]
+                    self.assertFalse(
+                        not (ax + aw <= bx or bx + bw <= ax or
+                             ay + ah <= by or by + bh <= ay),
+                        "solape en la pagina %d" % page)
+
+    def test_rect_bigger_than_page_is_rejected(self):
+        packer = ex.PagePacker(128)
+        self.assertIsNone(packer.add("grande", 256, 256))
+
+    def test_paginated_pack_shelf_equivalent(self):
+        rects = [(64, 64, "a"), (128, 96, "b"), (32, 200, "c"), (48, 48, "d")]
+        placements, width, height = ex.pack_skyline(rects, 256)
+        self.assertLessEqual(width, 256)
+        self.assertGreaterEqual(height, 1)
+        # el empaquetador pagina: cada clave dice (pagina, x, y)
+        for key, (page, x, y) in placements.items():
+            self.assertGreaterEqual(x, 0)
+            self.assertGreaterEqual(y, 0)
+            self.assertLessEqual(x + 64, 256)
+
+
+# ===========================================================================
+# 3.c Variantes de direccion y capas de cuerpo
+# ===========================================================================
+
+class TestVariants(unittest.TestCase):
+
+    def test_detect_variant_direction_and_flip(self):
+        self.assertEqual(
+            ex.detect_variant("__base__/graphics/entity/burner-mining-drill/"
+                              "burner-mining-drill-N.png"), ("N", False))
+        self.assertEqual(
+            ex.detect_variant("__base__/graphics/entity/burner-mining-drill/"
+                              "burner-mining-drill-E-flipped.png"), ("E", True))
+        self.assertEqual(
+            ex.detect_variant("__base__/graphics/entity/assembling-machine-1/"
+                              "assembling-machine-1-base.png"), (None, False))
+        self.assertEqual(
+            ex.detect_variant("__base__/graphics/entity/stone-furnace/"
+                              "stone-furnace-shadow.png"), (None, False))
+
+    def test_is_body_detects_shadows_and_lights(self):
+        class FakeLayer(object):
+            def __init__(self, ref, flags=()):
+                self.ref = ref
+                self.flags = list(flags)
+
+        self.assertTrue(ex.is_body_layer(
+            FakeLayer("base/graphics/entity/a/a-N.png")))
+        self.assertFalse(ex.is_body_layer(
+            FakeLayer("base/graphics/entity/a/a-N-shadow.png")))
+        self.assertFalse(ex.is_body_layer(
+            FakeLayer("base/graphics/entity/a/a-status-light.png")))
+        self.assertFalse(ex.is_body_layer(
+            FakeLayer("base/graphics/entity/a/a-reflection.png")))
+        self.assertFalse(ex.is_body_layer(
+            FakeLayer("base/graphics/entity/a/a.png", ["mask"])))
+
+    def test_listed_entity_types_cover_the_factory(self):
+        for name in ("assembling-machine-1", "transport-belt", "inserter",
+                     "iron-chest", "gun-turret", "radar", "roboport",
+                     "resource", "tree"):
+            self.assertIn(name, ex.LISTED_ENTITY_TYPES)
 
 
 # ===========================================================================

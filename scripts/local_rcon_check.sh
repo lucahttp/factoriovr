@@ -104,16 +104,22 @@ echo "=== Sondeando el protocolo RCON ==="
 cat > "$WORK/commands.txt" <<'CMDS'
 /silent-command remote.call('xfactorvr', 'get_world_snapshot', 32, 0.0, 0.0)
 /silent-command remote.call('xfactorvr', 'get_world_snapshot', 32, 0.0, 0.0)
+/silent-command remote.call('xfactorvr', 'place_entity', 'assembling-machine-1', 0, 0, 0)
+/silent-command remote.call('xfactorvr', 'place_entity', 'stone-furnace', 4, 0, 0)
+/silent-command remote.call('xfactorvr', 'place_entity', 'transport-belt', -4, 0, 0)
+/silent-command remote.call('xfactorvr', 'place_entity', 'inserter', 2, 2, 0)
+/silent-command remote.call('xfactorvr', 'place_entity', 'gun-turret', -2, 4, 0)
+/silent-command remote.call('xfactorvr', 'place_entity', 'iron-chest', 2, -3, 0)
+/silent-command remote.call('xfactorvr', 'place_entity', 'small-electric-pole', 0, 2, 0)
+/silent-command remote.call('xfactorvr', 'place_entity', 'electric-mining-drill', -6, 2, 0)
+/silent-command remote.call('xfactorvr', 'place_entity', 'burner-mining-drill', -6, -2, 0)
+/silent-command remote.call('xfactorvr', 'place_entity', 'fast-transport-belt', 0, -4, 0)
+/silent-command remote.call('xfactorvr', 'get_world_snapshot', 32, 0.0, 0.0)
 /silent-command remote.call('xfactorvr', 'get_inventory')
 /silent-command remote.call('xfactorvr', 'craft', 'iron-gear-wheel', 1)
-/silent-command rcon.print('DIAG_total=' .. tostring(#game.surfaces[1].find_entities({{-32,-32},{32,32}})))
-/silent-command rcon.print('DIAG_filtradas=' .. tostring(#game.surfaces[1].find_entities_filtered({{-32,-32},{32,32}}, {type="resource"})))
-/silent-command rcon.print('DIAG_arboles=' .. tostring(#game.surfaces[1].find_entities_filtered({{-32,-32},{32,32}}, {type="tree"})))
-/silent-command rcon.print('DIAG_todo=' .. tostring(#game.surfaces[1].find_entities_filtered({{-32,-32},{32,32}}, {name="iron-ore"})))
-/silent-command rcon.print('DIAG_tick=' .. tostring(game.tick))
-/silent-command rcon.print('DIAG_pausado=' .. tostring(game.tick_paused))
 CMDS
-python3 "$PROJECT_ROOT/scripts/rcon_probe.py" --file "$WORK/commands.txt" "$RCON_PORT" "$RCON_PASSWORD" || true
+python3 "$PROJECT_ROOT/scripts/rcon_probe.py" --file "$WORK/commands.txt" "$RCON_PORT" "$RCON_PASSWORD" \
+    --guardar "$WORK/snapshot.json" || true
 
 echo ""
 echo "=== Log del servidor (ultimas lineas) ==="

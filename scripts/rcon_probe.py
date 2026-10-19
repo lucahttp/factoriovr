@@ -46,16 +46,23 @@ def read_packet(sock):
 
 
 def main():
-    if len(sys.argv) >= 2 and sys.argv[1] == "--file":
-        if len(sys.argv) < 3:
+    guardar = None
+    args = sys.argv[1:]
+    if "--guardar" in args:
+        i = args.index("--guardar")
+        guardar = args[i + 1]
+        del args[i:i + 2]
+
+    if len(args) >= 2 and args[0] == "--file":
+        if len(args) < 3:
             print(__doc__)
             return 2
-        host, port, password = "127.0.0.1", int(sys.argv[3]), sys.argv[4]
-        with open(sys.argv[2], encoding="utf-8") as fh:
+        host, port, password = "127.0.0.1", int(args[2]), args[3]
+        with open(args[1], encoding="utf-8") as fh:
             commands = [line.rstrip("\n") for line in fh if line.strip()]
-    elif len(sys.argv) >= 5:
-        host, port, password = sys.argv[1], int(sys.argv[2]), sys.argv[3]
-        commands = sys.argv[4:]
+    elif len(args) >= 4:
+        host, port, password = args[0], int(args[1]), args[2]
+        commands = args[3:]
     else:
         print(__doc__)
         return 2
@@ -89,6 +96,11 @@ def main():
         print(f"  respuesta ({len(chunks)} paquete/s): {out!r}")
         if not out.strip():
             print("  >> RESPUESTA VACIA <<")
+        elif guardar and '"entities"' in out:
+            # Se guarda la ultima respuesta con entidades: la instantanea final.
+            with open(guardar, "w", encoding="utf-8") as fh:
+                fh.write(out.strip())
+            print(f"  instantanea guardada en {guardar}")
     return 0
 
 

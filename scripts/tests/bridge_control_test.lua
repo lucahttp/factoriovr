@@ -265,14 +265,18 @@ table.insert(entities, make_entity({ name = "small-biter", type = "unit", x = 11
 printed = {}
 interface.get_world_snapshot(32, 0, 0)
 json = last_print()
-check("ensambladora -> t=1", json:find('"t":1') ~= nil, json)
-check("torreta -> t=4", json:find('"t":4') ~= nil, json)
-check("radar -> t=5", json:find('"t":5') ~= nil, json)
-check("robopuerto -> t=6", json:find('"t":6') ~= nil, json)
-check("insertador -> t=10", json:find('"t":10') ~= nil, json)
-check("arbol -> t=12", json:find('"t":12') ~= nil, json)
-check("roca -> t=12", json:find('"t":12') ~= nil, json)
-check("bitero -> t=11", json:find('"t":11') ~= nil, json)
+-- El protocolo envia el NOMBRE del prototipo (no un id numerico): es lo que
+-- permite elegir el sprite real del juego en el render de VR.
+check("ensambladora -> nombre", json:find('"t":"assembling%-machine%-1"') ~= nil, json)
+check("torreta -> nombre", json:find('"t":"gun%-turret"') ~= nil, json)
+check("radar -> nombre", json:find('"t":"radar"') ~= nil, json)
+check("robopuerto -> nombre", json:find('"t":"roboport"') ~= nil, json)
+check("insertador -> nombre", json:find('"t":"inserter"') ~= nil, json)
+check("arbol -> nombre", json:find('"t":"tree"') ~= nil, json)
+check("roca -> nombre", json:find('"t":"rock"') ~= nil, json)
+check("bitero -> nombre", json:find('"t":"small%-biter"') ~= nil, json)
+-- Direccion y frame de animacion viajan en el protocolo.
+check("direccion este (d=4)", json:find('"d":4') ~= nil, json)
 
 print("\n== Yacimientos agrupados en parches de 4x4 ==")
 entities = {}

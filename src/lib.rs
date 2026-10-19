@@ -3,6 +3,7 @@
 // Inyectado en Factorio vía LD_PRELOAD para proporcionar la experiencia
 // Tabletop Mixed Reality en Pico 4 Ultra Standalone / OpenXR.
 
+pub mod assets;
 pub mod game_bridge;
 pub mod offsets;
 pub mod openxr;
@@ -276,6 +277,8 @@ pub unsafe extern "C" fn xfactorvr_place_or_update_entity(
                 animation_progress: 0.0,
                 health_ratio: 1.0,
                 arm_angle: 0.0,
+                sprite_id: 0,
+                anim_frame: 0,
             });
         }
         true
@@ -724,6 +727,39 @@ pub unsafe extern "C" fn xfactorvr_is_rcon_connected() -> bool {
     }
 }
 
+/// Rectangulo del frame de un sprite real de Factorio dentro del atlas.
+///
+/// Lo consume el motor C++ para dibujar el sprite en vez de una primitiva.
+/// `out` recibe 6 floats: x, y, w, h (pixeles del atlas) y el ancho y alto
+/// logicos del frame. Devuelve false si no hay sprite (se dibuja la
+/// primitiva de siempre).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn xfactorvr_get_sprite_frame(
+    sprite_id: u32,
+    anim_frame: u32,
+    orientation: f32,
+    out: *mut f32,
+) -> bool {
+    if out.is_null() || sprite_id == 0 {
+        return false;
+    }
+    // La direccion de Factorio (0..15) se deduce de la orientacion en
+    // radianes: dir = orientacion / TAU * 16.
+    let dir = ((orientation / (2.0 * std::f32::consts::PI) * 16.0).round() as i32) & 15;
+    match assets::sprite_frame(sprite_id, anim_frame, dir as u8) {
+        Some(f) => {
+            *out = f.x;
+            *out.add(1) = f.y;
+            *out.add(2) = f.w;
+            *out.add(3) = f.h;
+            *out.add(4) = f.frame_width;
+            *out.add(5) = f.frame_height;
+            true
+        }
+        None => false,
+    }
+}
+
 /// Hook invocado cuando una entidad de Factorio se dibuja en el motor original (ELF Hook bridge)
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn xfactorvr_on_entity_draw(
@@ -751,6 +787,8 @@ pub unsafe extern "C" fn xfactorvr_on_entity_draw(
                 animation_progress: 0.0,
                 health_ratio: 1.0,
                 arm_angle: 0.0,
+                sprite_id: 0,
+                anim_frame: 0,
             });
         }
     }
@@ -804,6 +842,8 @@ mod tests {
             animation_progress: 0.0,
             health_ratio: 0.0,
             arm_angle: 0.0,
+            sprite_id: 0,
+            anim_frame: 0,
         }; 64];
         let mut count = 0;
 
@@ -844,6 +884,8 @@ mod tests {
             animation_progress: 0.0,
             health_ratio: 0.0,
             arm_angle: 0.0,
+            sprite_id: 0,
+            anim_frame: 0,
         }; 64];
         let mut count = 0;
 

@@ -342,9 +342,20 @@ local function serialize_entity(e)
         progress = phase / 60.0
     end
 
+    -- Frame de animacion y direccion: el motor de VR necesita el frame
+    -- exacto para dibujar el sprite real (y no una caja). `e.animation` solo
+    -- existe en las entidades animadas, asi que va protegido.
+    local frame = 0
+    local ok_anim, anim = pcall(function() return e.animation end)
+    if ok_anim and anim then
+        local ok_f, f = pcall(function() return anim.frame end)
+        if ok_f and f then frame = f end
+    end
+
     local out = string.format(
-        '{"t":%d,"x":%.2f,"y":%.2f,"o":%.3f,"s":%d,"p":%.3f,"h":%.3f',
-        type_id, e.position.x, e.position.y, orientation, status_of(e), progress, health_of(e))
+        '{"t":"%s","x":%.2f,"y":%.2f,"o":%.3f,"s":%d,"p":%.3f,"h":%.3f,"f":%d,"d":%d',
+        e.name, e.position.x, e.position.y, orientation, status_of(e), progress,
+        health_of(e), frame, e.direction or 0)
     if type_id == 10 then
         out = out .. string.format(',"a":%.3f', arm_angle)
     end

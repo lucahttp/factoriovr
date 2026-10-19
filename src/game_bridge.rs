@@ -289,11 +289,24 @@ impl SimulationWorld {
         entities.clear();
         entities.reserve(snap.entities.len());
         for e in snap.entities {
-            if e.entity_type == 0 {
+            // El mod manda el nombre del prototipo; el id numerico solo
+            // aparece con despliegues antiguos del mod.
+            let (type_id, type_name) = match &e.entity_type {
+                SnapshotType::Name(n) => (entity_type_from_name(n), n.clone()),
+                SnapshotType::Id(i) => (*i, String::new()),
+            };
+            if type_id == 0 {
                 continue;
             }
+            // Id del sprite real en el atlas (0 si el manifiesto no esta
+            // desplegado o el tipo no tiene sprite).
+            let sprite_id = if type_name.is_empty() {
+                0
+            } else {
+                crate::assets::sprite_id_for_type(&type_name)
+            };
             entities.push(LiveEntity {
-                entity_type: e.entity_type,
+                entity_type: type_id,
                 tile_x: e.x,
                 tile_y: e.y,
                 orientation: e.orientation,
@@ -301,6 +314,8 @@ impl SimulationWorld {
                 animation_progress: e.progress,
                 health_ratio: e.health,
                 arm_angle: e.arm_angle,
+                sprite_id,
+                anim_frame: e.anim_frame,
             });
         }
 
@@ -1167,10 +1182,21 @@ pub fn get_rcon_client() -> &'static Mutex<RconClient> {
 
 // --- Formato de la instantanea que devuelve el mod -------------------------
 
+/// Campo "t" de la instantanea. El mod envia el NOMBRE del prototipo
+/// ("assembling-machine-1"), que es lo unico que permite elegir el sprite
+/// real del juego; se acepta tambien el numero por compatibilidad con
+/// despliegues antiguos del mod.
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+pub enum SnapshotType {
+    Name(String),
+    Id(u32),
+}
+
 #[derive(Debug, Deserialize)]
 pub struct SnapshotEntity {
     #[serde(rename = "t")]
-    pub entity_type: u32,
+    pub entity_type: SnapshotType,
     pub x: f32,
     pub y: f32,
     #[serde(rename = "o", default)]
@@ -1183,6 +1209,46 @@ pub struct SnapshotEntity {
     pub health: f32,
     #[serde(rename = "a", default)]
     pub arm_angle: f32,
+    /// Frame de animacion (lo que usa el motor para elegir el frame del
+    /// sprite). 0 si la entidad no se anima.
+    #[serde(rename = "f", default)]
+    pub anim_frame: u32,
+    /// Direccion de Factorio (0..15). La orientacion en radianes ya viene
+    /// en "o", pero la direccion cruda es la que indexa las filas del sprite.
+    #[serde(rename = "d", default)]
+    pub direction: u8,
+}
+
+/// Traduce el nombre del prototipo de Factorio al enumerado de entidad que
+/// usa el render. Debe coincidir con la tabla ENTITY_TYPES_MAP del mod
+/// (mods/xfactorvr_bridge/control.lua).
+pub fn entity_type_from_name(name: &str) -> u32 {
+    use crate::tabletop::*;
+    match name {
+        "assembling-machine-1" | "assembling-machine-2" | "assembling-machine-3" => {
+            ENTITY_ASSEMBLING_MACHINE
+        }
+        "electric-mining-drill" | "burner-mining-drill" | "offshore-mining-drill" => {
+            ENTITY_MINING_DRILL
+        }
+        "stone-furnace" | "steel-furnace" | "electric-furnace" | "campfire" => ENTITY_FURNACE,
+        "gun-turret" | "laser-turret" => ENTITY_GUN_TURRET,
+        "radar" => ENTITY_RADAR,
+        "roboport" => ENTITY_ROBOPORT,
+        "wooden-chest" | "iron-chest" | "steel-chest" | "transport-chest" => ENTITY_CHEST,
+        "small-electric-pole" | "medium-electric-pole" | "big-electric-pole" | "substation" => {
+            ENTITY_ELECTRIC_POLE
+        }
+        "transport-belt" | "fast-transport-belt" | "express-transport-belt" | "underground-belt"
+        | "splitter" => ENTITY_TRANSPORT_BELT,
+        "inserter" | "fast-inserter" | "long-handed-inserter" | "stack-inserter"
+        | "stack-inserter-1" => ENTITY_INSERTER,
+        "tree" | "simple-entity" => ENTITY_TREE,
+        "unit" | "unit-spawner" | "small-biter" | "medium-biter" | "big-biter"
+        | "small-spitter" | "medium-spitter" | "big-spitter" => ENTITY_BITER,
+        "character" | "player" => ENTITY_PLAYER,
+        _ => 0,
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -1229,6 +1295,8 @@ mod tests {
             animation_progress: 0.0,
             health_ratio: 1.0,
             arm_angle: 0.0,
+            sprite_id: 0,
+            anim_frame: 0,
         }
     }
 
@@ -1342,11 +1410,16 @@ mod tests {
 
     #[test]
     fn test_snapshot_parsing() {
-        let json = r#"{"entities":[{"t":1,"x":1.5,"y":2.5,"o":1.571,"s":1,"p":0.25,"h":1.0}],
+        let json = r#"{"entities":[{"t":"assembling-machine-1","x":1.5,"y":2.5,"o":1.571,"s":1,"p":0.25,"h":1.0,"f":7,"d":4}],
                       "patches":[{"t":1,"x":0.0,"y":0.0,"r":2.4,"rem":1000}]}"#;
         let snap: Snapshot = serde_json::from_str(json).unwrap();
         assert_eq!(snap.entities.len(), 1);
-        assert_eq!(snap.entities[0].entity_type, 1);
+        match &snap.entities[0].entity_type {
+            SnapshotType::Name(n) => assert_eq!(n, "assembling-machine-1"),
+            SnapshotType::Id(i) => panic!("se esperaba un nombre de prototipo, se obtuvo id {}", i),
+        }
+        assert_eq!(snap.entities[0].anim_frame, 7);
+        assert_eq!(snap.entities[0].direction, 4);
         assert!((snap.entities[0].orientation - 1.571).abs() < 0.01);
         assert_eq!(snap.patches.len(), 1);
         assert_eq!(snap.patches[0].remaining, 1000);

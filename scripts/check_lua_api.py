@@ -155,7 +155,16 @@ def main():
         used.setdefault((recv, member), 0)
         used[(recv, member)] += 1
 
-    # 2b. Globales eliminados en 2.x. Se buscan como identificadores sueltos,
+    # 2b. Receptores con ambito local: `local p = ...` o `for _, p in ...`
+    #     redeclaran el nombre y su tipo deja de ser el del mapa. No se puede
+    #     saber de que clase es, asi que se comparan contra el universo
+    #     completo y, si tampoco aparece, se marcan como desconocidos en vez
+    #     de dar un falso positivo.
+    shadowed = set(re.findall(r'\blocal\s+([A-Za-z_][A-Za-z0-9_]*)', code))
+    shadowed |= set(re.findall(r'\bfor\s+[A-Za-z_][A-Za-z0-9_]*\s*,\s*([A-Za-z_][A-Za-z0-9_]*)\s+in', code))
+    shadowed |= set(re.findall(r'\bfor\s+([A-Za-z_][A-Za-z0-9_]*)\s+in', code))
+
+    # 2c. Globales eliminados en 2.x. Se buscan como identificadores sueltos,
     #     no como miembro de otro objeto (x.global si existiria).
     removed_used = []
     for name in sorted(REMOVED_IN_2X):
@@ -174,10 +183,17 @@ def main():
     #    el receptor no se puede mapear, se usa el universo global.
     print("Miembros usados por el mod:")
     bad = []
+    unknown = []
     skipped = []
     for (recv, member) in sorted(used):
         cls = RECEIVER_CLASS.get(recv)
-        if cls:
+        if recv in shadowed:
+            # Tipo desconocido: se acepta si el miembro existe en alguna clase.
+            ok = member in universe
+            where = "?"
+            if not ok:
+                unknown.append((recv, member))
+        elif cls:
             members = effective(version, cls)
             ok = member in members
             where = cls
@@ -187,14 +203,19 @@ def main():
         if recv in GLOBAL_OBJECTS:
             skipped.append((recv, member))
             continue
-        if not ok:
+        if not ok and recv not in shadowed:
             bad.append((recv, member, where))
-        print(f"  {'OK     ' if ok else 'AUSENTE'}  {recv}.{member}   [{where}]")
+        label = "OK     " if ok else ("DESCONOCIDO" if recv in shadowed else "AUSENTE")
+        print(f"  {label}  {recv}.{member}   [{where}]")
 
     print()
     if skipped:
         print("Objetos globales de Factorio (verificados aparte): " +
               ", ".join(f"{r}.{m}" for r, m in skipped))
+        print()
+    if unknown:
+        print("Miembros con receptor de ambito local (tipo no determinable): " +
+              ", ".join(f"{r}.{m}" for r, m in unknown))
         print()
     if bad:
         print(f"RESULTADO: {len(bad)} llamada(s) NO existen en la API {version}:")

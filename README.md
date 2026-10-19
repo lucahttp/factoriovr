@@ -6,6 +6,11 @@ The factory is projected onto your real table as an interactive three-dimensiona
 
 ---
 
+<img width="auto" height="20%" alt="image_cropped" src="https://github.com/user-attachments/assets/d9405ea5-271f-4c69-a3c6-ca10c9ba6af2" />
+
+<img width="1920" height="1920" alt="Screenshot_com xfactorvr tabletop_2026 10 19-01 34 07 142_425" src="https://github.com/user-attachments/assets/55ae9313-f0db-4fba-a5c7-8f44600ae84e" />
+
+
 ## Main Features
 
 * **Tabletop Diorama Mode (Generals Zero Hour XR Style)**: Projects the Factorio factory fixed-anchor to the floor in `XR_REFERENCE_SPACE_TYPE_STAGE` space at the exact height of the physical desk (~0.74m), eliminating floating in front of your face.

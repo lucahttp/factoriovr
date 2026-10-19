@@ -9,13 +9,18 @@ La fábrica se proyecta sobre tu mesa real como un diorama tridimensional intera
 ## Características Principales
 
 * **Modo Maqueta / Tabletop Diorama (Estilo Generals Zero Hour XR)**: Proyecta la fábrica de Factorio anclada de forma fija al suelo en espacio `XR_REFERENCE_SPACE_TYPE_STAGE` a la altura exacta del escritorio físico (~0.74m), eliminando la flotación frente a la cara.
-* **Plinto Geológico y Recorte de Borde (`u_board_bounds`)**: El terreno se asienta sobre un zócalo con estratos de tierra/roca y marco biselado, recortando limpiamente la geometría para no desbordar en la habitación física.
-* **Simulación en Vivo y Puente Bidireccional (`xfactorvr_get_live_entities`)**: Conexión directa con la simulación C++/ARM64 de Factorio y ticks en tiempo real para reflejar el estado vivo de la fábrica.
-* **Construcción y Deconstrucción 6DoF**:
-  * **Quickbar Holográfica de 9 Ranuras**: Barra interactiva (Ensambladora, Minera, Horno, Torreta, Radar, Robopuerto, Cofre, Poste, Demolición) seleccionable con puntero láser.
-  * **Rejilla Magnética y Holograma Fantasma (Ghost Preview)**: Proyección 3D translúcida con detección de ocupación (verde para casilla libre, rojo para casilla ocupada).
-  * **Rotación y Orientación**: Giro instantáneo en incrementos de 90° usando el stick analógico.
-  * **Colocación y Minado**: Colocación con disparador derecho (Trigger) y demolición con botón lateral (Grip) o herramienta de demolición.
+* **Persistencia del Anclaje de Mesa (`layout.json`)**: Guarda automáticamente la posición, orientación yaw y escala de la maqueta en `/sdcard/XFactorVR/layout.json` al soltar el agarre y la restaura exactamente en el siguiente inicio.
+* **Interacción Bimanual (`XrInteraction`)**: Pellizcar para hacer zoom (Pinch-to-zoom de 0.25x a 4.0x) y rotación libre sobre el eje Y sujetando ambos gatillos Grip de los mandos Pico simultáneamente.
+* **Yacimientos Reales de Recursos (Hierro, Cobre, Carbón, Piedra)**: Vetás minerales tridimensionales con cristales emergentes sobre el terreno; perforadoras extrayendo mineral directamente del suelo.
+* **Simulación en Vivo y Puente Bidireccional (`xfactorvr_bridge`)**: Conexión RCON/IPC ultrarrápida con el servidor nativo Linux ARM64 y motor de automatización integrado en Rust (perforadoras, hornos fundiendo mineral con combustible, ensambladoras fabricando piezas).
+* **Consola Holográfica Espacial Multi-Pestaña (`XrCommandUI`)**:
+  * **Pestaña Construir**: Quickbar de 9 ranuras para edificios industriales.
+  * **Pestaña Inventario**: Inspección del inventario real del jugador con barras medidoras de stock.
+  * **Pestaña Fabricar**: Banco de trabajo interactivo para craftear Engranajes, Circuitos Electrónicos, Cintas Transportadoras y Perforadoras con un clic de gatillo.
+* **Tooltips Holográficos 3D en Mandos (`XrControllerHelp`)**: Badge HUD flotante sobre la muñeca del mando derecho con indicaciones codificadas por color (Trigger: Acción, Grip: Mover/Demoler, Stick: Rotar/Altura, 2-Grips: Zoom/Giro).
+* **Audio Espacial 3D Posicional (`XrAudio`)**: Síntesis estéreo nativa a 48000 Hz mediante AAudio con zumbido industrial continuo de fábrica, atenuación por distancia y paneo espacial dependiente de la pose de la cabeza, además de efectos acústicos para colocación, minado, crafteo y pulsaciones de interfaz.
+* **Feedback Háptico en Mandos (`XrHapticVibration`)**: Vibraciones táctiles sutiles en pulsaciones de menú (25ms), impactos al asentar maquinaria (45ms) y sacudidas firmes al desmantelar instalaciones (65ms).
+* **Construcción y Deconstrucción 6DoF**: Rejilla magnética, previsualización fantasma holográfica translúcida (verde para libre, rojo para ocupado) y consumo/devolución real de ítems al inventario.
 * **Animaciones de Maquinaria y Partículas 3D (`factorio-3d-mod`)**:
   * Antena de radar con rotación continua de 360°.
   * Torreta defensiva con rotación y seguimiento independiente del cabezal superior.
@@ -25,8 +30,6 @@ La fábrica se proyecta sobre tu mesa real como un diorama tridimensional intera
   * Postes de tendido eléctrico con cables catenarios tridimensionales autogenerados entre postes contiguos.
   * Cintas transportadoras con desplazamiento UV animado e ítems en tránsito.
   * Sistema de partículas 3D para humo, vapor, chispas de colocación y escombros de minado.
-* **Consola de Mando Espacial Holográfica (`XrCommandUI`)**: Panel flotante de cristal desacoplado de la mesa con 5 botones interactivos (`[OBSERVADOR 1:1]`, `[RE-ANCLAR]`, `[ENERGÍA]`, `[ÍTEMS]`, `[TECNOLOGÍA]`), apuntable con rayo láser y activable con el gatillo.
-* **Manipulación de Mesa 6DoF (`XrSurfaceGrab`)**: Agarra y traslada la maqueta por la habitación manteniendo presionado el botón Grip; ajusta la altura milimétrica y orientación con el joystick.
 * **Modo Observador Humano a Escala 1:1 (`XrWorld::observer`)**: Cambia entre la perspectiva de diorama táctico y la vista del ingeniero caminando directamente sobre el hormigón de la fábrica con navegación fluida mediante el stick analógico.
 
 ---

@@ -50,7 +50,7 @@ fi
     -L"$BUILD_DIR/apk/lib/arm64-v8a" \
     -lopenxr_loader -lxfactorvr -lEGL -lGLESv3 \
     -static-libstdc++ \
-    -llog -landroid \
+    -llog -landroid -laaudio \
     -o "$BUILD_DIR/apk/lib/arm64-v8a/libxfactorvr_launcher.so"
 
 # 3. Empaquetar recursos con aapt2

@@ -20,6 +20,7 @@
 #include <cstring>
 #include <algorithm>
 #include <dlfcn.h>
+#include <aaudio/AAudio.h>
 
 #define TAG "XFactorVR_OpenXR"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, TAG, __VA_ARGS__)
@@ -28,6 +29,164 @@
 static pthread_t s_engine_thread;
 static volatile bool s_running = false;
 static ANativeActivity* s_activity = nullptr;
+
+// ============================================================================
+// AUDIO ESPACIAL 3D POSICIONAL (XR AUDIO — GENERALS ZERO HOUR XR PATTERN)
+// ============================================================================
+enum AudioSfxType {
+    SFX_PLACE = 0,
+    SFX_MINE = 1,
+    SFX_CRAFT = 2,
+    SFX_CLICK = 3
+};
+
+struct ActiveSfx {
+    AudioSfxType type;
+    float time;
+    float duration;
+    float pan;
+    float volume;
+};
+
+static std::vector<ActiveSfx> s_active_sfx;
+static pthread_mutex_t s_audio_mutex = PTHREAD_MUTEX_INITIALIZER;
+static AAudioStream* s_audio_stream = nullptr;
+static XrVector3f s_listener_pos = { 0.0f, 0.0f, 0.0f };
+static float s_listener_yaw = 0.0f;
+static float s_factory_activity_level = 0.2f;
+
+static aaudio_data_callback_result_t audio_data_callback(
+    AAudioStream* stream,
+    void* userData,
+    void* audioData,
+    int32_t numFrames) {
+    
+    float* buffer = (float*)audioData;
+    static float s_phase_hum = 0.0f;
+
+    pthread_mutex_lock(&s_audio_mutex);
+
+    for (int32_t i = 0; i < numFrames; ++i) {
+        float left = 0.0f;
+        float right = 0.0f;
+
+        // 1. Zumbido continuo de maquinaria industrial (55 Hz con armónico a 110 Hz)
+        if (s_factory_activity_level > 0.01f) {
+            s_phase_hum += (2.0f * 3.14159265f * 55.0f) / 48000.0f;
+            if (s_phase_hum > 2.0f * 3.14159265f) s_phase_hum -= 2.0f * 3.14159265f;
+            float hum = (sinf(s_phase_hum) * 0.020f + sinf(s_phase_hum * 2.0f) * 0.010f) * s_factory_activity_level;
+            left += hum;
+            right += hum;
+        }
+
+        // 2. Efectos sonoros espaciales 3D
+        for (size_t s = 0; s < s_active_sfx.size(); ++s) {
+            ActiveSfx& sfx = s_active_sfx[s];
+            float t = sfx.time;
+            float sample = 0.0f;
+
+            if (sfx.type == SFX_PLACE) {
+                // Golpe metálico sordo y sólido al construir
+                float freq = 160.0f - (t / sfx.duration) * 110.0f;
+                float env = expf(-t * 14.0f);
+                sample = sinf(2.0f * 3.14159265f * freq * t) * env * 0.35f;
+            } else if (sfx.type == SFX_MINE) {
+                // Carraca metálica de desmontaje
+                float env = expf(-t * 10.0f);
+                float mod = (sinf(2.0f * 3.14159265f * 28.0f * t) > 0.0f) ? 1.0f : 0.2f;
+                sample = sinf(2.0f * 3.14159265f * 480.0f * t) * mod * env * 0.28f;
+            } else if (sfx.type == SFX_CRAFT) {
+                // Campanilla yunque brillante al fabricar ítem
+                float env = expf(-t * 6.0f);
+                sample = (sinf(2.0f * 3.14159265f * 1320.0f * t) * 0.7f +
+                          sinf(2.0f * 3.14159265f * 2640.0f * t) * 0.3f) * env * 0.30f;
+            } else if (sfx.type == SFX_CLICK) {
+                // Clic acústico de botón UI
+                float env = expf(-t * 90.0f);
+                sample = sinf(2.0f * 3.14159265f * 980.0f * t) * env * 0.20f;
+            }
+
+            float pan_norm = std::clamp(sfx.pan, -1.0f, 1.0f);
+            float angle = (pan_norm + 1.0f) * 0.25f * 3.14159265f;
+            float gl = cosf(angle);
+            float gr = sinf(angle);
+
+            left += sample * gl * sfx.volume;
+            right += sample * gr * sfx.volume;
+
+            sfx.time += 1.0f / 48000.0f;
+        }
+
+        buffer[i * 2]     = std::clamp(left, -1.0f, 1.0f);
+        buffer[i * 2 + 1] = std::clamp(right, -1.0f, 1.0f);
+    }
+
+    for (size_t s = 0; s < s_active_sfx.size(); ) {
+        if (s_active_sfx[s].time >= s_active_sfx[s].duration) {
+            s_active_sfx[s] = s_active_sfx.back();
+            s_active_sfx.pop_back();
+        } else {
+            ++s;
+        }
+    }
+
+    pthread_mutex_unlock(&s_audio_mutex);
+    return AAUDIO_CALLBACK_RESULT_CONTINUE;
+}
+
+static void init_audio_system() {
+    AAudioStreamBuilder* builder = nullptr;
+    if (AAudio_createStreamBuilder(&builder) != AAUDIO_OK) {
+        LOGE("Error creando AAudioStreamBuilder");
+        return;
+    }
+    AAudioStreamBuilder_setFormat(builder, AAUDIO_FORMAT_PCM_FLOAT);
+    AAudioStreamBuilder_setChannelCount(builder, 2);
+    AAudioStreamBuilder_setSampleRate(builder, 48000);
+    AAudioStreamBuilder_setDataCallback(builder, audio_data_callback, nullptr);
+    AAudioStreamBuilder_setPerformanceMode(builder, AAUDIO_PERFORMANCE_MODE_LOW_LATENCY);
+
+    aaudio_result_t res = AAudioStreamBuilder_openStream(builder, &s_audio_stream);
+    AAudioStreamBuilder_delete(builder);
+
+    if (res == AAUDIO_OK && s_audio_stream) {
+        AAudioStream_requestStart(s_audio_stream);
+        LOGI("Motor de Audio Espacial 3D (AAudio) inicializado a 48000Hz stereo");
+    } else {
+        LOGE("No se pudo iniciar el stream de AAudio: %d", res);
+        s_audio_stream = nullptr;
+    }
+}
+
+static void shutdown_audio_system() {
+    if (s_audio_stream) {
+        AAudioStream_requestStop(s_audio_stream);
+        AAudioStream_close(s_audio_stream);
+        s_audio_stream = nullptr;
+    }
+}
+
+static void play_spatial_sound(AudioSfxType type, float wx, float wy, float wz, float vol = 1.0f) {
+    float dx = wx - s_listener_pos.x;
+    float dz = wz - s_listener_pos.z;
+    float dist = sqrtf(dx * dx + dz * dz);
+    float dist_att = 1.0f / (1.0f + dist * 1.6f);
+
+    float angle_to_sound = atan2f(dx, -dz);
+    float rel_angle = angle_to_sound - s_listener_yaw;
+    float pan = sinf(rel_angle);
+
+    float duration = 0.25f;
+    if (type == SFX_CRAFT) duration = 0.50f;
+    else if (type == SFX_PLACE) duration = 0.32f;
+    else if (type == SFX_CLICK) duration = 0.04f;
+
+    pthread_mutex_lock(&s_audio_mutex);
+    if (s_active_sfx.size() < 16) {
+        s_active_sfx.push_back({type, 0.0f, duration, pan, vol * dist_att});
+    }
+    pthread_mutex_unlock(&s_audio_mutex);
+}
 
 // ============================================================================
 // MATEMÁTICAS 3D Y TRANSFORMACIONES (OPENGL ES COLUMN-MAJOR)
@@ -306,9 +465,10 @@ static bool s_table_grabbed = false;
 static XrVector3f s_grab_start_hand = { 0.0f, 0.0f, 0.0f };
 static XrVector3f s_grab_start_table = { 0.0f, 0.0f, 0.0f };
 
-// Sub-panel activo de la consola UI holográfica (0 = Power, 1 = Items, 2 = Tech)
+// Sub-panel activo de la consola UI holográfica (0 = Construcción, 1 = Inventario, 2 = Fabricar)
 static int s_active_ui_tab = 0;
 static int s_hovered_ui_btn = -1;
+static int s_hovered_recipe = -1;
 
 // Texturas Factorio procedurales
 static GLuint s_tex_concrete = 0;
@@ -349,12 +509,30 @@ enum EntityType {
     ENTITY_TYPE_COUNT = 14
 };
 
+struct PlayerItemFfi {
+    uint32_t item_id;
+    uint32_t count;
+};
+
+struct ResourcePatchFfi {
+    uint32_t item_type;
+    float tile_x;
+    float tile_y;
+    float radius;
+    uint32_t remaining;
+};
+
 typedef bool (*pfn_xfactorvr_load_glb)(const char* path, float target_width, DioramaVertex** out_verts, int* out_count);
 typedef void (*pfn_xfactorvr_free_glb)(DioramaVertex* verts, int count);
 typedef bool (*pfn_xfactorvr_get_live_entities)(LiveEntity* out_entities, int max_count, int* out_count);
 typedef bool (*pfn_xfactorvr_place_or_update_entity)(uint32_t entity_type, float tile_x, float tile_y, float orientation);
 typedef bool (*pfn_xfactorvr_mine_entity)(float tile_x, float tile_y);
 typedef void (*pfn_xfactorvr_update_simulation)(float delta_time);
+typedef bool (*pfn_xfactorvr_get_player_inventory)(PlayerItemFfi* out_items, uint32_t max_items, uint32_t* out_count);
+typedef bool (*pfn_xfactorvr_craft_item)(uint32_t item_id, uint32_t count);
+typedef bool (*pfn_xfactorvr_get_resource_patches)(ResourcePatchFfi* out_patches, uint32_t max_patches, uint32_t* out_count);
+typedef bool (*pfn_xfactorvr_connect_rcon)(const char* host, uint16_t port, const char* pwd);
+typedef bool (*pfn_xfactorvr_is_rcon_connected)();
 
 static pfn_xfactorvr_load_glb s_load_glb = nullptr;
 static pfn_xfactorvr_free_glb s_free_glb = nullptr;
@@ -362,6 +540,64 @@ static pfn_xfactorvr_get_live_entities s_get_live_entities = nullptr;
 static pfn_xfactorvr_place_or_update_entity s_place_or_update_entity = nullptr;
 static pfn_xfactorvr_mine_entity s_mine_entity = nullptr;
 static pfn_xfactorvr_update_simulation s_update_simulation = nullptr;
+static pfn_xfactorvr_get_player_inventory s_get_player_inventory = nullptr;
+static pfn_xfactorvr_craft_item s_craft_item = nullptr;
+static pfn_xfactorvr_get_resource_patches s_get_resource_patches = nullptr;
+static pfn_xfactorvr_connect_rcon s_connect_rcon = nullptr;
+static pfn_xfactorvr_is_rcon_connected s_is_rcon_connected = nullptr;
+
+// ============================================================================
+// PERSISTENCIA DE MESA (LAYOUT.JSON) — GENERALS ZERO HOUR XR PATTERN
+// ============================================================================
+static const char* LAYOUT_FILE_PATH = "/sdcard/XFactorVR/layout.json";
+
+static void update_table_matrix();
+
+static void save_tabletop_layout() {
+    FILE* f = fopen(LAYOUT_FILE_PATH, "w");
+    if (!f) return;
+    fprintf(f, "{\n  \"pos_x\": %.4f,\n  \"pos_y\": %.4f,\n  \"pos_z\": %.4f,\n  \"yaw\": %.4f,\n  \"scale\": %.4f\n}\n",
+        s_table_pos.x, s_table_pos.y, s_table_pos.z, s_table_yaw, s_table_scale);
+    fclose(f);
+    LOGI("[Layout] Layout guardado en %s (x=%.2f, y=%.2f, z=%.2f, yaw=%.2f, scale=%.2f)",
+        LAYOUT_FILE_PATH, s_table_pos.x, s_table_pos.y, s_table_pos.z, s_table_yaw, s_table_scale);
+}
+
+static void load_tabletop_layout() {
+    FILE* f = fopen(LAYOUT_FILE_PATH, "r");
+    if (!f) return;
+    float x = 0, y = 0, z = 0, yaw = 0, scale = 1;
+    if (fscanf(f, " { \"pos_x\": %f , \"pos_y\": %f , \"pos_z\": %f , \"yaw\": %f , \"scale\": %f }",
+               &x, &y, &z, &yaw, &scale) >= 4) {
+        s_table_pos.x = x;
+        s_table_pos.y = y;
+        s_table_pos.z = z;
+        s_table_yaw = yaw;
+        if (scale > 0.15f && scale < 8.0f) {
+            s_table_scale = scale;
+        }
+        s_table_placed = true;
+        update_table_matrix();
+        LOGI("[Layout] Layout restaurado desde %s", LAYOUT_FILE_PATH);
+    }
+    fclose(f);
+}
+
+static void update_table_matrix() {
+    float rot[16], trans[16], sc[16], model_temp[16];
+    mat4_rotate_y(rot, s_table_yaw);
+    mat4_translate(trans, s_table_pos.x, s_table_pos.y, s_table_pos.z);
+    mat4_scale(sc, s_table_scale, s_table_scale, s_table_scale);
+    mat4_multiply(rot, sc, model_temp);
+    mat4_multiply(trans, model_temp, s_table_model_mat);
+}
+
+// Interacción bimanual (Pinch-to-Zoom y Rotación bimanual)
+static bool s_dual_grip_active = false;
+static float s_dual_grip_initial_dist = 1.0f;
+static float s_dual_grip_initial_scale = 1.0f;
+static float s_dual_grip_initial_angle = 0.0f;
+static float s_dual_grip_initial_yaw = 0.0f;
 
 struct ModelMesh {
     GLuint vao = 0;
@@ -698,6 +934,11 @@ static void init_glb_loader() {
     s_place_or_update_entity = (pfn_xfactorvr_place_or_update_entity)dlsym(handle, "xfactorvr_place_or_update_entity");
     s_mine_entity = (pfn_xfactorvr_mine_entity)dlsym(handle, "xfactorvr_mine_entity");
     s_update_simulation = (pfn_xfactorvr_update_simulation)dlsym(handle, "xfactorvr_update_simulation");
+    s_get_player_inventory = (pfn_xfactorvr_get_player_inventory)dlsym(handle, "xfactorvr_get_player_inventory");
+    s_craft_item = (pfn_xfactorvr_craft_item)dlsym(handle, "xfactorvr_craft_item");
+    s_get_resource_patches = (pfn_xfactorvr_get_resource_patches)dlsym(handle, "xfactorvr_get_resource_patches");
+    s_connect_rcon = (pfn_xfactorvr_connect_rcon)dlsym(handle, "xfactorvr_connect_rcon");
+    s_is_rcon_connected = (pfn_xfactorvr_is_rcon_connected)dlsym(handle, "xfactorvr_is_rcon_connected");
 
     if (!s_load_glb || !s_get_live_entities) {
         void* mod_handle = dlopen("libxfactorvr.so", RTLD_NOW | RTLD_GLOBAL);
@@ -708,10 +949,18 @@ static void init_glb_loader() {
             s_place_or_update_entity = (pfn_xfactorvr_place_or_update_entity)dlsym(mod_handle, "xfactorvr_place_or_update_entity");
             s_mine_entity = (pfn_xfactorvr_mine_entity)dlsym(mod_handle, "xfactorvr_mine_entity");
             s_update_simulation = (pfn_xfactorvr_update_simulation)dlsym(mod_handle, "xfactorvr_update_simulation");
+            s_get_player_inventory = (pfn_xfactorvr_get_player_inventory)dlsym(mod_handle, "xfactorvr_get_player_inventory");
+            s_craft_item = (pfn_xfactorvr_craft_item)dlsym(mod_handle, "xfactorvr_craft_item");
+            s_get_resource_patches = (pfn_xfactorvr_get_resource_patches)dlsym(mod_handle, "xfactorvr_get_resource_patches");
+            s_connect_rcon = (pfn_xfactorvr_connect_rcon)dlsym(mod_handle, "xfactorvr_connect_rcon");
+            s_is_rcon_connected = (pfn_xfactorvr_is_rcon_connected)dlsym(mod_handle, "xfactorvr_is_rcon_connected");
         }
     }
-    LOGI("openxr_engine: Cargador GLB y FFI live_entities enlazado (load=%p, get=%p, place=%p, mine=%p, update=%p)",
-         s_load_glb, s_get_live_entities, s_place_or_update_entity, s_mine_entity, s_update_simulation);
+    LOGI("openxr_engine: Cargador GLB y FFI Factorio enlazados (load=%p, get=%p, inv=%p, patches=%p)",
+         s_load_glb, s_get_live_entities, s_get_player_inventory, s_get_resource_patches);
+
+    // Restaurar layout persistente si existe
+    load_tabletop_layout();
 }
 
 static bool load_mesh_from_glb(ModelMesh& out_mesh, const char* path, float target_width) {
@@ -943,6 +1192,24 @@ static void init_tabletop_scene() {
     LOGI("Diorama Tabletop Factorio inicializado con maqueta 3D completa estilo Generals XR");
 }
 
+static void trigger_controller_haptics(XrSession session, XrAction haptic_action, float amplitude = 0.7f, float duration_ms = 40.0f) {
+    if (session == XR_NULL_HANDLE || haptic_action == XR_NULL_HANDLE) return;
+    XrHapticVibration vib = {
+        .type = XR_TYPE_HAPTIC_VIBRATION,
+        .next = nullptr,
+        .duration = (XrDuration)(duration_ms * 1000000.0f),
+        .frequency = 180.0f,
+        .amplitude = amplitude
+    };
+    XrHapticActionInfo hapticInfo = {
+        .type = XR_TYPE_HAPTIC_ACTION_INFO,
+        .next = nullptr,
+        .action = haptic_action,
+        .subactionPath = XR_NULL_PATH
+    };
+    xrApplyHapticFeedback(session, &hapticInfo, (XrHapticBaseHeader*)&vib);
+}
+
 static void draw_tabletop_scene(const float* vp_mat,
                                 float anim_time,
                                 float dt,
@@ -950,7 +1217,9 @@ static void draw_tabletop_scene(const float* vp_mat,
                                 bool right_aim_valid,
                                 bool trigger_clicked,
                                 bool grip_clicked,
-                                bool is_primary_eye) {
+                                bool is_primary_eye,
+                                XrSession session = XR_NULL_HANDLE,
+                                XrAction haptic_action = XR_NULL_HANDLE) {
     if (s_program == 0) return;
 
     glUseProgram(s_program);
@@ -1115,6 +1384,36 @@ static void draw_tabletop_scene(const float* vp_mat,
     // G) GEOMETRÍA DINÁMICA DE LA FÁBRICA Y PIEZAS MÓVILES (FASE 3)
     std::vector<DioramaVertex> dyn_verts;
 
+    // 0. Yacimientos reales de recursos minerales en la superficie de la mesa (Hierro, Cobre, Carbón, Piedra)
+    ResourcePatchFfi resource_patches[16];
+    uint32_t patch_count = 0;
+    if (s_get_resource_patches && s_get_resource_patches(resource_patches, 16, &patch_count)) {
+        for (uint32_t p = 0; p < patch_count; ++p) {
+            const ResourcePatchFfi& patch = resource_patches[p];
+            float px = patch.tile_x * 0.04f;
+            float pz = patch.tile_y * 0.04f;
+            float pr = patch.radius * 0.04f;
+
+            float col_r = 0.5f, col_g = 0.5f, col_b = 0.5f;
+            switch (patch.item_type) {
+                case 1: col_r = 0.28f; col_g = 0.44f; col_b = 0.62f; break; // Iron Ore (Azulado)
+                case 2: col_r = 0.78f; col_g = 0.42f; col_b = 0.20f; break; // Copper Ore (Cobrizo)
+                case 3: col_r = 0.11f; col_g = 0.11f; col_b = 0.12f; break; // Coal (Carbón oscuro)
+                case 4: col_r = 0.65f; col_g = 0.62f; col_b = 0.55f; break; // Stone (Gris piedra)
+            }
+            add_cylinder_textured(dyn_verts, px, 0.003f, pz, pr, 0.003f, col_r * 0.65f, col_g * 0.65f, col_b * 0.65f, 0.95f, 16);
+
+            for (int k = 0; k < 7; ++k) {
+                float angle = (float)k * (6.2831853f / 7.0f) + (float)patch.item_type;
+                float dist = pr * 0.58f;
+                float ox = px + cosf(angle) * dist;
+                float oz = pz + sinf(angle) * dist;
+                float n_size = 0.016f + ((k % 3) * 0.004f);
+                add_box_textured(dyn_verts, ox, 0.006f, oz, n_size, 0.007f, n_size, 1.0f, 1.0f, col_r, col_g, col_b, 1.0f);
+            }
+        }
+    }
+
     // 1. Cableado catenario entre postes eléctricos existentes
     for (size_t p1 = 0; p1 < electric_poles.size(); ++p1) {
         for (size_t p2 = p1 + 1; p2 < electric_poles.size(); ++p2) {
@@ -1203,29 +1502,87 @@ static void draw_tabletop_scene(const float* vp_mat,
         ++p;
     }
 
-    // 6. Resaltado de la ranura Quickbar seleccionada activa en la consola UI
+    // 6. Consola UI Holográfica Espacial: Renderizado dinámico según pestaña activa
     if (!s_observer_mode) {
-        int selected_slot = -1;
-        const int slot_to_entity[9] = {
-            ENTITY_ASSEMBLING_MACHINE, ENTITY_MINING_DRILL, ENTITY_FURNACE,
-            ENTITY_GUN_TURRET, ENTITY_RADAR, ENTITY_ROBOPORT,
-            ENTITY_CHEST, ENTITY_ELECTRIC_POLE, ENTITY_NONE
-        };
-        for (int s = 0; s < 9; ++s) {
-            if (slot_to_entity[s] == s_selected_build_tool) {
-                selected_slot = s;
-                break;
+        if (s_active_ui_tab == 0) {
+            // Pestaña 0: Construcción / Quickbar
+            int selected_slot = -1;
+            const int slot_to_entity[9] = {
+                ENTITY_ASSEMBLING_MACHINE, ENTITY_MINING_DRILL, ENTITY_FURNACE,
+                ENTITY_GUN_TURRET, ENTITY_RADAR, ENTITY_ROBOPORT,
+                ENTITY_CHEST, ENTITY_ELECTRIC_POLE, ENTITY_NONE
+            };
+            for (int s = 0; s < 9; ++s) {
+                if (slot_to_entity[s] == s_selected_build_tool) {
+                    selected_slot = s;
+                    break;
+                }
             }
-        }
-        float slot_w = 0.055f, slot_h = 0.038f;
-        if (selected_slot >= 0) {
-            float sx = (float)(selected_slot - 4) * (slot_w + 0.010f);
-            // Marco de selección dorado brillante (#ffd700)
-            add_box_textured(dyn_verts, sx, ui_y - 0.055f, ui_z + 0.007f, slot_w + 0.006f, slot_h + 0.006f, 0.002f, 1.0f, 1.0f, 1.0f, 0.84f, 0.10f, 0.95f);
-        }
-        if (s_hovered_quickbar_slot >= 0 && s_hovered_quickbar_slot != selected_slot) {
-            float hx = (float)(s_hovered_quickbar_slot - 4) * (slot_w + 0.010f);
-            add_box_textured(dyn_verts, hx, ui_y - 0.055f, ui_z + 0.006f, slot_w + 0.004f, slot_h + 0.004f, 0.002f, 1.0f, 1.0f, 0.20f, 0.95f, 1.00f, 0.85f);
+            float slot_w = 0.055f, slot_h = 0.038f;
+            if (selected_slot >= 0) {
+                float sx = (float)(selected_slot - 4) * (slot_w + 0.010f);
+                // Marco de selección dorado brillante (#ffd700)
+                add_box_textured(dyn_verts, sx, ui_y - 0.055f, ui_z + 0.007f, slot_w + 0.006f, slot_h + 0.006f, 0.002f, 1.0f, 1.0f, 1.0f, 0.84f, 0.10f, 0.95f);
+            }
+            if (s_hovered_quickbar_slot >= 0 && s_hovered_quickbar_slot != selected_slot) {
+                float hx = (float)(s_hovered_quickbar_slot - 4) * (slot_w + 0.010f);
+                add_box_textured(dyn_verts, hx, ui_y - 0.055f, ui_z + 0.006f, slot_w + 0.004f, slot_h + 0.004f, 0.002f, 1.0f, 1.0f, 0.20f, 0.95f, 1.00f, 0.85f);
+            }
+        } else if (s_active_ui_tab == 1) {
+            // Pestaña 1: Inventario del jugador (Factorio Player Inventory)
+            PlayerItemFfi inv_items[32];
+            uint32_t inv_count = 0;
+            if (s_get_player_inventory && s_get_player_inventory(inv_items, 32, &inv_count)) {
+                float slot_w = 0.046f, slot_h = 0.032f;
+                uint32_t display_count = std::min(inv_count, 14u);
+                for (uint32_t i = 0; i < display_count; ++i) {
+                    int col = (int)i % 7;
+                    int row = (int)i / 7;
+                    float ix = (float)(col - 3) * (slot_w + 0.008f);
+                    float iy = ui_y - 0.042f - (float)row * (slot_h + 0.008f);
+
+                    float ir = 0.5f, ig = 0.5f, ib = 0.5f;
+                    switch (inv_items[i].item_id) {
+                        case 1: ir = 0.28f; ig = 0.44f; ib = 0.62f; break; // Iron Ore
+                        case 2: ir = 0.78f; ig = 0.42f; ib = 0.20f; break; // Copper Ore
+                        case 3: ir = 0.12f; ig = 0.12f; ib = 0.14f; break; // Coal
+                        case 4: ir = 0.65f; ig = 0.62f; ib = 0.55f; break; // Stone
+                        case 5: ir = 0.82f; ig = 0.85f; ib = 0.90f; break; // Iron Plate
+                        case 6: ir = 0.88f; ig = 0.52f; ib = 0.25f; break; // Copper Plate
+                        case 7: ir = 0.95f; ig = 0.78f; ib = 0.20f; break; // Iron Gear
+                        case 8: ir = 0.20f; ig = 0.88f; ib = 0.35f; break; // Electronic Circuit
+                        case 9: ir = 0.25f; ig = 0.48f; ib = 0.68f; break; // Assembling Machine
+                        case 10: ir = 0.18f; ig = 0.62f; ib = 0.58f; break; // Mining Drill
+                        case 11: ir = 0.52f; ig = 0.38f; ib = 0.30f; break; // Furnace
+                        case 12: ir = 0.92f; ig = 0.82f; ib = 0.15f; break; // Transport Belt
+                        case 13: ir = 0.95f; ig = 0.68f; ib = 0.12f; break; // Inserter
+                        case 14: ir = 0.56f; ig = 0.44f; ib = 0.28f; break; // Electric Pole
+                        default: ir = 0.45f; ig = 0.50f; ib = 0.55f; break;
+                    }
+                    add_box_textured(dyn_verts, ix, iy, ui_z + 0.005f, slot_w, slot_h, 0.002f, 1.0f, 1.0f, ir, ig, ib, 0.95f);
+                    float fill = std::clamp((float)inv_items[i].count / 50.0f, 0.15f, 1.0f);
+                    add_box_textured(dyn_verts, ix, iy - slot_h * 0.34f, ui_z + 0.007f, slot_w * fill, 0.004f, 0.002f, 1.0f, 1.0f, 0.2f, 0.95f, 0.4f, 1.0f);
+                }
+            }
+        } else if (s_active_ui_tab == 2) {
+            // Pestaña 2: Fabricación / Crafteo de recetas
+            float recipe_w = 0.120f, recipe_h = 0.046f;
+            for (int r = 0; r < 4; ++r) {
+                float rx_btn = (float)(r - 1.5f) * (recipe_w + 0.014f);
+                float ry_btn = ui_y - 0.055f;
+
+                float rr = 0.2f, rg = 0.5f, rb = 0.7f;
+                switch (r) {
+                    case 0: rr = 0.95f; rg = 0.78f; rb = 0.20f; break; // Engranaje (Hierro)
+                    case 1: rr = 0.20f; rg = 0.88f; rb = 0.35f; break; // Circuito Verde
+                    case 2: rr = 0.92f; rg = 0.82f; rb = 0.15f; break; // Cinta Transportadora
+                    case 3: rr = 0.18f; rg = 0.62f; rb = 0.58f; break; // Minera Eléctrica
+                }
+                add_box_textured(dyn_verts, rx_btn, ry_btn, ui_z + 0.005f, recipe_w, recipe_h, 0.002f, 1.0f, 1.0f, rr * 0.85f, rg * 0.85f, rb * 0.85f, 0.95f);
+                if (s_hovered_recipe == r) {
+                    add_box_textured(dyn_verts, rx_btn, ry_btn, ui_z + 0.008f, recipe_w + 0.006f, recipe_h + 0.006f, 0.002f, 1.0f, 1.0f, 1.0f, 1.0f, 0.3f, 1.0f);
+                }
+            }
         }
     }
 
@@ -1302,6 +1659,8 @@ static void draw_tabletop_scene(const float* vp_mat,
                     }
 
                     if (is_primary_eye && trigger_clicked && s_hovered_ui_btn >= 0) {
+                        trigger_controller_haptics(session, haptic_action, 0.45f, 25.0f);
+                        play_spatial_sound(SFX_CLICK, ui_hit_x, ui_hit_y, ui_world_z);
                         if (s_hovered_ui_btn == 0) {
                             s_observer_mode = !s_observer_mode;
                             LOGI("Modo cambiado: %s", s_observer_mode ? "OBSERVADOR 1:1" : "TABLETOP DIORAMA");
@@ -1313,29 +1672,62 @@ static void draw_tabletop_scene(const float* vp_mat,
                         }
                     }
                 }
-                // Ranuras de Quickbar / Construcción 6DoF (rel_y <= 0.0)
+                // Ranuras de Quickbar o Recetas de Crafteo (rel_y <= 0.0)
                 else if (rel_y <= 0.0f && rel_y >= -0.10f) {
-                    float slot_w = 0.055f;
-                    for (int s = 0; s < 9; ++s) {
-                        float sx = (float)(s - 4) * (slot_w + 0.010f);
-                        if (fabsf(rel_x - sx) < slot_w * 0.5f && fabsf(rel_y - (-0.055f)) < 0.022f) {
-                            s_hovered_quickbar_slot = s;
-                            break;
+                    if (s_active_ui_tab == 2) {
+                        // Modo Crafteo: 4 botones de recetas
+                        float recipe_w = 0.120f;
+                        s_hovered_recipe = -1;
+                        for (int r = 0; r < 4; ++r) {
+                            float rx_btn = (float)(r - 1.5f) * (recipe_w + 0.014f);
+                            if (fabsf(rel_x - rx_btn) < recipe_w * 0.5f && fabsf(rel_y - (-0.055f)) < 0.025f) {
+                                s_hovered_recipe = r;
+                                break;
+                            }
                         }
-                    }
 
-                    if (is_primary_eye && trigger_clicked && s_hovered_quickbar_slot >= 0) {
-                        const int slot_to_entity[9] = {
-                            ENTITY_ASSEMBLING_MACHINE, ENTITY_MINING_DRILL, ENTITY_FURNACE,
-                            ENTITY_GUN_TURRET, ENTITY_RADAR, ENTITY_ROBOPORT,
-                            ENTITY_CHEST, ENTITY_ELECTRIC_POLE, ENTITY_NONE
-                        };
-                        s_selected_build_tool = slot_to_entity[s_hovered_quickbar_slot];
-                        LOGI("Quickbar: Herramienta seleccionada = %d (slot %d)", s_selected_build_tool, s_hovered_quickbar_slot);
-                        for (int k = 0; k < 12; ++k) {
-                            spawn_particle(ui_hit_x, ui_hit_y, ui_hit_x,
-                                           ((rand() % 100) - 50) * 0.001f, ((rand() % 100) - 50) * 0.001f, 0.02f,
-                                           0.20f, 0.95f, 1.0f, 0.9f, 0.008f, 0.4f);
+                        if (is_primary_eye && trigger_clicked && s_hovered_recipe >= 0) {
+                            const uint32_t recipe_item_ids[4] = { 7, 8, 12, 10 }; // Engranaje, Circuito, Cinta, Minera
+                            if (s_craft_item) {
+                                bool crafted = s_craft_item(recipe_item_ids[s_hovered_recipe], 1);
+                                if (crafted) {
+                                    LOGI("Crafteado item_id=%d con éxito", recipe_item_ids[s_hovered_recipe]);
+                                    trigger_controller_haptics(session, haptic_action, 0.8f, 50.0f);
+                                    play_spatial_sound(SFX_CRAFT, ui_hit_x, ui_hit_y, ui_world_z);
+                                    for (int k = 0; k < 18; ++k) {
+                                        spawn_particle(ui_hit_x, ui_hit_y, ui_world_z,
+                                                       ((rand() % 100) - 50) * 0.001f, 0.02f + (rand() % 40) * 0.0005f, ((rand() % 100) - 50) * 0.001f,
+                                                       1.0f, 0.88f, 0.20f, 0.95f, 0.009f, 0.6f);
+                                    }
+                                }
+                            }
+                        }
+                    } else if (s_active_ui_tab == 0) {
+                        // Modo Quickbar: 9 ranuras de construcción
+                        float slot_w = 0.055f;
+                        for (int s = 0; s < 9; ++s) {
+                            float sx = (float)(s - 4) * (slot_w + 0.010f);
+                            if (fabsf(rel_x - sx) < slot_w * 0.5f && fabsf(rel_y - (-0.055f)) < 0.022f) {
+                                s_hovered_quickbar_slot = s;
+                                break;
+                            }
+                        }
+
+                        if (is_primary_eye && trigger_clicked && s_hovered_quickbar_slot >= 0) {
+                            const int slot_to_entity[9] = {
+                                ENTITY_ASSEMBLING_MACHINE, ENTITY_MINING_DRILL, ENTITY_FURNACE,
+                                ENTITY_GUN_TURRET, ENTITY_RADAR, ENTITY_ROBOPORT,
+                                ENTITY_CHEST, ENTITY_ELECTRIC_POLE, ENTITY_NONE
+                            };
+                            s_selected_build_tool = slot_to_entity[s_hovered_quickbar_slot];
+                            LOGI("Quickbar: Herramienta seleccionada = %d (slot %d)", s_selected_build_tool, s_hovered_quickbar_slot);
+                            trigger_controller_haptics(session, haptic_action, 0.5f, 30.0f);
+                            play_spatial_sound(SFX_CLICK, ui_hit_x, ui_hit_y, ui_world_z);
+                            for (int k = 0; k < 12; ++k) {
+                                spawn_particle(ui_hit_x, ui_hit_y, ui_world_z,
+                                               ((rand() % 100) - 50) * 0.001f, ((rand() % 100) - 50) * 0.001f, 0.02f,
+                                               0.20f, 0.95f, 1.0f, 0.9f, 0.008f, 0.4f);
+                            }
                         }
                     }
                 }
@@ -1402,6 +1794,8 @@ static void draw_tabletop_scene(const float* vp_mat,
                         s_place_or_update_entity(s_selected_build_tool, hover_tile_x, hover_tile_y, s_placement_yaw);
                         LOGI("Construido tipo=%d en tile (%.1f, %.1f) yaw=%.2f",
                              s_selected_build_tool, hover_tile_x, hover_tile_y, s_placement_yaw);
+                        trigger_controller_haptics(session, haptic_action, 0.75f, 45.0f);
+                        play_spatial_sound(SFX_PLACE, s_table_pos.x + snap_mx, s_table_pos.y, s_table_pos.z + snap_mz);
                         for (int k = 0; k < 20; ++k) {
                             spawn_particle(snap_mx, 0.05f, snap_mz,
                                            ((rand() % 100) - 50) * 0.001f, 0.04f + (rand() % 50) * 0.0005f, ((rand() % 100) - 50) * 0.001f,
@@ -1415,6 +1809,8 @@ static void draw_tabletop_scene(const float* vp_mat,
                     if (s_mine_entity) {
                         s_mine_entity(hover_tile_x, hover_tile_y);
                         LOGI("Minado/Deconstruido en tile (%.1f, %.1f)", hover_tile_x, hover_tile_y);
+                        trigger_controller_haptics(session, haptic_action, 0.90f, 65.0f);
+                        play_spatial_sound(SFX_MINE, s_table_pos.x + snap_mx, s_table_pos.y, s_table_pos.z + snap_mz);
                         for (int k = 0; k < 24; ++k) {
                             spawn_particle(snap_mx, 0.04f, snap_mz,
                                            ((rand() % 100) - 50) * 0.0015f, 0.05f + (rand() % 60) * 0.0008f, ((rand() % 100) - 50) * 0.0015f,
@@ -1446,6 +1842,26 @@ static void draw_tabletop_scene(const float* vp_mat,
                 laser_verts.push_back({hit_stage_x + cosf(a1) * ret_rad, s_table_pos.y + 0.003f, hit_stage_z + sinf(a1) * ret_rad, 0, 1, 0, 0, 0, l_r, l_g, l_b, 0.95f});
             }
         }
+
+        // 5. Tooltips Holográficos 3D en Mandos Pico (XrControllerHelp — Generals XR pattern)
+        // Posicionado flotando 6cm encima del mando derecho mirando hacia el jugador
+        float cx = rx;
+        float cy = ry + 0.055f;
+        float cz = rz;
+
+        // Placa base holográfica flotante de HUD (#0e141a translúcido)
+        add_box_textured(laser_verts, cx, cy, cz, 0.11f, 0.040f, 0.002f, 1.0f, 1.0f, 0.06f, 0.09f, 0.14f, 0.90f);
+        // Borde superior cian Factorio
+        add_box_textured(laser_verts, cx, cy + 0.018f, cz + 0.002f, 0.106f, 0.003f, 0.001f, 1.0f, 1.0f, 0.20f, 0.85f, 1.00f, 0.95f);
+
+        // Badge 1 (Superior Izq): Trigger -> Acción / Construir (Cian)
+        add_box_textured(laser_verts, cx - 0.026f, cy + 0.007f, cz + 0.002f, 0.044f, 0.012f, 0.001f, 1.0f, 1.0f, 0.15f, 0.75f, 0.95f, 0.95f);
+        // Badge 2 (Superior Der): Grip -> Mover Mesa / Demoler (Naranja)
+        add_box_textured(laser_verts, cx + 0.026f, cy + 0.007f, cz + 0.002f, 0.044f, 0.012f, 0.001f, 1.0f, 1.0f, 0.95f, 0.55f, 0.15f, 0.95f);
+        // Badge 3 (Inferior Izq): Stick -> Rotar Edificio / Altura (Amarillo)
+        add_box_textured(laser_verts, cx - 0.026f, cy - 0.008f, cz + 0.002f, 0.044f, 0.012f, 0.001f, 1.0f, 1.0f, 0.95f, 0.85f, 0.20f, 0.95f);
+        // Badge 4 (Inferior Der): 2 Grips -> Zoom & Rotar Mesa (Púrpura)
+        add_box_textured(laser_verts, cx + 0.026f, cy - 0.008f, cz + 0.002f, 0.044f, 0.012f, 0.001f, 1.0f, 1.0f, 0.75f, 0.35f, 0.95f, 0.95f);
 
         // Renderizar láser con MVP de mundo
         float ident_mat[16];
@@ -1666,26 +2082,44 @@ static void* openxr_thread_main(void* arg) {
     XrAction rightAimAction = XR_NULL_HANDLE;
     xrCreateAction(actionSet, &aimInfo, &rightAimAction);
 
-    // Trigger
+    // Left Aim Pose (para interacción bimanual)
+    strncpy(aimInfo.actionName, "left_aim", XR_MAX_ACTION_NAME_SIZE);
+    strncpy(aimInfo.localizedActionName, "Left Aim", XR_MAX_LOCALIZED_ACTION_NAME_SIZE);
+    XrAction leftAimAction = XR_NULL_HANDLE;
+    xrCreateAction(actionSet, &aimInfo, &leftAimAction);
+
+    // Trigger (Right)
     XrActionCreateInfo trigInfo = { .type = XR_TYPE_ACTION_CREATE_INFO, .actionType = XR_ACTION_TYPE_FLOAT_INPUT };
     strncpy(trigInfo.actionName, "right_trigger", XR_MAX_ACTION_NAME_SIZE);
     strncpy(trigInfo.localizedActionName, "Right Trigger", XR_MAX_LOCALIZED_ACTION_NAME_SIZE);
     XrAction rightTrigAction = XR_NULL_HANDLE;
     xrCreateAction(actionSet, &trigInfo, &rightTrigAction);
 
-    // Grip (para agarrar y mover la mesa)
+    // Grip (Right & Left - para agarrar la mesa y zoom bimanual)
     XrActionCreateInfo gripInfo = { .type = XR_TYPE_ACTION_CREATE_INFO, .actionType = XR_ACTION_TYPE_FLOAT_INPUT };
     strncpy(gripInfo.actionName, "right_grip", XR_MAX_ACTION_NAME_SIZE);
     strncpy(gripInfo.localizedActionName, "Right Grip", XR_MAX_LOCALIZED_ACTION_NAME_SIZE);
     XrAction rightGripAction = XR_NULL_HANDLE;
     xrCreateAction(actionSet, &gripInfo, &rightGripAction);
 
-    // Thumbstick (para ajustar altura o caminar en modo observador)
+    strncpy(gripInfo.actionName, "left_grip", XR_MAX_ACTION_NAME_SIZE);
+    strncpy(gripInfo.localizedActionName, "Left Grip", XR_MAX_LOCALIZED_ACTION_NAME_SIZE);
+    XrAction leftGripAction = XR_NULL_HANDLE;
+    xrCreateAction(actionSet, &gripInfo, &leftGripAction);
+
+    // Thumbsticks
     XrActionCreateInfo stickInfo = { .type = XR_TYPE_ACTION_CREATE_INFO, .actionType = XR_ACTION_TYPE_VECTOR2F_INPUT };
     strncpy(stickInfo.actionName, "right_stick", XR_MAX_ACTION_NAME_SIZE);
     strncpy(stickInfo.localizedActionName, "Right Stick", XR_MAX_LOCALIZED_ACTION_NAME_SIZE);
     XrAction rightStickAction = XR_NULL_HANDLE;
     xrCreateAction(actionSet, &stickInfo, &rightStickAction);
+
+    // Haptics (Vibración háptica táctil)
+    XrActionCreateInfo hapticInfo = { .type = XR_TYPE_ACTION_CREATE_INFO, .actionType = XR_ACTION_TYPE_VIBRATION_OUTPUT };
+    strncpy(hapticInfo.actionName, "right_haptic", XR_MAX_ACTION_NAME_SIZE);
+    strncpy(hapticInfo.localizedActionName, "Right Haptic", XR_MAX_LOCALIZED_ACTION_NAME_SIZE);
+    XrAction rightHapticAction = XR_NULL_HANDLE;
+    xrCreateAction(actionSet, &hapticInfo, &rightHapticAction);
 
     // Bindings de interacción
     XrPath simpleProfile = XR_NULL_PATH, oculusProfile = XR_NULL_PATH, picoProfile = XR_NULL_PATH;
@@ -1698,6 +2132,11 @@ static void* openxr_thread_main(void* arg) {
     xrStringToPath(instance, "/user/hand/right/input/trigger/value", &rightTrigPath);
     xrStringToPath(instance, "/user/hand/right/input/squeeze/value", &rightGripPath);
     xrStringToPath(instance, "/user/hand/right/input/thumbstick", &rightStickPath);
+
+    XrPath leftAimPath = XR_NULL_PATH, leftGripPath = XR_NULL_PATH, rightHapticPath = XR_NULL_PATH;
+    xrStringToPath(instance, "/user/hand/left/input/aim/pose", &leftAimPath);
+    xrStringToPath(instance, "/user/hand/left/input/squeeze/value", &leftGripPath);
+    xrStringToPath(instance, "/user/hand/right/output/haptic", &rightHapticPath);
 
     XrPath simpleClickPath = XR_NULL_PATH;
     xrStringToPath(instance, "/user/hand/right/input/select/click", &simpleClickPath);
@@ -1718,12 +2157,15 @@ static void* openxr_thread_main(void* arg) {
         { rightAimAction, rightAimPath },
         { rightTrigAction, rightTrigPath },
         { rightGripAction, rightGripPath },
-        { rightStickAction, rightStickPath }
+        { rightStickAction, rightStickPath },
+        { leftAimAction, leftAimPath },
+        { leftGripAction, leftGripPath },
+        { rightHapticAction, rightHapticPath }
     };
     XrInteractionProfileSuggestedBinding touchSuggested = {
         .type = XR_TYPE_INTERACTION_PROFILE_SUGGESTED_BINDING,
         .interactionProfile = oculusProfile,
-        .countSuggestedBindings = 4,
+        .countSuggestedBindings = 7,
         .suggestedBindings = touchBindings,
     };
     xrSuggestInteractionProfileBindings(instance, &touchSuggested);
@@ -1731,7 +2173,7 @@ static void* openxr_thread_main(void* arg) {
     XrInteractionProfileSuggestedBinding picoSuggested = {
         .type = XR_TYPE_INTERACTION_PROFILE_SUGGESTED_BINDING,
         .interactionProfile = picoProfile,
-        .countSuggestedBindings = 4,
+        .countSuggestedBindings = 7,
         .suggestedBindings = touchBindings,
     };
     xrSuggestInteractionProfileBindings(instance, &picoSuggested);
@@ -1754,6 +2196,10 @@ static void* openxr_thread_main(void* arg) {
     };
     XrSpace rightAimSpace = XR_NULL_HANDLE;
     xrCreateActionSpace(session, &actionSpaceInfo, &rightAimSpace);
+
+    actionSpaceInfo.action = leftAimAction;
+    XrSpace leftAimSpace = XR_NULL_HANDLE;
+    xrCreateActionSpace(session, &actionSpaceInfo, &leftAimSpace);
 
     // 8. Swapchains con Depth Buffer
     uint32_t viewCount = 0;
@@ -1817,6 +2263,7 @@ static void* openxr_thread_main(void* arg) {
     }
 
     init_tabletop_scene();
+    init_audio_system();
 
     // 9. Bucle de ejecución
     bool sessionRunning = false;
@@ -1898,6 +2345,17 @@ static void* openxr_thread_main(void* arg) {
         uint32_t viewCountOut = 0;
         xrLocateViews(session, &locateInfo, &viewState, viewCount, &viewCountOut, views.data());
 
+        // Actualizar posición y orientación del oyente para Audio Espacial 3D
+        if (viewState.viewStateFlags & XR_VIEW_STATE_POSITION_VALID_BIT) {
+            s_listener_pos.x = (views[0].pose.position.x + views[1].pose.position.x) * 0.5f;
+            s_listener_pos.y = (views[0].pose.position.y + views[1].pose.position.y) * 0.5f;
+            s_listener_pos.z = (views[0].pose.position.z + views[1].pose.position.z) * 0.5f;
+
+            float fx = 0.0f, fz = -1.0f;
+            yawForwardFromQuat(views[0].pose.orientation, &fx, &fz);
+            s_listener_yaw = atan2f(fx, -fz);
+        }
+
         // Anclar mesa en el mundo real en el primer frame válido
         if (!s_table_placed && (viewState.viewStateFlags & XR_VIEW_STATE_POSITION_VALID_BIT)) {
             float hx = (views[0].pose.position.x + views[1].pose.position.x) * 0.5f;
@@ -1961,8 +2419,46 @@ static void* openxr_thread_main(void* arg) {
         XrActionStateGetInfo getStick = { .type = XR_TYPE_ACTION_STATE_GET_INFO, .action = rightStickAction };
         xrGetActionStateVector2f(session, &getStick, &stickState);
 
-        // 1. Agarre y arrastre de la mesa con el gatillo Grip (XrSurfaceGrab)
-        if (rightAimValid && gripState.currentState > 0.5f && !grip_clicked) {
+        XrActionStateFloat leftGripState = { .type = XR_TYPE_ACTION_STATE_FLOAT };
+        XrActionStateGetInfo getLeftGrip = { .type = XR_TYPE_ACTION_STATE_GET_INFO, .action = leftGripAction };
+        xrGetActionStateFloat(session, &getLeftGrip, &leftGripState);
+
+        XrSpaceLocation leftAimLoc = { .type = XR_TYPE_SPACE_LOCATION };
+        xrLocateSpace(leftAimSpace, appSpace, frameState.predictedDisplayTime, &leftAimLoc);
+        bool leftAimValid = (leftAimLoc.locationFlags & XR_SPACE_LOCATION_POSITION_VALID_BIT);
+
+        // 1. Interacción Bimanual: Zoom y Rotación con Dos Manos (Generals XR pattern)
+        bool both_grips = rightAimValid && leftAimValid && (gripState.currentState > 0.5f) && (leftGripState.currentState > 0.5f);
+
+        if (both_grips) {
+            float dx = rightAimLoc.pose.position.x - leftAimLoc.pose.position.x;
+            float dy = rightAimLoc.pose.position.y - leftAimLoc.pose.position.y;
+            float dz = rightAimLoc.pose.position.z - leftAimLoc.pose.position.z;
+            float dist = sqrtf(dx * dx + dy * dy + dz * dz);
+            float angle = atan2f(dz, dx);
+
+            if (!s_dual_grip_active) {
+                s_dual_grip_active = true;
+                s_dual_grip_initial_dist = fmaxf(dist, 0.05f);
+                s_dual_grip_initial_scale = s_table_scale;
+                s_dual_grip_initial_angle = angle;
+                s_dual_grip_initial_yaw = s_table_yaw;
+            } else {
+                // Escalar (Pinch-to-zoom con las dos manos)
+                float ratio = dist / s_dual_grip_initial_dist;
+                s_table_scale = fminf(fmaxf(s_dual_grip_initial_scale * ratio, 0.25f), 4.0f);
+
+                // Rotar sobre eje vertical Y con las dos manos
+                float delta_angle = angle - s_dual_grip_initial_angle;
+                s_table_yaw = s_dual_grip_initial_yaw - delta_angle;
+
+                update_table_matrix();
+            }
+        } else if (s_dual_grip_active) {
+            s_dual_grip_active = false;
+            save_tabletop_layout();
+        } else if (rightAimValid && gripState.currentState > 0.5f && !grip_clicked) {
+            // 2. Agarre y arrastre monomanual de la mesa (XrSurfaceGrab)
             if (!s_table_grabbed) {
                 s_table_grabbed = true;
                 s_grab_start_hand = rightAimLoc.pose.position;
@@ -1972,23 +2468,20 @@ static void* openxr_thread_main(void* arg) {
                 s_table_pos.y = s_grab_start_table.y + (rightAimLoc.pose.position.y - s_grab_start_hand.y);
                 s_table_pos.z = s_grab_start_table.z + (rightAimLoc.pose.position.z - s_grab_start_hand.z);
 
-                float rot[16], trans[16];
-                mat4_rotate_y(rot, s_table_yaw);
-                mat4_translate(trans, s_table_pos.x, s_table_pos.y, s_table_pos.z);
-                mat4_multiply(trans, rot, s_table_model_mat);
+                update_table_matrix();
             }
         } else if (gripState.currentState <= 0.5f) {
-            s_table_grabbed = false;
+            if (s_table_grabbed) {
+                s_table_grabbed = false;
+                save_tabletop_layout();
+            }
         }
 
         // 2. Rotación de herramienta de colocación con Joystick X o ajuste de altura con Y
         if (!s_table_grabbed && !s_observer_mode) {
             if (fabsf(stickState.currentState.y) > 0.2f) {
                 s_table_pos.y += stickState.currentState.y * 0.004f;
-                float rot[16], trans[16];
-                mat4_rotate_y(rot, s_table_yaw);
-                mat4_translate(trans, s_table_pos.x, s_table_pos.y, s_table_pos.z);
-                mat4_multiply(trans, rot, s_table_model_mat);
+                update_table_matrix();
             }
             if (fabsf(stickState.currentState.x) > 0.6f && !s_stick_rotated) {
                 s_placement_yaw += (stickState.currentState.x > 0.0f) ? 1.5707963f : -1.5707963f;
@@ -2028,7 +2521,7 @@ static void* openxr_thread_main(void* arg) {
             mat4_view_from_pose(views[i].pose, viewMat);
             mat4_multiply(proj, viewMat, vp_mat);
 
-            draw_tabletop_scene(vp_mat, anim_time, 0.016f, rightAimLoc.pose, rightAimValid, trigger_clicked, grip_clicked, (i == 0));
+            draw_tabletop_scene(vp_mat, anim_time, 0.016f, rightAimLoc.pose, rightAimValid, trigger_clicked, grip_clicked, (i == 0), session, rightHapticAction);
 
             XrSwapchainImageReleaseInfo relInfo = { .type = XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO };
             xrReleaseSwapchainImage(swapchains[i].handle, &relInfo);
@@ -2069,6 +2562,7 @@ static void* openxr_thread_main(void* arg) {
         }
     }
 
+    shutdown_audio_system();
     activity->vm->DetachCurrentThread();
     LOGI("=== Hilo OpenXR finalizado ===");
     return nullptr;

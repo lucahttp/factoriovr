@@ -3,6 +3,7 @@
 // Inyectado en Factorio vía LD_PRELOAD para proporcionar la experiencia
 // Tabletop Mixed Reality en Pico 4 Ultra Standalone / OpenXR.
 
+pub mod game_bridge;
 pub mod offsets;
 pub mod openxr;
 pub mod renderer;
@@ -181,6 +182,39 @@ pub unsafe extern "C" fn xfactorvr_get_live_entities(
     }
 }
 
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct PlayerItemFfi {
+    pub item_id: u32,
+    pub count: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct ResourcePatchFfi {
+    pub item_type: u32,
+    pub tile_x: f32,
+    pub tile_y: f32,
+    pub radius: f32,
+    pub remaining: u32,
+}
+
+fn entity_type_to_item_id(entity_type: u32) -> u32 {
+    match entity_type {
+        tabletop::ENTITY_ASSEMBLING_MACHINE => game_bridge::ITEM_ASSEMBLING_MACHINE,
+        tabletop::ENTITY_MINING_DRILL => game_bridge::ITEM_MINING_DRILL,
+        tabletop::ENTITY_FURNACE => game_bridge::ITEM_FURNACE,
+        tabletop::ENTITY_GUN_TURRET => game_bridge::ITEM_TURRET,
+        tabletop::ENTITY_RADAR => game_bridge::ITEM_RADAR,
+        tabletop::ENTITY_ROBOPORT => game_bridge::ITEM_ROBOPORT,
+        tabletop::ENTITY_CHEST => game_bridge::ITEM_CHEST,
+        tabletop::ENTITY_ELECTRIC_POLE => game_bridge::ITEM_POWER_POLE,
+        tabletop::ENTITY_TRANSPORT_BELT => game_bridge::ITEM_TRANSPORT_BELT,
+        tabletop::ENTITY_INSERTER => game_bridge::ITEM_INSERTER,
+        _ => 0,
+    }
+}
+
 /// Registra o actualiza una entidad viva (llamado desde hooks o UI de colocación 6DoF)
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn xfactorvr_place_or_update_entity(
@@ -189,6 +223,41 @@ pub unsafe extern "C" fn xfactorvr_place_or_update_entity(
     tile_y: f32,
     orientation: f32,
 ) -> bool {
+    let item_id = entity_type_to_item_id(entity_type);
+    if item_id > 0 {
+        if let Ok(mut world) = game_bridge::get_simulation_world().write() {
+            if let Some(cnt) = world.player_inventory.get_mut(&item_id) {
+                if *cnt > 0 {
+                    *cnt -= 1;
+                }
+            }
+        }
+    }
+
+    // Si hay conexión RCON con Factorio, emitir comando a la simulación nativa
+    if let Ok(mut rcon) = game_bridge::get_rcon_client().lock() {
+        let name_str = match entity_type {
+            tabletop::ENTITY_ASSEMBLING_MACHINE => "assembling-machine-1",
+            tabletop::ENTITY_MINING_DRILL => "electric-mining-drill",
+            tabletop::ENTITY_FURNACE => "stone-furnace",
+            tabletop::ENTITY_GUN_TURRET => "gun-turret",
+            tabletop::ENTITY_RADAR => "radar",
+            tabletop::ENTITY_ROBOPORT => "roboport",
+            tabletop::ENTITY_CHEST => "wooden-chest",
+            tabletop::ENTITY_ELECTRIC_POLE => "small-electric-pole",
+            tabletop::ENTITY_TRANSPORT_BELT => "transport-belt",
+            tabletop::ENTITY_INSERTER => "inserter",
+            _ => "",
+        };
+        if !name_str.is_empty() {
+            let cmd = format!(
+                "/c remote.call('xfactorvr', 'place_entity', '{}', {}, {}, 0)",
+                name_str, tile_x, tile_y
+            );
+            rcon.execute(&cmd);
+        }
+    }
+
     let lock = get_live_entities_lock();
     if let Ok(mut entities) = lock.write() {
         if let Some(existing) = entities.iter_mut().find(|e| (e.tile_x - tile_x).abs() < 0.5 && (e.tile_y - tile_y).abs() < 0.5) {
@@ -217,14 +286,30 @@ pub unsafe extern "C" fn xfactorvr_mine_entity(
     tile_x: f32,
     tile_y: f32,
 ) -> bool {
+    let mut removed_type = 0;
     let lock = get_live_entities_lock();
     if let Ok(mut entities) = lock.write() {
         if let Some(pos) = entities.iter().position(|e| (e.tile_x - tile_x).abs() < 1.0 && (e.tile_y - tile_y).abs() < 1.0) {
+            removed_type = entities[pos].entity_type;
             entities.remove(pos);
-            true
-        } else {
-            false
         }
+    }
+
+    if removed_type > 0 {
+        let item_id = entity_type_to_item_id(removed_type);
+        if item_id > 0 {
+            if let Ok(mut world) = game_bridge::get_simulation_world().write() {
+                let cnt = world.player_inventory.entry(item_id).or_insert(0);
+                *cnt += 1;
+            }
+        }
+
+        // Si hay conexión RCON con Factorio, emitir comando de minado a la simulación nativa
+        if let Ok(mut rcon) = game_bridge::get_rcon_client().lock() {
+            let cmd = format!("/c remote.call('xfactorvr', 'mine_entity', {}, {})", tile_x, tile_y);
+            rcon.execute(&cmd);
+        }
+        true
     } else {
         false
     }
@@ -235,19 +320,160 @@ pub unsafe extern "C" fn xfactorvr_mine_entity(
 pub unsafe extern "C" fn xfactorvr_update_simulation(delta_time: f32) {
     let lock = get_live_entities_lock();
     if let Ok(mut entities) = lock.write() {
-        for entity in entities.iter_mut() {
-            if entity.status == 1 {
-                let speed = match entity.entity_type {
-                    tabletop::ENTITY_ASSEMBLING_MACHINE => 1.2,
-                    tabletop::ENTITY_MINING_DRILL => 0.8,
-                    tabletop::ENTITY_RADAR => 0.5,
-                    tabletop::ENTITY_GUN_TURRET => 0.4,
-                    tabletop::ENTITY_INSERTER => 1.5,
-                    _ => 0.2,
-                };
-                entity.animation_progress = (entity.animation_progress + delta_time * speed).rem_euclid(1.0);
-            }
+        if let Ok(mut world) = game_bridge::get_simulation_world().write() {
+            world.tick(&mut entities, delta_time);
         }
+    }
+}
+
+/// Obtiene los ítems del inventario del jugador
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn xfactorvr_get_player_inventory(
+    out_items: *mut PlayerItemFfi,
+    max_items: u32,
+    out_count: *mut u32,
+) -> bool {
+    if out_items.is_null() || out_count.is_null() || max_items == 0 {
+        return false;
+    }
+
+    if let Ok(world) = game_bridge::get_simulation_world().read() {
+        let mut count = 0;
+        for (&item_id, &qty) in &world.player_inventory {
+            if count >= max_items as usize {
+                break;
+            }
+            *out_items.add(count) = PlayerItemFfi { item_id, count: qty };
+            count += 1;
+        }
+        *out_count = count as u32;
+        true
+    } else {
+        *out_count = 0;
+        false
+    }
+}
+
+/// Fabrica un ítem consumiendo los recursos necesarios del inventario
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn xfactorvr_craft_item(
+    item_id: u32,
+    count: u32,
+) -> bool {
+    if count == 0 {
+        return false;
+    }
+
+    if let Ok(mut world) = game_bridge::get_simulation_world().write() {
+        match item_id {
+            // Engranaje de hierro: cuesta 2 planchas de hierro
+            game_bridge::ITEM_IRON_GEAR => {
+                let required = count * 2;
+                let plates = world.player_inventory.entry(game_bridge::ITEM_IRON_PLATE).or_insert(0);
+                if *plates >= required {
+                    *plates -= required;
+                    let gears = world.player_inventory.entry(game_bridge::ITEM_IRON_GEAR).or_insert(0);
+                    *gears += count;
+                    return true;
+                }
+            }
+            // Cinta transportadora: 1 plancha de hierro + 1 engranaje -> 2 cintas
+            game_bridge::ITEM_TRANSPORT_BELT => {
+                let required_plates = count;
+                let required_gears = count;
+                let plates = *world.player_inventory.get(&game_bridge::ITEM_IRON_PLATE).unwrap_or(&0);
+                let gears = *world.player_inventory.get(&game_bridge::ITEM_IRON_GEAR).unwrap_or(&0);
+                if plates >= required_plates && gears >= required_gears {
+                    *world.player_inventory.get_mut(&game_bridge::ITEM_IRON_PLATE).unwrap() -= required_plates;
+                    *world.player_inventory.get_mut(&game_bridge::ITEM_IRON_GEAR).unwrap() -= required_gears;
+                    let belts = world.player_inventory.entry(game_bridge::ITEM_TRANSPORT_BELT).or_insert(0);
+                    *belts += count * 2;
+                    return true;
+                }
+            }
+            // Minera eléctrica: 10 planchas + 5 engranajes + 3 circuitos
+            game_bridge::ITEM_MINING_DRILL => {
+                let required_plates = count * 10;
+                let required_gears = count * 5;
+                let plates = *world.player_inventory.get(&game_bridge::ITEM_IRON_PLATE).unwrap_or(&0);
+                let gears = *world.player_inventory.get(&game_bridge::ITEM_IRON_GEAR).unwrap_or(&0);
+                if plates >= required_plates && gears >= required_gears {
+                    *world.player_inventory.get_mut(&game_bridge::ITEM_IRON_PLATE).unwrap() -= required_plates;
+                    *world.player_inventory.get_mut(&game_bridge::ITEM_IRON_GEAR).unwrap() -= required_gears;
+                    let drills = world.player_inventory.entry(game_bridge::ITEM_MINING_DRILL).or_insert(0);
+                    *drills += count;
+                    return true;
+                }
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
+/// Obtiene los yacimientos de recursos del mapa para su renderizado en la mesa
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn xfactorvr_get_resource_patches(
+    out_patches: *mut ResourcePatchFfi,
+    max_patches: u32,
+    out_count: *mut u32,
+) -> bool {
+    if out_patches.is_null() || out_count.is_null() || max_patches == 0 {
+        return false;
+    }
+
+    if let Ok(world) = game_bridge::get_simulation_world().read() {
+        let count = world.patches.len().min(max_patches as usize);
+        for i in 0..count {
+            let p = &world.patches[i];
+            *out_patches.add(i) = ResourcePatchFfi {
+                item_type: p.item_type,
+                tile_x: p.tile_x,
+                tile_y: p.tile_y,
+                radius: p.radius,
+                remaining: p.remaining,
+            };
+        }
+        *out_count = count as u32;
+        true
+    } else {
+        *out_count = 0;
+        false
+    }
+}
+
+/// Conecta con el servidor RCON de Factorio
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn xfactorvr_connect_rcon(
+    host_ip: *const std::os::raw::c_char,
+    port: u16,
+    password: *const std::os::raw::c_char,
+) -> bool {
+    if host_ip.is_null() || password.is_null() {
+        return false;
+    }
+    let c_host = std::ffi::CStr::from_ptr(host_ip).to_string_lossy();
+    let c_pwd = std::ffi::CStr::from_ptr(password).to_string_lossy();
+    let addr = format!("{}:{}", c_host, port);
+
+    if let Ok(mut rcon) = game_bridge::get_rcon_client().lock() {
+        let success = rcon.connect(&addr, &c_pwd);
+        if let Ok(mut world) = game_bridge::get_simulation_world().write() {
+            world.is_connected_to_rcon = success;
+        }
+        success
+    } else {
+        false
+    }
+}
+
+/// Consulta si el puente RCON con Factorio está activo
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn xfactorvr_is_rcon_connected() -> bool {
+    if let Ok(world) = game_bridge::get_simulation_world().read() {
+        world.is_connected_to_rcon
+    } else {
+        false
     }
 }
 

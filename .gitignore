@@ -1,35 +1,38 @@
-# Gradle files
-.gradle/
+# Build and target artifacts
+target/
 build/
-.kotlin/
-
-# Local configuration file (sdk path, etc)
-local.properties
-
-# Log/OS Files
-*.log
-
-# Android Studio generated files and folders
-captures/
-.externalNativeBuild/
-.cxx/
-*.aab
+tmp/
 *.apk
-output-metadata.json
-
-# IntelliJ
-*.iml
-.idea/
-misc.xml
-deploymentTargetDropDown.xml
-render.experimental.xml
-
-# Keystore files
-*.jks
+*.so
+*.dylib
+*.a
 *.keystore
 
-# Google Services (e.g. APIs or Firebase)
-google-services.json
+# macOS files
+.DS_Store
 
-# Android Profiling
-*.hprof
+# Factorio Game Binaries & Data (Strict Copyright Protection - Steam Depot Downloaded in Pipeline)
+factorio/
+factorio_arm64/
+factorio_linux
+factorio-headless_arm64.tar.xz
+*.tar.xz
+*.tar.gz
+*.tar
+*.rar
+*.aria2
+
+# 3D Mod Assets and Raw Models (Downloaded during deployment/setup)
+factorio-3d-mod/
+*.glb
+*.gltf
+*.bin
+*.jpeg
+*.jpg
+*.png
+
+# Reference cloned repositories
+Generals-Zero-Hour-XR/
+
+# Local IDE & Cargo config
+.cargo/

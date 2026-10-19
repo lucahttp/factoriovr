@@ -1,0 +1,23 @@
+[package]
+name = "xfactorvr"
+version = "0.1.0"
+edition = "2021"
+description = "Factorio Tabletop Mixed Reality port for Pico 4 Ultra Standalone"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+glam = "0.29"
+object = { version = "0.36", default-features = false, features = ["read_core", "elf"] }
+log = "0.4"
+env_logger = "0.11"
+anyhow = "1.0"
+gltf = { version = "1.4", features = ["import", "utils", "names", "KHR_texture_transform", "KHR_materials_unlit", "KHR_materials_emissive_strength"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+glow = "0.14"
+
+[features]
+default = []
+openxr = []

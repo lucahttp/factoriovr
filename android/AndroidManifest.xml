@@ -1,0 +1,109 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="com.xfactorvr.tabletop"
+    android:versionCode="1"
+    android:versionName="1.0.0"
+    android:installLocation="auto">
+
+    <uses-sdk
+        android:minSdkVersion="29"
+        android:targetSdkVersion="34" />
+
+    <!-- Permisos OpenXR requeridos por el runtime de Pico OS / Snapdragon XR2 -->
+    <uses-permission android:name="org.khronos.openxr.permission.OPENXR" />
+    <uses-permission android:name="org.khronos.openxr.permission.OPENXR_SYSTEM" />
+
+    <!-- Permisos para almacenamiento y audio en Pico OS -->
+    <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" />
+    <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" />
+    <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE" />
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
+
+    <queries>
+        <intent>
+            <action android:name="org.khronos.openxr.OpenXRRuntimeService" />
+        </intent>
+        <intent>
+            <action android:name="org.khronos.openxr.OpenXRApiLayerService" />
+        </intent>
+    </queries>
+
+    <!-- Requerimientos de Realidad Virtual y Mixta para Pico 4 Ultra -->
+    <uses-feature
+        android:name="android.hardware.vr.headtracking"
+        android:required="true"
+        android:version="1" />
+    <uses-feature
+        android:name="android.software.vr.mode"
+        android:required="true" />
+    <uses-feature
+        android:name="pico.software.handtracking"
+        android:required="false" />
+
+    <application
+        android:allowBackup="false"
+        android:fullBackupContent="false"
+        android:hasCode="false"
+        android:hardwareAccelerated="true"
+        android:isGame="true"
+        android:label="XFactorVR Tabletop"
+        android:requestLegacyExternalStorage="true"
+        android:theme="@android:style/Theme.Black.NoTitleBar.Fullscreen">
+
+        <!-- Metadatos de la plataforma PICO para VR, Passthrough y Control/Manos -->
+        <meta-data
+            android:name="pvr.supportedDevices"
+            android:value="pico_4_ultra|pico_4|pico_neo3|pico_g3" />
+        <meta-data
+            android:name="pvr.app.type"
+            android:value="vr" />
+        <meta-data
+            android:name="pvr.app.inputType"
+            android:value="controller|hand" />
+        <meta-data
+            android:name="pvr.app.handtrackingSupport"
+            android:value="1" />
+        <meta-data
+            android:name="handtracking"
+            android:value="1" />
+        <meta-data
+            android:name="pvr.display.refreshrate"
+            android:value="90" />
+        <meta-data
+            android:name="com.pvr.see-through.supported"
+            android:value="true" />
+        <meta-data
+            android:name="pico_advance_interface"
+            android:value="true" />
+        <meta-data
+            android:name="enable_shared_context"
+            android:value="true" />
+
+        <activity
+            android:name="android.app.NativeActivity"
+            android:alwaysRetainTaskState="true"
+            android:configChanges="density|fontScale|keyboard|keyboardHidden|layoutDirection|locale|mcc|mnc|navigation|orientation|screenLayout|screenSize|smallestScreenSize|uiMode|touchscreen"
+            android:exported="true"
+            android:label="XFactorVR Tabletop"
+            android:launchMode="singleTask"
+            android:resizeableActivity="false"
+            android:screenOrientation="sensorLandscape">
+
+            <!-- Librería nativa que inicia OpenXR y lanza el motor -->
+            <meta-data
+                android:name="android.app.lib_name"
+                android:value="xfactorvr_launcher" />
+
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <!-- Categoría estándar de lanzador Android -->
+                <category android:name="android.intent.category.LAUNCHER" />
+                <!-- Categoría oficial de PICO VR Store / Library Launcher -->
+                <category android:name="com.picovr.intent.category.VR" />
+                <!-- Categoría estándar Khronos OpenXR -->
+                <category android:name="org.khronos.openxr.intent.category.IMMERSIVE_HMD" />
+            </intent-filter>
+        </activity>
+    </application>
+</manifest>

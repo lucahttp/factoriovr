@@ -527,3 +527,321 @@ control, `MainLoop+0x2b8` y `MainLoop+0x2c0`) y despues el
 `InLoadingGameBox`, en ese orden.
 
 
+
+## 12. La via oficial del motor tambien se atasca: por que (2026-10-20)
+
+Este apartado recoge la investigacion hecha porque la via **oficial** del motor
+(`--load-scenario`, `--load-game`, o el boton "Continue" del propio menu)
+se queda atascada **exactamente igual** que las vias manipuladas por el
+inyector. Con eso cambia el enfoque: el bloqueo no era de nuestro manipuleo
+de la pila de estados.
+
+### 12.1 Instrumentos nuevos
+
+* **`injector-linux/src/diagnostico.rs`** (nuevo): vuelca la pila de estados
+  del `AppManager` cada N ticks (`XFACTORVR_DIAG_PILA=1`,
+  `XFACTORVR_DIAG_CADA=N`). Los estados se identifican **por la tabla
+  virtual** (`_ZTV...` del `.symtab`), no llamando a `getStateType()`: en esa
+  pila hay punteros a estados ya destruidos y llamar a un metodo virtual
+  sobre uno de ellos **SIGSEGV** (suceso que paso al principio y por eso el
+  diagnostico es solo-lectura).
+* **`elfutils` (`eu-stack`) en el contenedor**: da la pila de todos los hilos
+  en segundos; `gdb` tarda 3 minutos en leer el DWARF de este binario de
+  261 MB (con `--readnever` arranca rapido pero ya no desenrolla las pilas).
+* **`xdotool`** + `imagemagick` + `x11-apps` en el contenedor: para poder
+  **conducir el menu del juego con el raton** (apartado 12.7).
+
+### 12.2 Lo que hace el motor con `--load-scenario` (pila de estados medida)
+
+Con el diagnostico del inyector (el motor oficial, sin tocar la pila):
+
+```
+diag: tick=1 t=0ms   estados=3
+diag:   [0] tipo=InMainMenu
+diag:   [1] tipo=InUpdater
+diag:   [2] tipo=InGenerateMapDialog
+diag: tick=2 t=7ms   estados=4
+diag:   [0] tipo=InMainMenu
+diag:   [1] tipo=InUpdater
+diag:   [2] tipo=InGenerateMapDialog
+diag:   [3] tipo=InCreatingGame          <-- el que carga el escenario
+        25.772 Applying migration: Base Mod: 2.0.0.lua
+diag: tick=6 t=94ms  estados=2
+diag:   [0] tipo=InMainMenu
+diag:   [1] tipo=InGame                  <-- FIN DE LA CARGA, sin mapa
+```
+
+O sea, el camino oficial del cliente grafico es:
+
+1. `InMainMenu` + `InUpdater` (el actualizador).
+2. El motor mete el dialogo de **"generar mapa"** (`InGenerateMapDialog`),
+   que es la via que usa el GUI cuando pulsas "New Game".
+3. Ese dialogo mete `InCreatingGame`, que es quien carga el escenario
+   (`level.dat`, scripts, migraciones).
+4. En cuanto la carga llega a la fase de scripts ("Applying migration:
+   Base Mod: 2.0.0.lua"), el motor **saca el dialogo y toda la pila** y deja
+   `[InMainMenu, InGame]`.
+
+Y un `InGame` sin vista de control (`GlobalContext+0x2c0 == NULL`) es un estado
+**muerto**: `InGame::process()` (AppManagerStates.cpp:82-94) sin la vista de
+control no crea el mapa, asi que el mapa no existe, el RCON no abre y el
+juego se queda pintando el menu para siempre.
+
+### 12.3 La correccion importante: el guardia de la seccion 11.3 estaba mal leido
+
+La seccion 11.3 de este ADR decia que `InLoadingGameBox::process()` mira el
+estado de **la cima** de la pila. **No es asi.** El codigo real
+(AppManagerStates.cpp:1674-1679, desensamblado a mano) es:
+
+```
+2b38c9c: cbz  w24, ...          ; si el cargador NO ha terminado, no hace nada
+2b38ca4: bl   AppManager::popState()      ; saca 2 estados
+2b38cb0: bl   AppManager::popState()
+2b38cb4: ldr  x20, [x19, #0x258] ; INICIO de la pila (no la cima)
+2b38cb8: ldr  x21, [x19, #0x260] ; fin de la pila
+2b38cc4: ldr  x0, [x20]         ; primer estado
+2b38ccc: ldr  x8, [x8, #0x40]   ; getStateType()
+2b38cd4: cmp  w0, #0x4          ; InGame?
+2b38cd8: b.eq <seguir>
+2b38cec: cmp  w0, #0x5 ... 6 ... 8   ; otros tipos que tambien valen
+2b38d28: b.ne <cancelar>       ; si no hay NINGUNO -> cancelar la carga
+```
+
+O sea: **cuando la carga termina, el motor saca 2 estados de la pila y exige
+que sobre algum estado de tipo 4 (`InGame`), 5, 6 u 8**. Si no queda ninguno,
+la carga se cancela.
+
+Y el motor **si** construye esa pila cuando el juego se carga desde el GUI:
+`InLoadGameDialog::process()` (AppManagerStates.cpp:1442-1521) hace, en este
+orden:
+
+1. `AppManager::popStateToMainMenu()` (AppManagerStates.cpp:1461)
+2. `operator new(16)` + vtable de `InGame` + `pushState(InGame)`
+   (AppManagerStates.cpp:1461-1466) — **el `InGame` del motor es un objeto de
+   16 bytes con solo la vtable, sin constructor**: exactamente el mismo
+   "fake" que crea el inyector.
+3. `pushState(X)` (AppManagerStates.cpp:1492)
+4. `operator new(...)` + `InLoadingGameBox::InLoadingGameBox(...)` +
+   `pushState(InLoadingGameBox)` (AppManagerStates.cpp:1464-1467)
+
+O sea, la pila buena es **`[InGame, X, InLoadingGameBox]`** (tres estados), y
+al sacar los 2 ultimos sobrevive el `InGame` (tipo 4) y la carga sigue.
+
+**Las vias de linea de comandos no construyen esa pila**: solo meten la caja
+de carga encima del menu. Medido con `--load-game`:
+
+```
+tick=23  [InMainMenu, InLoadingGameBox]   cargador=0x...  estado_cargador=0
+   26.179 Checksum for script __level__/control.lua: 3704017257
+tick=24  [InMainMenu, InLoadingGameBox]   cargador=0x...  estado_cargador=1
+tick=25  [InMainMenu, InGame]             <-- se cancela igualmente
+```
+
+### 12.4 No es el entorno de prueba (matriz de drivers)
+
+Se probo el mismo `--load-scenario base/xfv-nivel` con cuatro combinaciones
+de SDL/Mesa en el contenedor del banco:
+
+| combinacion                                   | ultima linea del log                   | RCON |
+|-----------------------------------------------|----------------------------------------|------|
+| x11 + zink + lavapipe (la del banco)          | `Applying migration: Base Mod: 2.0.0.lua` | no |
+| x11 + **sin zink** (GLX por software de Mesa)  | `Applying migration: Base Mod: 2.0.0.lua` | no |
+| x11 + zink + lavapipe **sin vsync**           | `Applying migration: Base Mod: 2.0.0.lua` | no |
+| **offscreen** (sin servidor X) + zink         | `Applying migration: Base Mod: 2.0.0.lua` | no |
+
+**Las cuatro se atascan en el mismo punto**, asi que el driver grafico no es
+la causa (ni Zink, ni lavapipe, ni el vsync, ni el servidor X). El tamano
+tampoco: a 320x180 el bucle corre a ~80 fps y se atasca igual.
+
+### 12.5 El headless carga el MISMO escenario sin problema
+
+Con el mismo `data/` y el mismo escenario:
+
+```
+$ ./bin/arm64/factorio-headless --config /factorio/config/config.ini \
+      --start-server-load-scenario base/xfv-nivel --rcon-port 27016 ...
+   0.278 Loading level.dat: 1413855 bytes.
+   0.315 Applying migration: Base Mod: 2.0.0.lua
+   0.584 Info ServerMultiplayerManager.cpp:809: updateTick(157301) changing state from(CreatingGame) to(InGame)
+   0.585 Info RemoteCommandProcessor.cpp:119: Starting RCON interface at IP ADDR:({0.0.0.0:27016})
+```
+
+El headless pasa por el **mismo** "Applying migration" y sigue hasta
+`InGame` + RCON en 0,58 s. Los datos son los mismos; lo que cambia es que el
+headless **no tiene GUI** y por tanto no pasa por
+`InGenerateMapDialog`/`InCreatingGame` ni por la pila de estados del GUI.
+
+### 12.6 El hilo del cargador desaparece
+
+Con `eu-stack` sobre el proceso atascado **no hay ningun hilo** en
+`ParallelScenarioLoader::doLoad` ni en `Scenario::loadFactory`: todos los
+hilos del motor estan ociosos (`WorkerThread::loop()`,
+`MapGenerationHelper::consumeTasks()`, `PackagePathAdapter::readFile()`) y el
+hilo principal esta en `MainLoop::run` -> `swapRenderBuffers()` ->
+`kopperSwapBuffersWithDamage()` (dentro de `libgallium`), esperando al
+rasterizador por software.
+
+Es decir: el hilo que carga el escenario **termina** (y el motor se queda con
+un `InGame` sin mapa), en vez de quedarse esperando.
+
+### 12.7 Ni siquiera el boton "Continue" del GUI funciona (conduciendo el menu con el raton)
+
+Con `xdotool` + una captura (`import -window root`) se ven los botones del
+menu: "Continue xfv-nivel" (verde, el de arriba), "Single player",
+"Multiplayer", "Map editor", "Settings", "Mods", "About", "Exit".
+
+Con un clic en "Continue" el motor carga el save **por su propia via del GUI**:
+
+```
+  45.986 Loading map /factorio/saves/xfv-nivel.zip: 495397 bytes.
+  45.986 Loading level.dat: 1035122 bytes.
+  46.001 Loading script.dat: 401 bytes.
+  46.004 Checksum for script __level__/control.lua: 2743417419
+```
+
+y la pila acaba igual: **`[InMainMenu, InGame]`**, sin mapa y sin RCON
+(`Starting RCON interface` = 0 veces en el log).
+
+**Conclusion:** en este entorno el cliente grafico **no** consigue cargar una
+partida por NINGUNA via (ni `--load-game`, ni `--load-scenario`, ni el boton
+"Continue" del propio menu).
+
+### 12.8 Lo que SI funciona: el modo pesado (`--heavy`)
+
+`--load-game ... --heavy` y `--load-scenario ... --heavy` **crean el mapa y lo
+hacen correr**:
+
+```
+  28.846 Heavy mode - tick 157301 finished
+  ...
+  63.239 Heavy mode - tick 158216 finished
+```
+
+(miles de ticks simulados). O sea: el motor **puede** crear el mapa y
+ejecutarlo aqui; lo que no llega a funcionar es el camino de un jugador.
+
+### 12.9 Otros dos bloqueos encontrados de paso
+
+* **`--load-scenario base/campaigns/tutorial/level-01` no es valido** por linea
+  de comandos: `Error CommandLineUtils.cpp:80: Invalid scenario level name`.
+  El CLI solo acepta escenarios, no niveles de campana. Por eso la prueba de
+  la campana tiene que hacerse con una **copia** del nivel puesta como
+  escenario (`base/xfv-nivel`).
+* **El actualizador mete un `InUpdaterLoginGui`**: al arrancar, el motor
+  empuja `InUpdater` y su dialogo de login de la cuenta Factorio, que es
+  modal y bloquea la pila de estados. Se quita con `check-updates=false` en el
+  `config.ini`. (Con el actualizador apagado, la pila queda
+  `[InMainMenu, InUpdater]` y el juego se queda en el menu.)
+
+## 13. Conclusion y siguiente paso
+
+1. **El bloqueo NO es del entorno grafico** (12.4) ni de los datos (12.5): el
+   motor se atasa en el mismo punto con zink, sin zink, sin vsync, en
+   offscreen y a 320x180.
+2. **El bloqueo NO es de nuestro inyector**: las vias oficiales del motor se
+   atascan igual (12.2, 12.7).
+3. **La causa concreta**: el motor cancela la carga cuando al terminarla no
+   queda en la pila ningun estado de tipo 4/5/6/8 (12.3). Las vias de linea de
+   comandos y el propio menu dejan la pila en `[InMainMenu, InGame]`, con un
+   `InGame` sin vista de control (`GlobalContext+0x2c0 == NULL`), que es un
+   estado muerto: no crea el mapa, no abre el RCON y no se queja.
+4. **El mapa si se puede crear y correr aqui** (12.8, modo pesado).
+5. **El headless va bien** (12.5): carga, crea el mapa y abre el RCON.
+
+**Lo que queda por hacer para el cliente grafico** es una de estas dos:
+
+* **A)** Que el inyector Monte la pila **exactamente** como lo hace
+  `InLoadGameDialog::process()`: `InGame` (16 bytes + vtable) -> estado `X` ->
+  `InLoadingGameBox`, y **ademas** panne la vista de control
+  (`GlobalContext+0x2c0`), que hoy no se crea en ninguna via y de la que
+  depende `InGame::process()`. La pista: el constructor del `GameView` es
+  `_ZN8GameViewC2ER4GameP6Player9NamedBoolI15IsSImulationTagEP18EngineFramebuffersS4_I17MuteWindSoundsTagE`
+  (necesita un `Game*` y un `Player*` de verdad, que solo crea el motor).
+* **B)** Usar el **headless** para la parte de servidor (carga + RCON, que ya
+  funciona) y el cliente grafico solo como visor.
+
+Mientras tanto, el inyector ya trae dos piezas nuevas que hacen falta para
+cualquiera de las dos:
+
+* `AppManager::startRconIfEnabled()` resuelta y llamada desde el hook de
+  render (`tick_rcon()`): es la **unica** via que tiene el motor para abrir
+  el RCON (la llama el `InLoadingGameBox::process()` cuando la carga
+  termina). Con el autostart por `createGame` se llega a llamarla, pero el
+  puerto no abre todavia porque el `RemoteCommandProcessor` todavia no esta
+  en marcha (hace falta que el mapa corra).
+* `injector-linux/src/diagnostico.rs`: el volcado de la pila de estados, que
+  es lo que ha permitido llegar hasta aqui.
+
+## 14. Avance final: el mapa SI se crea y el juego corre (2026-10-20)
+
+Con `XFACTORVR_ESTADO_INGAME=1` (el `InGame` de 16 bytes con la vtable
+encima de la caja de carga, que es exactamente como lo construye el propio
+motor en `InLoadGameDialog::process()`) **la carga se completa, el motor crea
+el mapa y el juego se pone a pintar el mapa**:
+
+```
+  30.327 Loading map /factorio/saves/client_test.zip: 523809 bytes.
+  30.338 Info Scenario.cpp:152: Map version 2.1.22-1
+  30.347 Checksum for script __level__/control.lua: 3704017257
+```
+
+y la captura de pantalla (`import -window root`) muestra el **mapa renderizado**
+con el minimapa, la barra de atajos, el inventario y el dialogo de bienvenida
+("Welcome to Factorio Freeplay. Your task is to launch a rocket into
+space..."). El juego aguanta mas de 2 minutos sin caerse.
+
+### 14.1 El crash que queda si NO se pone el `InGame`
+
+Sin `XFACTORVR_ESTADO_INGAME=1` el motor crea el mapa tambien, pero el juego
+peta a los ~36 ticks:
+
+```
+  32.070 Error CrashHandler.cpp:614: Received SIGSEGV
+  src/GameView.cpp (1813): render
+  src/Game.cpp (435): render
+  src/MainLoop.cpp (1539): render
+  src/MainLoop.cpp (728): mainLoopStep
+  36.300 Error CrashHandler.cpp:163: Map tick at moment of crash: 36
+```
+
+Es el `InGame` a medio construir (16 bytes, solo vtable) el que se queda
+colgado: `InGame::process()` (AppManagerStates.cpp:82-94) necesita la vista de
+control (`GlobalContext+0x2c0`) y, si no la encuentra, hace
+`popStateToMainMenu()` y el motor sigue llamando a su `process()` sobre
+memoria ya liberada. Con el `InGame` de verdad (el que crea el motor) no hay
+crash; con el del inyector, si.
+
+### 14.2 El RCON: como se abre y por que todavia no
+
+`AppManager::startRconIfEnabled()` (AppManager.cpp:662-674) es la unica via
+para abrir el RCON. La funcion:
+
+1. lee el **socket** de `GlobalContext+0x240` -> `+0x2348` (una
+   `std::string` tipo `"0.0.0.0:27015"`),
+2. lee la **password** de `+0x2428` (longitud) y `+0x2430` (puntero),
+3. y llama a `RemoteCommandProcessor::addInterface<RconInterface>(...)`.
+
+El inyector ya la resuelve y la llama (`tick_rcon()`, reintentando cada 30
+frames porque el `RemoteCommandProcessor` todavia no esta en marcha en el
+instante en que el motor empuja el `InGame`; el motor, en su flujo normal,
+tambien la llama en cada frame). El diagnostico nuevo (`diag: rcon:`) lee las
+dos cadenas para ver que hay puesto.
+
+**Pendiente**: en este entorno la cadena del socket sale **vacia/garbage**
+(aunque el parametro `--rcon-port 27015` este en la linea de comandos), y la
+clave `local-rcon-socket` del `config.ini` es para el **servidor de
+multiplayer del menu** ("Socket to host RCON when launching MP server from the
+menu"), no para el single player. Es el punto exacto donde hay que seguir:
+encontrar de donde saca el motor el puerto del RCON en single player (el
+`GameSettings` / la linea de comandos) y por que no llega a la cadena.
+
+### 14.3 Como queda el estado
+
+| via                                        | mapa | RCON | nota                                    |
+|--------------------------------------------|------|------|-----------------------------------------|
+| `--load-scenario` (oficial)                 | no   | no   | se cancela la carga (12.2)              |
+| `--load-game` (oficial)                     | no   | no   | se cancela la carga (12.3)              |
+| boton "Continue" del GUI (con xdotool)      | no   | no   | se cancela la carga (12.7)              |
+| `--load-scenario/--load-game --heavy`       | **si** | no | el motor crea el mapa y lo simula (12.8) |
+| inyector + `XFACTORVR_ESTADO_INGAME=1`     | **si** | casi | el juego corre; falta que el RCON abra |
+| headless (`--start-server-load-scenario`)   | **si** | **si** | funciona perfecto (12.5)               |

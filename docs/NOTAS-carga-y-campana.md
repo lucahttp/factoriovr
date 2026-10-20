@@ -67,3 +67,51 @@ podman exec xfactorvr-client bash -c '
 # el RCON deberia abrir; se comprueba con:
 python3 scripts/rcon_probe.py 127.0.0.1 27015 xfactorvr "/silent-command game.print('hola')"
 ```
+
+## 6. Hallazgo del 2026-10-20 (tarde): el RCON es una función de SERVIDOR
+
+En el `--help` del cliente, `--rcon-port` y `--rcon-password` aparecen bajo **"Server
+options"**, no como opciones de single player. Y el `config.ini` solo tiene
+`local-rcon-socket` / `local-rcon-password`, que son "when launching MP server from the
+menu". **El cliente gráfico en single player no tiene RCON**: por eso el inyector no
+consigue que abra el puerto, y no es un bug del inyector.
+
+### La arquitectura que encaja con todo
+
+```
+ Factorio headless (servidor)                 <- simulación + campaña + RCON + mod puente
+   · arranca el escenario de campaña: --start-server-load-scenario base/<campaña>
+   · RCON abierto (es función de servidor) y el mod puente ya talking
+   · el juego corre SIN jugador -> el escenario muere:
+       "__level__/control.lua:132: attempt to index field '?'"
+          (el nivel usa game.players[1] en su init)
+        |
+        | el cliente grafico SE CONECTA al servidor: --mp-connect 127.0.0.1:34197
+        v
+ Factorio cliente (graficos, ARM64, Mesa+Zink)  <- crea el JUGADOR y pinta el mundo 3D
+   · con el inyector puesto: el mod 3D dibuja los modelos y la camara deformada
+```
+
+El cliente conectado aporta el **jugador real** que la campaña exige, y el servidor aporta
+el **RCON** por el que nuestra app lee el estado y manda ordenes. Los dos procesos son el
+mismo juego 2.1.22, asi que el estado y las ordenes son los mismos.
+
+### Estado de la prueba MP (en curso)
+
+- El servidor con `--start-server-load-scenario` arranca, llega a InGame y abre el RCON: OK.
+- El cliente con `--mp-connect` todavia no entra: hay que darle su propio arbol de datos
+  (el `.lock` y la deducci��n de `data/` fallan cuando se copia el binario). Es un detalle de
+  rutas, no de logica: el cliente necesita su directorio con `bin/arm64/factorio` y `data/`
+  como symlink, y hay que comprobar que deduce bien la raiz.
+- El inyector, ademas, se activa en CUALQUIER proceso por el que pase LD_PRELOAD
+  (grep, tail, cut...): hay que restringirlo al ejecutable de Factorio.
+
+### Ideas que quedaron descartadas con evidencia
+
+| Idea | Resultado |
+|---|---|
+| Forzar `AppManager::isAppInMenu()` a false | refutado con breakpoints: no es la puerta |
+| Que el entorno grafico fuera el problema | refutado: zink, GLX software, sin vsync y offscreen fallan igual; el headless va bien |
+| Que fuera el inyector | refutado: el control sin inyector se atasca igual |
+| Que fuera el OOM | era parte: con 4 GB lo mataba; con 6 GB sobrevive, pero sigue atascado |
+| Que el RCON se pudiera abrir en single player | descartado: el RCON es de servidor |

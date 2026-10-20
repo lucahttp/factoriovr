@@ -264,7 +264,7 @@ pub fn instalar(destino: u64, hook: u64, forzar: Option<Estilo>) -> Result<Detou
     }
     // Diagnostico: volcar los bytes reales del parche y las direcciones, para
     // poder comprobar a mano el codigo que se va a ejecutar.
-    {
+    if std::env::var("XFACTORVR_HOOK_TRACE").as_deref() == Ok("1") {
         let mut hex = String::with_capacity(parche.len() * 2);
         for b in &parche {
             hex.push_str(&format!("{:02x}", b));

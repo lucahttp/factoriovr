@@ -62,10 +62,11 @@ HOOKS = {
         "nota": "prepara los recursos antes de dibujar",
     },
     "GAME_RENDERER_RENDER_INTERNAL": {
+        "simbolo_exacto": ["GameRenderer::renderInternal(bool)"],
         "simbolo": ["GameRenderer::renderInternal(bool)::$_0>::_M_invoke"],
-        "nota": ("en 2.1.22 GameRenderer::renderInternal(bool) ya no es una "
-                 "funcion out-of-line: su cuerpo quedo outlining en la lambda "
-                 "que recibe el DrawQueue"),
+        "nota": ("en el cliente de 2.1.22 sigue siendo una funcion; en el "
+                 "build headless esta inlinada y solo queda la lambda que "
+                 "recibe el DrawQueue (de ahi el segundo nombre de busqueda)"),
     },
     "RP_CENTER_ON": {
         "simbolo": ["RenderParameters::centerOn("],
@@ -229,6 +230,18 @@ class Elf:
                 return datos
         return None
 
+    def simbolos_exactos(self, fragmento):
+        """Simbolos cuyo nombre des-mangled es exactamente `fragmento`.
+
+        Se admite tambien el sufijo " const" (metodo const). Sirve para no
+        confuse una funcion con la lambda que lleva su mismo nombre.
+        """
+        return [
+            (a, n)
+            for a, n, _t in self.symbols
+            if n == fragmento or n == fragmento + " const"
+        ]
+
     def simbolos_con(self, fragmento):
         """Simbolos cuyo nombre des-mangled contiene `fragmento`.
 
@@ -288,7 +301,13 @@ def main():
     tabla = {}
     for hook, spec in HOOKS.items():
         encontrados = []
+        for frag in spec.get("simbolo_exacto", []):
+            encontrados = elf.simbolos_exactos(frag)
+            if encontrados:
+                break
         for frag in spec.get("simbolo", []):
+            if encontrados:
+                break
             for addr, nombre in elf.simbolos_con(frag):
                 encontrados.append((addr, nombre))
             if encontrados:

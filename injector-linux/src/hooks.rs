@@ -31,6 +31,9 @@ static DEBUG: AtomicU64 = AtomicU64::new(1);
 /// el fallo esta en el trampolin o en el hook).
 static NOCALL: AtomicU64 = AtomicU64::new(0);
 
+/// Traza de cada entrada al hook (diagnostico).
+static TRACE: AtomicU64 = AtomicU64::new(0);
+
 /// Funcion hooked: `GameRenderer::render()`.
 ///
 /// Se exporta con `#[no_mangle]` para poder pedir su direccion REAL de
@@ -47,8 +50,10 @@ pub extern "C" fn xfv_hook_render(this: *mut c_void) {
 /// Cuerpo del hook.
 extern "C" fn hook_render(this: *mut c_void) {
     // Traza minima de la entrada (diagnostico): se escribe con write(2) para
-    // no depender de nada mas.
-    crate::log::escribir_stderr(b"[xfv] hook: entrada\n");
+    // no depender de nada mas. Solo con XFACTORVR_HOOK_TRACE=1.
+    if TRACE.load(Ordering::Relaxed) == 1 {
+        crate::log::escribir_stderr(b"[xfv] hook: entrada\n");
+    }
     let n = FRAMES.fetch_add(1, Ordering::Relaxed) + 1;
 
     if DEBUG.load(Ordering::Relaxed) == 1 {
@@ -122,6 +127,12 @@ pub fn instalar() {
         Err(_) => false,
     };
     NOCALL.store(if nocall { 1 } else { 0 }, Ordering::Relaxed);
+
+    let trace = match std::env::var("XFACTORVR_HOOK_TRACE") {
+        Ok(v) => v != "0",
+        Err(_) => false,
+    };
+    TRACE.store(if trace { 1 } else { 0 }, Ordering::Relaxed);
 
     let objetivo = match std::env::var("XFACTORVR_HOOK_TARGET") {
         Ok(v) if !v.is_empty() => v,

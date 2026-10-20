@@ -15,6 +15,7 @@ tmp/
 factorio/
 factorio_arm64/
 factorio_linux
+factorio_linux_arm64/
 factorio-headless_arm64.tar.xz
 *.tar.xz
 *.tar.gz
@@ -38,3 +39,11 @@ Generals-Zero-Hour-XR/
 .cargo/
 __pycache__/
 *.pyc
+
+# Cliente grafico ARM64 descargado (2 GB, no va al repo)
+factorio_client_arm64/
+# Artefactos pesados generados
+build/factorio_stripped.elf
+build/factorio_assets/
+build/*.apk
+tmp/

@@ -54,10 +54,16 @@ def main():
         del args[i:i + 2]
 
     if len(args) >= 2 and args[0] == "--file":
-        if len(args) < 3:
+        if len(args) < 4:
             print(__doc__)
             return 2
-        host, port, password = "127.0.0.1", int(args[2]), args[3]
+        # Se aceptan las dos formas:
+        #   --file <ruta> <puerto> <password>          (host 127.0.0.1)
+        #   --file <ruta> <host> <puerto> <password>
+        if len(args) >= 5 and args[2].count(".") == 3:
+            host, port, password = args[2], int(args[3]), args[4]
+        else:
+            host, port, password = "127.0.0.1", int(args[2]), args[3]
         with open(args[1], encoding="utf-8") as fh:
             commands = [line.rstrip("\n") for line in fh if line.strip()]
     elif len(args) >= 4:

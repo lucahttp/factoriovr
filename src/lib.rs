@@ -322,6 +322,45 @@ pub unsafe extern "C" fn xfactorvr_mine_entity(
     }
 }
 
+/// Mueve al JUGADOR REAL del juego a una posicion.
+///
+/// En la campana el escenario exige un jugador (usa game.players[1]) y las
+/// ramas finales piden acciones reales (abrir el pecio, coger piezas). Desde
+/// VR el jugador se mueve con el control izquierdo: esto es lo que le lleva
+/// al sitio que se ha点了.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn xfactorvr_teleport_player(tile_x: f32, tile_y: f32) -> bool {
+    let ok = if let Ok(mut rcon) = game_bridge::get_rcon_client().lock() {
+        let cmd = format!(
+            "/silent-command remote.call('xfactorvr', 'teleport_player', {:.2}, {:.2})",
+            tile_x, tile_y
+        );
+        rcon.execute(&cmd);
+        true
+    } else {
+        false
+    };
+    ok
+}
+
+/// Interactua con una entidad: abre su GUI y le recoge el contenido.
+///
+/// Es el equivalente a hacer clic con el raton: abrir el pecio del nivel de
+/// campana, coger las piezas, activar una maquina.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn xfactorvr_interact_entity(tile_x: f32, tile_y: f32) -> bool {
+    if let Ok(mut rcon) = game_bridge::get_rcon_client().lock() {
+        let cmd = format!(
+            "/silent-command remote.call('xfactorvr', 'interact_entity', {:.2}, {:.2})",
+            tile_x, tile_y
+        );
+        rcon.execute(&cmd);
+        true
+    } else {
+        false
+    }
+}
+
 /// Actualiza el ciclo de simulación y animaciones continuas de las entidades vivas
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn xfactorvr_update_simulation(delta_time: f32) {

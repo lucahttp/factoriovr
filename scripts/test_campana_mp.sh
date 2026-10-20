@@ -337,6 +337,10 @@ in_container "cat > '$CMDS_A' <<'CMDS'
 /silent-command rcon.print('nombre='..tostring(game.players[1] and game.players[1].name))
 /silent-command remote.call('xfactorvr', 'get_world_snapshot', 16, 0, 0)
 /silent-command remote.call('xfactorvr', 'get_world_snapshot', 16, 0, 0)
+/silent-command remote.call('xfactorvr', 'teleport_player', 0, 0)
+/silent-command remote.call('xfactorvr', 'teleport_player', 0, 0)
+/silent-command remote.call('xfactorvr', 'interact_entity', 0, 0)
+/silent-command remote.call('xfactorvr', 'interact_entity', 0, 0)
 CMDS"
 
 in_container "cat > '$CMDS_B' <<'CMDS'
@@ -398,6 +402,19 @@ case "$SNAPSHOT" in
         ok "el mod puente responde por RCON con el estado del mundo ($n_ent entidades)"
         ;;
     *) fail "el mod puente no devolvio la instantanea del mundo" ;;
+esac
+
+# 4d. el jugador se puede mover e interactuar (lo que pide el final del nivel)
+TELEPORT="$(valor_de "/silent-command remote.call('xfactorvr', 'teleport_player'" "$SALIDA_A")"
+INTERACT="$(valor_de "/silent-command remote.call('xfactorvr', 'interact_entity'" "$SALIDA_A")"
+case "$TELEPORT" in
+    # El mod responde con rcon.print("OK") y ademas devuelve true; vale cualquiera.
+    *true*|*OK*) ok "el jugador real se teletransporta (teleport_player)" ;;
+    *) fail "teleport_player no devolvio OK (obtenido: ${TELEPORT:-vacio})" ;;
+esac
+case "$INTERACT" in
+    *true*|*OK*) ok "el jugador real interactua con entidades (interact_entity)" ;;
+    *) fail "interact_entity no devolvio true (obtenido: ${INTERACT:-vacio})" ;;
 esac
 
 # --------------------------------------------------------------------------

@@ -709,6 +709,96 @@ remote.add_interface("xfactorvr", {
         return 0
     end,
 
+    -- Mueve al JUGADOR REAL a una posicion.
+    --
+    -- En la campana el escenario exige un jugador (usa game.players[1]) y las
+    -- ramas finales piden acciones reales: abrir el pecio, coger piezas. Desde
+    -- VR el jugador se mueve con el control izquierdo, asi que el mod hace
+    -- dePiernas: teleport() coloca al jugador donde toca.
+    teleport_player = function(x, y)
+        local p = real_player()
+        if not p then
+            rcon.print("ERR|no_player")
+            return false
+        end
+        local ok, err = pcall(function()
+            p.teleport({ x = x, y = y })
+        end)
+        if not ok then
+            rcon.print("ERR|teleport")
+            return false
+        end
+        rcon.print("OK")
+        return true
+    end,
+
+    -- Interactua con una entidad: abre su GUI (abrir el pecio), le coje
+    -- piezas, la activa. Es lo que usa el jugador con el raton.
+    interact_entity = function(x, y)
+        local surface = game.surfaces[1]
+        local p = real_player()
+        if not surface or not p then
+            rcon.print("ERR|no_player")
+            return false
+        end
+
+        local found = surface.find_entities_filtered({
+            position = { x, y },
+            radius = 1.5,
+        })
+        if #found == 0 then
+            rcon.print("ERR|no_entity")
+            return false
+        end
+
+        -- La entidad mas cercana al punto.
+        local mejor, mejor_dist = nil, nil
+        for _, e in ipairs(found) do
+            if e.valid then
+                local dx = e.position.x - x
+                local dy = e.position.y - y
+                local d = dx * dx + dy * dy
+                if not mejor_dist or d < mejor_dist then
+                    mejor, mejor_dist = e, d
+                end
+            end
+        end
+        if not mejor then
+            rcon.print("ERR|no_entity")
+            return false
+        end
+
+        -- `opened` es lo que el juego usa para "tener abierto" el GUI de una
+        -- entidad. Si la entidad tiene inventario, se le recoge antes.
+        local ok_open, err_open = pcall(function()
+            p.opened = mejor
+        end)
+        if not ok_open then
+            rcon.print("ERR|open")
+            return false
+        end
+
+        -- Si tiene inventario con contenido, se le coge al jugador.
+        local cogido = 0
+        local ok_out, out_inv = pcall(function() return mejor.get_output_inventory() end)
+        if ok_out and out_inv then
+            local ok_contents, contents = pcall(function() return out_inv.get_contents() end)
+            if ok_contents and contents then
+                for name, value in pairs(contents) do
+                    local amount = value
+                    if type(value) == "table" then amount = value.count end
+                    if type(amount) == "number" and amount > 0 then
+                        inv_add(name, amount)
+                        cogido = cogido + amount
+                    end
+                end
+            end
+        end
+
+        rcon.print("OK|" .. tostring(cogido))
+        return true
+    end,
+
     -- Inventario completo del jugador en el formato compacto del protocolo.
     get_inventory = function()
         local items = {}

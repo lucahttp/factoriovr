@@ -88,7 +88,6 @@ impl ElfImage {
         f.read_exact(&mut shdrs)?;
 
         struct Sh {
-            name_off: u32,
             kind: u32,
             offset: u64,
             size: u64,
@@ -102,7 +101,6 @@ impl ElfImage {
                 return Err(io::Error::new(io::ErrorKind::InvalidData, "shdr corto"));
             }
             secs.push(Sh {
-                name_off: u32::from_le_bytes(s[0..4].try_into().unwrap_or([0; 4])),
                 kind: u32::from_le_bytes(s[4..8].try_into().unwrap_or([0; 4])),
                 offset: u64::from_le_bytes(s[0x18..0x20].try_into().unwrap_or([0; 8])),
                 size: u64::from_le_bytes(s[0x20..0x28].try_into().unwrap_or([0; 8])),

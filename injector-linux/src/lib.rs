@@ -17,6 +17,7 @@
 //!
 //! Solo std: ni una dependencia externa.
 
+pub mod autostart;
 pub mod demangle;
 pub mod detour;
 pub mod elf;

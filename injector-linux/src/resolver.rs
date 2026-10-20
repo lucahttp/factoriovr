@@ -107,6 +107,8 @@ pub struct Resuelto {
     pub mangled: String,
     /// Nombre legible ("GameRenderer::render").
     pub legible: String,
+    /// Nombre cualificado sin argumentos ("GameRenderer::render").
+    pub qualified: String,
     /// Direccion real en memoria.
     pub direccion: u64,
     /// Tamano del simbolo en bytes (0 si el ELF no lo dice).
@@ -152,6 +154,35 @@ impl Simbolos {
             return Some(Resuelto {
                 mangled: s.name.clone(),
                 legible: d.full,
+                qualified: d.qualified,
+                direccion,
+                tamano: s.size,
+            });
+        }
+        None
+    }
+
+    /// Resuelve un simbolo por su nombre MANGLED exacto.
+    ///
+    /// Es la via sin ambiguedad para los constructores de C++: el nombre
+    /// des-mangled no distingue sobrecargas (tres constructores se llaman
+    /// "ScenarioExecutionContext::ScenarioExecutionContext"), pero el nombre
+    /// mangled si. Se usa para llamar a funciones internas del motor con la
+    /// firma exacta (ver el modulo `autostart`).
+    pub fn resolver_exacto(&self, mangled: &str) -> Option<Resuelto> {
+        for s in &self.imagen.symbols {
+            if s.name != mangled {
+                continue;
+            }
+            let (legible, qualified) = match demangle::demangle(&s.name) {
+                Some(d) => (d.full, d.qualified),
+                None => (mangled.to_string(), mangled.to_string()),
+            };
+            let direccion = self.load_bias.wrapping_add(s.value);
+            return Some(Resuelto {
+                mangled: s.name.clone(),
+                legible,
+                qualified,
                 direccion,
                 tamano: s.size,
             });

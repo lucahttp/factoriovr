@@ -453,8 +453,18 @@ fn montar_trampolin(destino: u64, original: &[u8], bytes: usize) -> Result<u64, 
     unsafe {
         std::ptr::copy_nonoverlapping(bloque.as_ptr(), addr as *mut u8, bloque.len());
         // La pagina se deja en RWX: el codigo tiene que ser ejecutable.
-        if mprotect(addr as *mut c_void, PAGINA, PROT_READ | PROT_WRITE | PROT_EXEC) != 0 {
-            return Err(Error::Sistema("mprotect del trampolin fallo".into()));
+        //
+        // `mprotect` exige que la direccion este alineada a pagina, y aqui
+        // `addr` es `base + usado`: el segundo trampolin de la pagina empieza
+        // en `base + 32`, que no esta alineado, y `mprotect` fallaria con
+        // EINVAL. Se protege la BASE de la pagina, no el trampolin.
+        let base_pagina = TRAMPOLIN_BASE.load(std::sync::atomic::Ordering::SeqCst) as *mut c_void;
+        if mprotect(base_pagina, PAGINA, PROT_READ | PROT_WRITE | PROT_EXEC) != 0 {
+            return Err(Error::Sistema(format!(
+                "mprotect de la pagina de trampolines (0x{:x}) fallo: {}",
+                base_pagina as usize,
+                io::Error::last_os_error()
+            )));
         }
         limpiar_cache(addr as *mut c_void, (addr + bloque.len() as u64) as *mut c_void);
     }

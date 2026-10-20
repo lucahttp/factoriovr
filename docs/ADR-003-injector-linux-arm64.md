@@ -1,6 +1,6 @@
 # ADR-003 — Inyector LD_PRELOAD para Factorio 2.1.22 ARM64 (Linux)
 
-- **Estado**: aceptado (implementado en `injector-linux/`)
+- **Estado**: aceptado (implementado y **validado** en `injector-linux/`)
 - **Fecha**: 2026-10-19
 - **Contexto**: port del "mod 3D" de GDani31 (`factorio-3d-mod`) de Windows a
   Linux ARM64, para correr dentro del visor Android con Mesa+Zink.
@@ -16,9 +16,8 @@ El upstream (Windows) engancha el motor con una DLL que:
    actualización, cae a un **RVA de reserva** (`src/offsets.rs`).
 
 En Linux ARM64 no hay PDB, pero el problema es menor: **el motor no va
-stripeado**. `build/factorio_stripped.elf` (copia del motor 2.1.22 sin debug
-info) conserva el `.symtab` con **148.802 símbolos C++ con nombre**, de los
-que **94.821 son funciones** (`STT_FUNC`).
+stripeado**. Su `.symtab` conserva **94.946 símbolos C++ con nombre** (de los
+que 94.821 son funciones en el build headless y 94.939 en el cliente).
 
 | | Windows (upstream) | Linux ARM64 (este ADR) |
 |---|---|---|
@@ -57,7 +56,7 @@ La forma canónica de AArch64 para saltar a una dirección de 64 bits es
         br   x16                 ; salta ahi
 ```
 
-`LDR (literal, 64 bits)` tiene la codificacion `0x58000000 | (imm19 << 5) | Rt`
+`LDR (literal, 64 bits)` tiene la codificación `0x58000000 | (imm19 << 5) | Rt`
 y `BR Xn` es `0xD61F0000 | (Rn << 5)`.
 
 ### 2.2 Los dos parches que usa el inyector
@@ -73,7 +72,7 @@ destino+4:  br   x16            ; 0xD61F0200
 
 - Solo se **reubican 8 bytes** (2 instrucciones) del original.
 - Exige que el literal esté a menos de **1 MB** (alcance de `LDR` PC-relativo:
-  `imm19` con signo × 4 → ±2 MB).
+  `imm19` con signo × 4 → ±1 MB).
 - El literal se reserva en un pool de 64 entradas (`static LITERALES:
   [AtomicU64; 64]` en la `.so`): su dirección es estable de por vida y su
   contenido se escribe al instalar el detour.
@@ -103,7 +102,43 @@ caso contrario. Se puede forzar con `XFACTORVR_HOOK_PATCH=corto|largo`.
 > inevitable; por eso el parche corto necesita el pool en nuestra `.so` y el
 > largo lo lleva dentro.
 
-### 2.3 El trampolín
+### 2.3 Reubicar el bloque: el problema de las instrucciones PC-relativas
+
+Al copiar el principio de una función a otro sitio, las instrucciones que
+calculan direcciones relativas al PC dejan de apuntar a lo mismo. En el
+motor real esto **pasa en el primer frame**: el prólogo de
+`GameRenderer::render()` es
+
+```asm
+17837e0: stp  x29, x30, [sp, #-0x20]!
+17837e4: stp  x20, x19, [sp, #0x10]
+17837e8: mov  x29, sp
+17837ec: adrp x8, 0x3eba000        <-- PC-relativo
+```
+
+El `adrp` de la cuarta instrucción apunta a un global del juego. Copiada tal
+cual al trampolín apuntaría a otra página ✗ (y el juego crashea al primer
+frame).
+
+Por eso el trampolín **reescribe** las instrucciones PC-relativas para que
+apunten al mismo destino desde su nueva dirección:
+
+| Instrucción | Corrección | Alcance |
+|---|---|---|
+| `adrp Xd, pagina` | se recalcula `imm21` (21 bits) | ±4 GB |
+| `adr Xd, etiqueta` | se recalcula `imm21` (21 bits) | ±1 MB |
+| `ldr`/`prfm` de literal | si el literal está **dentro** del bloque reubicado se mantiene el desplazamiento; si está fuera, se recalcula `imm19` | ±1 MB |
+
+Si algún destino queda fuera de alcance, el inyector **renuncia** (error
+claro) en vez de generar código roto.
+
+> **Trampa (la que costó el crash)**: `imm21` son **21 bits**, no 19. Con la
+> máscara equivocada (`0x1_FFFF` = 17 bits, o `0x7_FFFF` = 19) el `adrp`
+> reubicado apuntaba a una página equivocada y el juego moría con SIGSEGV en
+> el primer frame, con un PC de salto en la pila. La máscara correcta es
+> `0x1F_FFFF`, y el `immhi` se limita a 19 bits (`0x7_FFFF`) al re-codificar.
+
+### 2.4 El trampolín
 
 Página mapeada con `PROT_READ|PROT_WRITE|PROT_EXEC` (una sola para todos los
 detours, con un contador):
@@ -118,9 +153,17 @@ trampolin+N+8: .quad <destino + N>            ; vuelta al original
 El hook llama al trampolín con un `bl` normal, así que `x30` (lr) apunta a la
 instrucción siguiente del hook; el original termina con su `ret` y vuelve al
 hook, que a su vez retorna al juego. `x16`/`x17` son registros temporales
- según la AAPCS64: se pueden machacar sin romper la convención.
+según la AAPCS64: se pueden machacar sin romper la convención.
 
-### 2.4 Renunciar antes de corromper
+**Dónde vive el trampolín importa**: el `adrp` reubicado solo se puede
+corregir si el trampolín está a menos de 4 GB del código original. Como el
+motor ocupa ~768 MB de dirección virtual contiguos, una pista de `mmap` a
+2 MB cae dentro de su mapa; con una pista mayor (16 MB, 64 MB, 256 MB, 1 GB)
+el kernel coloca la página en el hueco libre **más cercano** (a unos pocos
+cientos de MB) y la corrección cabe ✓. El inyector prueba varias pistas y
+solo acepta una que quede a menos de 2 GB.
+
+### 2.5 Renunciar antes de corromper
 
 Antes de escribir nada se comprueba que **todas** las instrucciones a reubicar
 sean reubicables. Se rechaza (y se devuelve un error claro, sin parchear) si
@@ -128,8 +171,6 @@ aparece:
 
 | Patrón | Por qué no se puede reubicar |
 |---|---|
-| `ADR`, `ADRP` | calculan una dirección relativa al PC |
-| `LDR` de literal, `PRFM` de literal | leen un dato relativo al PC |
 | `B`, `BL` | salto relativo |
 | `B.cond` | salto condicional relativo |
 | `CBZ`/`CBNZ`, `TBZ`/`TBNZ` | saltos relativos |
@@ -139,24 +180,36 @@ aparece:
 Además, si la función es **más corta que el parche** (8 o 16 bytes), el
 inyector **renuncia**: se necesita el bloque original entero para reubicarlo.
 Hay funciones reales del motor en ese caso, por ejemplo
-`Entity::getDirection() const` (0x16f3068) son solo 8 bytes
-(`mov w0, wzr` / `ret`).
+`Entity::getDirection() const` (0x16f3068 en el build headless) son solo
+8 bytes (`mov w0, wzr` / `ret`).
 
-### 2.5 Permisos y coherencia de caché
+### 2.6 Permisos y coherencia de caché
 
 1. Se localizan las páginas que cubren el parche con `/proc/self/maps`.
 2. `mprotect(paginas, PROT_READ|PROT_WRITE|PROT_EXEC)` (la página original es
    `r-x`).
 3. Se escriben los bytes del parche.
-4. `__clear_cache(inicio, fin)` — en ARM64 la caché de instrucciones y la de
-   datos **no son coherentes** entre sí: sin esta llamada la CPU puede seguir
-   ejecutando los bytes viejos.
+4. Se **invalida la caché de instrucciones**: en ARM64 la I-cache y la D-cache
+   **no son coherentes** entre sí. glibc **no exporta** `__clear_cache` en
+   aarch64 (es un símbolo de compiler-rt), así que se hace a mano con la
+   secuencia estándar (la misma que usan los motores JIT):
+
+   ```asm
+   dc cvau, <linea>      ; limpia la D-cache hasta el punto de unicidad
+   dsb ish               ; que la limpieza se complete
+   ic ivau, <linea>      ; invalida la I-cache
+   dsb ish
+   isb                   ; vacia la tuberia de instrucciones
+   ```
+
+   (Linux deja el bit `SCTLR_EL1.UCI` activo, así que `dc cvau` está permitido
+   en modo usuario.)
 5. Se restauran los permisos originales (`r-x`).
 
-### 2.6 Pointer authentication (PAC): por qué esto sigue siendo transparente
+### 2.7 Pointer authentication (PAC): por qué esto sigue siendo transparente
 
-El motor ARM64 **sí usa PAC**: 2.602 `paciasp` y 3.264 `autiasp` en el binario
-(contados sobre el binario completo). La convención observada en `_fini` es:
+El motor ARM64 **sí usa PAC**: 2.602 `paciasp` y 3.264 `autiasp` en el binario.
+La convención observada en `_fini` es:
 
 ```asm
 _fini:
@@ -182,12 +235,10 @@ Nuestro trampolín reproduce eso exactamente:
   sin parchear.
 
 Único matiz: durante la ejecución del original, `lr` contiene la dirección de
-retorno *dentro del hook* en vez de la del juego. Solo affects código que
+retorno *dentro del hook* en vez de la del juego. Solo afecta a código que
 leyese `lr` dentro de la función original (prácticamente inexistente).
 
-`GameRenderer::render()` (el objetivo del hook de prueba) **no** usa PAC:
-su prólogo es `sub sp, sp, #0x70` / `stp x29, x30, [sp, #0x20]` y su epílogo
-un `ret` normal.
+`GameRenderer::render()` (el objetivo del hook de prueba) **no** usa PAC.
 
 ---
 
@@ -211,8 +262,8 @@ ejecutable principal y llega con `dlpi_name == ""`. De ahí sale:
 - Cabecera ELF64 (64 bytes) → `e_shoff`, `e_shentsize`, `e_shnum`.
 - Tabla de cabeceras de sección → se busca `.symtab` (`SHT_SYMTAB`) y su
   `.strtab` enlazada por `sh_link`.
-- Se leen **solo** los rangos de `.symtab` y `.strtab` (3,5 MB y 1 MB), no el
-  fichero entero (260 MB).
+- Se leen **solo** los rangos de `.symtab` y `.strtab`, no el fichero entero
+  (260 MB).
 - Se filtran los símbolos `STT_FUNC` definidos (`st_shndx != SHN_UNDEF`).
 
 ### 3.3 Des-mangling (ABI Itanium)
@@ -235,14 +286,15 @@ construye siempre con nombres literales, así que es exacto.
 
 Resultado: `GameRenderer::render()` — idéntico al formato de `nm -C`.
 
-### 3.4 Buscar sin des-manglear 94.821 símbolos
+### 3.4 Buscar sin des-manglear 94.939 símbolos
 
 Des-manglear todo en cada arranque sería lento. Se hace un **pre-filtrado
 barato**: el nombre mangled contiene literalmente los trozos del nombre
 buscado (`_ZN12GameRenderer6renderEv` contiene "GameRenderer" y "render"), y
 solo se des-manglean los candidatos. La coincidencia final es **exacta** sobre
 el nombre cualificado (`Owner::metodo`), lo que además evita el error clásico
-de `Turret::draw` ↔ `AmmoTurret::draw`.
+de `Turret::draw` ↔ `AmmoTurret::draw` (la búsqueda exige que el nombre de la
+clase no esté pegado a otro).
 
 Ejemplo real (`cargo run --example parse_elf`):
 
@@ -266,52 +318,66 @@ Las direcciones coinciden **exactamente** con las de `nm -C` ✓.
 Regenerada con:
 
 ```bash
-python3 scripts/resolve_hooks.py --elf build/factorio_stripped.elf \
-        --json build/hooks_2.1.22.json
+python3 scripts/resolve_hooks.py \
+    --elf factorio_client_arm64/factorio/bin/arm64/factorio \
+    --json build/hooks_2.1.22.json
 ```
 
 **Resultado: 20/20 resueltos.** Para los que no son función, el script
 **verifica el offset desensamblando** la función que lo usa.
 
-| Hook | Dirección | Nombre en 2.1.22 |
+> **Ojo: las direcciones son por binario.** El repo tiene tres copias del
+> motor: el **cliente gráfico** (`factorio_client_arm64/…/factorio`), el
+> **headless** (`factorio_arm64/…/factorio`) y `build/factorio_stripped.elf`,
+> que es una copia *sin debug info* del headless. Headless y cliente son
+> **builds distintos** (94.821 vs 94.939 símbolos de función) y sus
+> direcciones **no coinciden**. La tabla de arriba es la del **cliente**, que
+> es el que se hookea en el visor. El inyector, en cambio, resuelve siempre
+> en el binario que esté corriendo en ese momento ✓.
+
+| Hook | Dirección (cliente) | Nombre en 2.1.22 |
 |---|---|---|
-| `GAME_RENDERER_RENDER` | `0x177d7b0` | `GameRenderer::render()` |
-| `GAME_RENDERER_PREPARE` | `0x1779db4` | `GameRenderer::prepare(RenderParameters const&)` |
-| `GAME_RENDERER_RENDER_INTERNAL` | `0x1780108` | `std::_Function_handler<void (DrawQueue*), GameRenderer::renderInternal(bool)::$_0>::_M_invoke` |
-| `RP_CENTER_ON` | `0x17728a8` | `RenderParameters::centerOn(Map const&, SurfaceView const&)` |
-| `GET_MAP_POSITION` | `0x176c6b8` | `GameView::getMapPosition(PixelPosition) const` |
-| `GAME_VIEW_CALCULATE_SURFACE_VIEW` | `0x1761c00` | `GameView::calculateSurfaceView() const` |
-| `ASSEMBLING_MACHINE_DRAW` | `0x2400684` | `AssemblingMachine::draw(DrawQueue&) const` |
-| `FURNACE_DRAW` | `0x313890c` | `Furnace::draw(DrawQueue&) const` |
-| `MINING_DRILL_DRAW` | `0x1ed4354` | `MiningDrill::draw(DrawQueue&) const` |
-| `TURRET_DRAW` | `0x2f64be8` | `Turret::draw(DrawQueue&) const` |
-| `AMMO_TURRET_DRAW` | `0x31e5714` | `AmmoTurret::draw(DrawQueue&) const` |
-| `CRAFTING_MACHINE_DRAW` | `0x24012ac` | `CraftingMachine::draw(DrawQueue&, Entity const&, UpdatableEntity const&, WorkingVisualisations const&, CraftingMachineAnimationState, bool, EnergySource const*, RecipeTints const&, WorkingVisualisationEnabledIndices)` |
-| `WORKING_VISUALISATION_DRAW` | `0x1eef1dc` | `WorkingVisualisationDrawState::draw(DrawQueue&, WorkingVisualisation const&, Surface const&, Color const*, float, Vector const&, DrawingFlags)` |
-| `DRAW_ITEM_STACK` | `0x18f51b8` | `ItemStackPainter::drawItemStack(...)` |
-| `TB_DRAW_ITEMS` | `0x2f78694` | `TransportBelt::drawItems(...)` |
-| `DRAW_SCALED_TINTED` | `0x1845af4` | `DrawQueue::drawScaledTinted(...)` |
+| `GAME_RENDERER_RENDER` | `0x17837e0` | `GameRenderer::render()` |
+| `GAME_RENDERER_PREPARE` | `0x177fde4` | `GameRenderer::prepare(RenderParameters const&)` |
+| `GAME_RENDERER_RENDER_INTERNAL` | `0x1785ee0` | `GameRenderer::renderInternal(bool)` |
+| `RP_CENTER_ON` | `0x17788d8` | `RenderParameters::centerOn(Map const&, SurfaceView const&)` |
+| `GET_MAP_POSITION` | `0x17726e8` | `GameView::getMapPosition(PixelPosition) const` |
+| `GAME_VIEW_CALCULATE_SURFACE_VIEW` | `0x1767c30` | `GameView::calculateSurfaceView() const` |
+| `ASSEMBLING_MACHINE_DRAW` | `0x2406754` | `AssemblingMachine::draw(DrawQueue&) const` |
+| `FURNACE_DRAW` | `0x313fb10` | `Furnace::draw(DrawQueue&) const` |
+| `MINING_DRILL_DRAW` | `0x1eda428` | `MiningDrill::draw(DrawQueue&) const` |
+| `TURRET_DRAW` | `0x2f6bdec` | `Turret::draw(DrawQueue&) const` |
+| `AMMO_TURRET_DRAW` | `0x31ec918` | `AmmoTurret::draw(DrawQueue&) const` |
+| `CRAFTING_MACHINE_DRAW` | `0x240737c` | `CraftingMachine::draw(DrawQueue&, Entity const&, UpdatableEntity const&, WorkingVisualisations const&, CraftingMachineAnimationState, bool, EnergySource const*, RecipeTints const&, WorkingVisualisationEnabledIndices)` |
+| `WORKING_VISUALISATION_DRAW` | `0x1ef52b0` | `WorkingVisualisationDrawState::draw(DrawQueue&, WorkingVisualisation const&, Surface const&, Color const*, float, Vector const&, DrawingFlags)` |
+| `DRAW_ITEM_STACK` | `0x18fb28c` | `ItemStackPainter::drawItemStack(...)` |
+| `TB_DRAW_ITEMS` | `0x2f7f898` | `TransportBelt::drawItems(...)` |
+| `DRAW_SCALED_TINTED` | `0x184bbc8` | `DrawQueue::drawScaledTinted(...)` |
 | `ENTITY_GET_PROTOTYPE` | `Entity+0x48` | **miembro** (`EntityPrototype const*`) |
 | `ENTITY_GET_SURFACE` | `Entity+0x70` | **miembro** (`Surface*`) |
-| `DAYTIME_SET_POSITION` | `0x265c8e0` | `DayTime::setPosition(double)` |
-| `PLAYER_INPUT_WALK_DIR` | `0x1c6b1f0` | `PlayerInputSource::computeWalkingDirectionFromPlayerInputs()` |
+| `DAYTIME_SET_POSITION` | `0x26629b0` | `DayTime::setPosition(double)` |
+| `PLAYER_INPUT_WALK_DIR` | `0x1c712c4` | `PlayerInputSource::computeWalkingDirectionFromPlayerInputs()` |
 
 ### 4.1 Cambios respecto a 2.0.77 (Windows)
 
 | Upstream 2.0.77 | 2.1.22 | Qué pasó |
 |---|---|---|
-| `WorkingVisualisation::draw` | `WorkingVisualisationDrawState::draw` (`0x1eef1dc`) | la clase se partió; el dibujado de la visualización de trabajo es ahora una función libre de estado |
+| `WorkingVisualisation::draw` | `WorkingVisualisationDrawState::draw` | la clase se partió; el dibujado de la visualización de trabajo es ahora una función de estado |
 | `Entity::getPrototype()` | **miembro** en `Entity+0x48` | el compilador la inlinó: no queda símbolo |
 | `Entity::getSurface()` | **miembro** en `Entity+0x70` | ídem |
-| `GameRenderer::renderInternal(bool)` | lambda `_M_invoke` (`0x1780108`) | el cuerpo quedó *outlined* en la lambda que recibe el `DrawQueue` (su cuerpo es un `tail-call` a `DrawEngine::load`) |
-| `?render@GameRenderer@@` | `GameRenderer::render()` (`0x177d7b0`) | mismo nombre, otra dirección |
+| `?render@GameRenderer@@` | `GameRenderer::render()` | mismo nombre, otra dirección |
+
+`GameRenderer::renderInternal(bool)` **sigue existiendo** en el cliente
+(`0x1785ee0`); en el build headless está inlinada y solo queda la lambda que
+recibe el `DrawQueue` (`_M_invoke`), de ahí el segundo nombre de búsqueda en
+la tabla.
 
 **Verificación de los miembros** (la hace el propio script, desensamblando):
 
-- `Entity::prototypeCollide(BoundingBox const&) const` (`0x190bb68`) hace
+- `Entity::prototypeCollide(BoundingBox const&) const` hace
   `ldr x22, [x0, #0x48]` → ese puntero se usa luego como `EntityPrototype`
-  (`ldrb w8, [x22, #0x568]`, `add x1, x22, #0x278`).
-- `Entity::setupPosition(Surface&)` (`0x16f454c`) hace `str x1, [x0, #0x70]`
+  (`ldrb w8, [x22, #0x568]`, `add x1, x22, #0x278]`).
+- `Entity::setupPosition(Surface&)` hace `str x1, [x0, #0x70]`
   → ahí se guarda la `Surface&`.
 
 ### 4.2 Mapeo de los hooks del upstream
@@ -333,9 +399,8 @@ des-mangled en el `.symtab` del motor. El trabajo pendiente es:
    equivalente (mismo formato que `build/hooks_2.1.22.json`).
 2. Declarar la **firma** de cada hook (parámetros y retorno) para poder
    reenviarlos al original: el patrón `draw(DrawQueue&)` de AArch64 es
-   `x0 = this`, `x1 = DrawQueue&`, y el retorno puede ir en `x0` o en un
-   puntero oculto (convención MSVC) — en ARM64/SysV el retorno va en `x0`
-   salvo para tipos grandes.
+   `x0 = this`, `x1 = DrawQueue&`, y el retorno va en `x0` salvo para tipos
+   grandes.
 3. Enganchar de verdad el pipeline (cámara, entidades, items, cables) — este
    ADR solo deja la **infraestructura** (resolver + parchear + contar).
 
@@ -410,7 +475,7 @@ _Unwind_stub_impl:
     ...
 ```
 
-> **Trampa encontrado por el camino**: la primera versión usaba el
+> **Trampa encontrada por el camino**: la primera versión usaba el
 > `libunwind.a` del NDK como `libgcc_s`. Funcionaba, pero el libunwind de LLVM
 > saca el `FILE*` de stderr del símbolo **interno** de glibc `__sF`, que en
 > **aarch64 no está exportado** (en x86-64 sí). El `.so` no cargaba:
@@ -451,6 +516,9 @@ Variables de entorno:
 | `XFACTORVR_HOOK_EVERY` | `60` | cada cuántos frames se imprime |
 | `XFACTORVR_HOOK_TARGET` | `GameRenderer::render` | otro símbolo que enganchar |
 | `XFACTORVR_HOOK_PATCH` | auto | `corto` / `largo` |
+| `XFACTORVR_HOOK_TRACE` | `0` | vuelca parche y trampolín (diagnóstico) |
+| `XFACTORVR_HOOK_NOPATCH` | `0` | resuelve pero **no** parchea (diagnóstico) |
+| `XFACTORVR_HOOK_NOCALL` | `0` | el hook **no** llama al original (diagnóstico) |
 
 ---
 
@@ -474,6 +542,25 @@ Variables de entorno:
 Códigos de salida: `0` validado, `1` fallo real, `2` no validado (sin
 contenedor/máquina).
 
+Salida real de la validación (contenedor `xfactorvr-client`, glibc 2.39, Mesa
+25.2.8 con Zink sobre lavapipe):
+
+```
+[xfv-injector] info: arrancando: objetivo='GameRenderer::render' debug=si cada=10
+[xfv-injector] info: ejecutable: /factorio/bin/arm64/factorio base=0xaaaaabe40000
+[xfv-injector] info: simbolos de funcion leidos: 94939
+[xfv-injector] info: resuelto: GameRenderer::render() -> 0xaaaaad5c37e0 (mangled _ZN12GameRenderer6renderEv)
+[xfv-injector] info: bloque original (16 bytes): fd7bbea9f44f01a9fd030091a83901f0 -> reubicado en 0xaaaab15c3000 (bloque de 32 bytes)
+[xfv-injector] info: detour instalado: parche de 16 bytes (Largo), trampolin en 0xaaaab15c3000
+[xfv-injector] info: hook activo: cada frame pasa por hook_render()
+  55.786 Factorio initialised
+[xfactorvr] hook vivo: 1 frames
+[xfactorvr] hook vivo: 10 frames
+[xfactorvr] hook vivo: 20 frames
+...
+OK: hook vivo -> hook vivo: 20 frames
+```
+
 ---
 
 ## 8. Limitaciones conocidas y trabajo pendiente
@@ -487,13 +574,14 @@ contenedor/máquina).
 | 5 | La firma de cada hook hay que declararla a mano (qué va en `x0..x7`, qué vuelve y dónde). No hay des-mangling de tipos suficiente para deducirlo. | medio: hay que hacerlo hook a hook |
 | 6 | El des-mangler es un subconjunto del ABI de Itanium: las plantillas más exóticas pueden no des-manglearse bien. El camino `Owner::metodo` sí es exacto. | bajo |
 | 7 | El `.so` de glibc no vale para el visor Android (bionic): ahí hay que usar el target `aarch64-linux-android`, que ya compila ✓. | — |
-| 8 | `GameRenderer::renderInternal` ya no existe como función: el hook equivalente es la lambda `_M_invoke`, que es un *tail-call* a `DrawEngine::load`. Engancharla no es lo mismo que enganchar el render interno. | medio |
+| 8 | El trampolín tiene que quedar a menos de 4 GB del código enganchado (por el `adrp`). Con la pista de `mmap` se consigue en la práctica, pero no está garantizado. | bajo |
+| 9 | La tabla de direcciones es **por binario**: cliente y headless no coinciden (§4). | — |
 
 ### Herramientas de análisis
 
 Para este trabajo se ha usado `nm`, `llvm-objdump` (el del NDK) y scripts en
 Python. **REA no ha podido usarse en esta máquina**: su proveedor Hopper no
-arranca (macOS no autoriza los *Apple events* — hay que granting el permiso de
+arranca (macOS no autoriza los *Apple events* — hay que conceder el permiso de
 Automatización en Ajustes del Sistema → Privacidad), Ghidra no está instalado
 y `inspect_binary_layout` solo soporta el perfil verificado de Linux x64.
 Conceder el permiso de Automización para Hopper habilitaría el análisis con
@@ -513,7 +601,7 @@ de los parámetros, qué hace exactamente cada `draw`).
 | `injector-linux/src/demangle.rs` | des-mangler del ABI de Itanium |
 | `injector-linux/src/elf.rs` | lector de `.symtab` del ELF |
 | `injector-linux/src/resolver.rs` | `dl_iterate_phdr` + `/proc/self/exe` + búsqueda |
-| `injector-linux/src/detour.rs` | parche ARM64, trampolín, `mprotect` |
+| `injector-linux/src/detour.rs` | parche ARM64, reubicación PC-relativa, trampolín, `mprotect` |
 | `injector-linux/src/hooks.rs` | hook de prueba y contador de frames |
 | `injector-linux/src/maps.rs` | lectura de `/proc/self/maps` |
 | `injector-linux/src/log.rs` | logging por `write(2)` |

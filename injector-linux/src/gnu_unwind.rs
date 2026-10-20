@@ -19,18 +19,27 @@
 //! libreria del proceso. Con `#[no_mangle]` en Rust no se puede (el version
 //! script que genera Rust mete los `#[no_mangle]` en `global:`), de ahi el
 //! ensamblador.
+//!
+//! Solo hacen falta en el target **glibc** (Linux). En Android el NDK ya
+//! enlaza su propio `libunwind` (y defininglos aqui daria simbolos
+//! duplicados), y en macOS el desenrollador tiene otros nombres.
 
+#[cfg(target_os = "linux")]
 use std::os::raw::c_void;
+#[cfg(target_os = "linux")]
 use std::sync::atomic::AtomicPtr;
 
 /// Nombre del stub real al que apuntan todos los alias.
+#[cfg(target_os = "linux")]
 const IMPLEMENTACION: &str = "_Unwind_stub_impl";
 
 /// Referencia a `c_void`: documenta la firma de los stubs y evita que el
 /// modulo parezca vacio.
+#[cfg(target_os = "linux")]
 #[allow(dead_code)]
 pub type StubArg = *mut c_void;
 
+#[cfg(target_os = "linux")]
 core::arch::global_asm!(
     // --- implementacion comun: termina el proceso como un abort ---
     ".globl _Unwind_stub_impl",
@@ -71,12 +80,15 @@ core::arch::global_asm!(
 );
 
 /// Nombre de la implementacion comun (para diagnostico).
+#[cfg(target_os = "linux")]
 pub const IMPLEMENTACION_STUB: &str = IMPLEMENTACION;
 
-// Declaraciones de los simbolos que Define el ensamblador. Solo sirven para
+#[cfg(target_os = "linux")]
+// Declaraciones de los simbolos que define el ensamblador. Solo sirven para
 // generar referencias: asi el enlazador los resuelve contra los alias
 // locales (y `--gc-sections` no se lleva por delante la seccion, que si no se
 // queda sin definir y los "_Unwind_*" siguen sin resolver).
+#[cfg(target_os = "linux")]
 extern "C" {
     fn _Unwind_Resume() -> !;
     fn _Unwind_RaiseException(_exc: *mut c_void) -> !;
@@ -100,6 +112,7 @@ extern "C" {
 }
 
 /// Tabla que fuerza a que los stubs se queden en el binario.
+#[cfg(target_os = "linux")]
 #[used]
 static STUBS: [AtomicPtr<()>; 13] = [
     AtomicPtr::new(_Unwind_Resume as *mut ()),

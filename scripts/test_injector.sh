@@ -19,6 +19,11 @@ set -uo pipefail
 #      disponibles). No se da por validado algo que no lo esta.
 #
 # Uso: bash scripts/test_injector.sh [--timeout SEGUNDOS] [--keep]
+#       bash scripts/test_injector.sh --solo-compilar
+#
+# Con --solo-compilar se hace solo el paso 1 (preparar el sysroot y compilar
+# el inyector para aarch64) y se sale con 0: lo usa scripts/test_autostart.sh
+# para no repetir elmontaje del toolchain.
 
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PODMAN="${PODMAN:-/opt/podman/bin/podman}"
@@ -29,11 +34,13 @@ SYSROOT="$PROJECT_ROOT/build/glibc_sysroot"
 LOG_DIR="$PROJECT_ROOT/build"
 TIMEOUT=90
 KEEP=0
+SOLO_COMPILAR=0
 
 for arg in "$@"; do
     case "$arg" in
         --timeout) TIMEOUT="${2:-90}"; shift ;;
         --keep) KEEP=1 ;;
+        --solo-compilar) SOLO_COMPILAR=1 ;;
     esac
 done
 
@@ -123,6 +130,11 @@ cp "$CFG.bak" "$CFG"; rm -f "$CFG.bak"
 say "    .so: $SO ($(du -h "$SO" | cut -f1))"
 file_out=$("$PODMAN" run --rm --platform linux/arm64 "$IMAGE" true 2>/dev/null; echo ok)
 say "    target: aarch64-unknown-linux-gnu"
+
+if [ "$SOLO_COMPILAR" = "1" ]; then
+    say "    (--solo-compilar: se para aqui)"
+    exit 0
+fi
 
 # --------------------------------------------------------------------------
 say ""

@@ -1,8 +1,0 @@
-/* Version script extra: deja en LOCAL los stubs del desenrollador.
-   Si se exportaran, interpondrian el desenrollador del juego (que lo lleva
-   enlazado estaticamente) para cualquier otra libreria del proceso. */
-{
-  local:
-    _Unwind_*;
-    __gxx_personality_v0;
-};

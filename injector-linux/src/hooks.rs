@@ -21,6 +21,9 @@ pub static FRAMES: AtomicU64 = AtomicU64::new(0);
 /// Direccion del trampolin (para chamar al original).
 static TRAMPOLIN: AtomicUsize = AtomicUsize::new(0);
 
+/// Direccion del trampolin de `AppManager::process()`.
+static TRAMPOLIN_APP: AtomicUsize = AtomicUsize::new(0);
+
 /// Cada cuantos frames se imprime el "pull" de depuracion.
 static CADA: AtomicU64 = AtomicU64::new(60);
 
@@ -45,6 +48,11 @@ static TRACE: AtomicU64 = AtomicU64::new(0);
 #[no_mangle]
 pub extern "C" fn xfv_hook_render(this: *mut c_void) {
     hook_render(this)
+}
+
+/// Trampolin de `AppManager::process()` (para llamar al original).
+pub fn trampolin_app_process() -> usize {
+    TRAMPOLIN_APP.load(Ordering::Relaxed)
 }
 
 /// Cuerpo del hook.
@@ -179,6 +187,13 @@ pub fn instalar() {
         simbolos.imagen.symbols.len()
     ));
 
+    // --- funciones del motor para el arranque automatico ---
+    // Se resuelven siempre (es barato) para poder informar de lo que falta.
+    crate::autostart::resolver_funciones(&simbolos);
+    if autostart_activo() {
+        instalar_hook_app_manager(&simbolos);
+    }
+
     // --- resolver ---
     let encontrado = match simbolos.resolver(&objetivo) {
         Some(r) => r,
@@ -240,20 +255,86 @@ pub fn instalar() {
 
 /// Direccion de ejecucion del hook, pedida al cargador con dlsym.
 fn direccion_de_ejecucion() -> Option<u64> {
+    direccion_de_ejecucion_de("xfv_hook_render")
+}
+
+/// Direccion REAL de ejecucion de un simbolo exportado por esta libreria.
+///
+/// Tomar el puntero a la funcion (`hook as *const ()`) puede devolver la
+/// direccion de ENLAZADO, no la de ejecucion: si el segmento de texto tiene
+/// direccion fija, el parche saltaria a una direccion inexistente y el juego
+/// recibiria un SIGSEGV sin llegar a entrar en el hook.
+fn direccion_de_ejecucion_de(nombre: &str) -> Option<u64> {
     extern "C" {
         fn dlsym(handle: *mut core::ffi::c_void, symbol: *const core::ffi::c_char)
             -> *mut core::ffi::c_void;
     }
     const RTLD_DEFAULT: *mut core::ffi::c_void = 0 as *mut core::ffi::c_void;
+    // El nombre tiene que ir con NUL final.
+    let mut c = [0u8; 64];
+    if nombre.len() >= c.len() {
+        return None;
+    }
+    c[..nombre.len()].copy_from_slice(nombre.as_bytes());
     unsafe {
-        let p = dlsym(
-            RTLD_DEFAULT,
-            b"xfv_hook_render\0".as_ptr() as *const core::ffi::c_char,
-        );
+        let p = dlsym(RTLD_DEFAULT, c.as_ptr() as *const core::ffi::c_char);
         if p.is_null() {
             None
         } else {
             Some(p as u64)
+        }
+    }
+}
+
+/// True si hay un arranque automatico configurado.
+fn autostart_activo() -> bool {
+    match std::env::var("XFACTORVR_AUTOSTART") {
+        Ok(v) => !v.trim().is_empty(),
+        Err(_) => false,
+    }
+}
+
+/// Instala el detour sobre `AppManager::process()`.
+///
+/// Se engancha ahi (y no en el render) por dos razones:
+///   * `process()` recibe el `this` del `AppManager` en x0, que es lo que
+///     hace falta para llamar a `createGame`/`createTutorial`; y
+///   * el disparo ocurre al principio del tick, antes de que se procese el
+///     estado actual, asi que `createGame` puede empujar su estado sin
+///     destruir el objeto que este en ejecucion.
+fn instalar_hook_app_manager(simbolos: &resolver::Simbolos) {
+    const MANGLE: &str = "_ZN10AppManager7processEv";
+    let encontrado = match simbolos.resolver_exacto(MANGLE) {
+        Some(r) => r,
+        None => {
+            log::error("no se encontro AppManager::process() en el symtab");
+            return;
+        }
+    };
+    log::info(&format!(
+        "resuelto: AppManager::process() -> 0x{:x}",
+        encontrado.direccion
+    ));
+
+    let hook_addr = match direccion_de_ejecucion_de("xfv_hook_app_process") {
+        Some(a) => a,
+        None => {
+            log::aviso("dlsym no devolvio el hook de AppManager; se usa la direccion de enlace");
+            return;
+        }
+    };
+
+    match detour::instalar(encontrado.direccion, hook_addr, None) {
+        Ok(d) => {
+            TRAMPOLIN_APP.store(d.trampolin as usize, Ordering::SeqCst);
+            log::info(&format!(
+                "detour instalado sobre AppManager::process(): parche de {} bytes, trampolin en 0x{:x}",
+                d.estilo.bytes(),
+                d.trampolin
+            ));
+        }
+        Err(e) => {
+            log::error(&format!("no se pudo instalar el detour de AppManager::process(): {e}"));
         }
     }
 }

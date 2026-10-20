@@ -400,6 +400,70 @@ local function collect_patches(found)
 end
 
 -- ---------------------------------------------------------------------------
+-- Terreno: el suelo real del mapa (hierba, tierra, arena, agua, caminos).
+--
+-- El motor de VR dibuja el terreno con los tiles de verdad del juego, no con
+-- un color plano. Para que el payload siga siendo compacto se manda el tile
+-- DOMINANTE del area y solo los que difieren de ese.
+-- ---------------------------------------------------------------------------
+local function collect_terrain(surface, area)
+    local x0, y0 = area[1][1], area[1][2]
+    local x1, y1 = area[2][1], area[2][2]
+    local w = x1 - x0 + 1
+    local h = y1 - y0 + 1
+
+    local names = {}
+    local name_idx = {}
+    local counts = {}
+    local grid = {}
+
+    for y = y0, y1 do
+        local row = {}
+        for x = x0, x1 do
+            local nombre = nil
+            local ok, tile = pcall(function() return surface.get_tile(x, y) end)
+            if ok and tile and tile.name then
+                nombre = tile.name
+            end
+            local i = name_idx[nombre]
+            if not i then
+                i = #names + 1
+                name_idx[nombre] = i
+                names[i] = nombre
+                counts[i] = 0
+            end
+            counts[i] = counts[i] + 1
+            row[x - x0 + 1] = i
+        end
+        grid[y - y0 + 1] = row
+    end
+
+    -- El tile mas frecuente es la base: el resto se manda como excepciones.
+    local base, mejor = 1, -1
+    for i, c in pairs(counts) do
+        if c > mejor then
+            mejor, base = c, i
+        end
+    end
+
+    local excepciones = {}
+    for y = 0, h - 1 do
+        for x = 0, w - 1 do
+            local i = grid[y + 1][x + 1]
+            if i ~= base then
+                excepciones[#excepciones + 1] =
+                    string.format("[%d,%d,%d]", x, y, i)
+            end
+        end
+    end
+
+    return string.format(
+        '{"base":%d,"names":[%s],"x0":%d,"y0":%d,"w":%d,"h":%d,"tiles":[%s]}',
+        base, '"' .. table.concat(names, '","') .. '"',
+        x0, y0, w, h, table.concat(excepciones, ","))
+end
+
+-- ---------------------------------------------------------------------------
 -- Interfaz remota
 -- ---------------------------------------------------------------------------
 
@@ -413,7 +477,7 @@ remote.add_interface("xfactorvr", {
 
         local surface = game.surfaces[1]
         if not surface then
-            local empty = '{"entities":[],"patches":[]}'
+            local empty = '{"entities":[],"patches":[],"terrain":{}}'
             rcon.print(empty)
             return empty
         end
@@ -425,7 +489,7 @@ remote.add_interface("xfactorvr", {
 
         local ok, found = pcall(function() return surface.find_entities(area) end)
         if not ok or not found then
-            local empty = '{"entities":[],"patches":[]}'
+            local empty = '{"entities":[],"patches":[],"terrain":{}}'
             rcon.print(empty)
             return empty
         end
@@ -439,8 +503,19 @@ remote.add_interface("xfactorvr", {
             if s then table.insert(entities, s) end
         end
 
+        -- El terreno se recoge aparte: son miles de tiles y no deben
+        -- romper el caso de que get_tile falle en alguna posicion.
+        local terreno = "{}"
+        local ok_t, t_err = pcall(function()
+            return collect_terrain(surface, area)
+        end)
+        if ok_t and t_err then
+            terreno = t_err
+        end
+
         local out = '{"entities":[' .. table.concat(entities, ",") ..
-            '],"patches":[' .. table.concat(patches, ",") .. ']}'
+            '],"patches":[' .. table.concat(patches, ",") ..
+            '],"terrain":' .. terreno .. '}'
         rcon.print(out)
         return out
     end,

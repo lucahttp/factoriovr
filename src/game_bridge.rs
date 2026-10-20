@@ -129,6 +129,8 @@ fn is_machine_type(entity_type: u32) -> bool {
 
 pub struct SimulationWorld {
     pub patches: Vec<ResourcePatch>,
+    /// Terreno real del area visible (lo que se pinta en el suelo del diorama).
+    pub terrain: TerrainSnapshot,
     pub machine_states: HashMap<(i32, i32), MachineState>,
     pub player_inventory: HashMap<u32, u32>,
     pub is_connected_to_rcon: bool,
@@ -178,6 +180,7 @@ impl SimulationWorld {
 
         Self {
             patches,
+            terrain: TerrainSnapshot::default(),
             machine_states: HashMap::new(),
             player_inventory: inv,
             is_connected_to_rcon: false,
@@ -330,6 +333,7 @@ impl SimulationWorld {
                 remaining: p.remaining,
             })
             .collect();
+        self.terrain = snap.terrain;
     }
 
     /// Aplica el inventario real del jugador.
@@ -1273,6 +1277,55 @@ pub struct Snapshot {
     pub entities: Vec<SnapshotEntity>,
     #[serde(default)]
     pub patches: Vec<SnapshotPatch>,
+    /// Terreno real del mapa (hierba, tierra, arena, agua...).
+    #[serde(default)]
+    pub terrain: TerrainSnapshot,
+}
+
+/// Terreno del area visible.
+///
+/// El mod manda el tile DOMINANTE del area ("base") y solo los que difieren
+/// de ese, en coordenadas relativas al origen. Es compacto y exacto.
+#[derive(Debug, Default, Clone, Deserialize)]
+pub struct TerrainSnapshot {
+    /// Indice (en `names`) del tile dominante.
+    #[serde(default)]
+    pub base: u32,
+    /// Nombres de los tiles (prototipos: "grass", "dirt", "water"...).
+    #[serde(default)]
+    pub names: Vec<String>,
+    /// Casilla origen del area.
+    #[serde(default)]
+    pub x0: i32,
+    #[serde(default)]
+    pub y0: i32,
+    /// Tamano del area en casillas.
+    #[serde(default)]
+    pub w: u32,
+    #[serde(default)]
+    pub h: u32,
+    /// Celdas que difieren del dominante: [x_rel, y_rel, indice_de_nombre].
+    #[serde(default)]
+    pub tiles: Vec<[u32; 3]>,
+}
+
+impl TerrainSnapshot {
+    /// Nombre del terreno en una casilla del area (o None si esta fuera).
+    pub fn tile_at(&self, rel_x: i32, rel_y: i32) -> Option<&str> {
+        if rel_x < 0 || rel_y < 0 || rel_x >= self.w as i32 || rel_y >= self.h as i32 {
+            return None;
+        }
+        for t in &self.tiles {
+            if t[0] as i32 == rel_x && t[1] as i32 == rel_y {
+                return self.names.get(t[2] as usize).map(|s| s.as_str());
+            }
+        }
+        self.names.get(self.base as usize).map(|s| s.as_str())
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.names.is_empty() || self.w == 0 || self.h == 0
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -1406,6 +1459,36 @@ mod tests {
         let assembler = world.machine_states.get(&(-6, 6)).unwrap();
         let ore = *assembler.input_buffer.get(&ITEM_IRON_ORE).unwrap_or(&0);
         assert!(ore >= 1, "La cinta deberia llevar mineral a la ensambladora, llego {}", ore);
+    }
+
+    #[test]
+    fn test_terreno_de_la_instantanea() {
+        // Formato que manda el mod: tile dominante + excepciones.
+        let json = r#"{"entities":[],"patches":[],
+            "terrain":{"base":0,"names":["grass","dirt","water"],"x0":-4,"y0":-4,"w":9,"h":9,
+                       "tiles":[[0,0,1],[1,0,2],[2,2,1]]}}"#;
+        let snap: Snapshot = serde_json::from_str(json).unwrap();
+        let t = &snap.terrain;
+        assert_eq!(t.names, vec!["grass", "dirt", "water"]);
+        assert_eq!(t.w, 9);
+        // El dominante se aplica a todo lo demas.
+        assert_eq!(t.tile_at(5, 5), Some("grass"));
+        // Las excepciones pisan al dominante.
+        assert_eq!(t.tile_at(0, 0), Some("dirt"));
+        assert_eq!(t.tile_at(1, 0), Some("water"));
+        assert_eq!(t.tile_at(2, 2), Some("dirt"));
+        // Fuera del area no hay terreno.
+        assert_eq!(t.tile_at(-1, 0), None);
+        assert_eq!(t.tile_at(9, 0), None);
+    }
+
+    #[test]
+    fn test_instantanea_sin_terreno_no_rompe() {
+        // Un mod antiguo (sin terreno) debe seguir siendo valido.
+        let json = r#"{"entities":[{"t":"tree","x":1.0,"y":2.0}],"patches":[]}"#;
+        let snap: Snapshot = serde_json::from_str(json).unwrap();
+        assert!(snap.terrain.is_empty());
+        assert_eq!(snap.entities.len(), 1);
     }
 
     #[test]

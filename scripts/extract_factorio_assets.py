@@ -133,9 +133,13 @@ PROTECTED_ENTITIES = {
 }
 
 
+# Lado maximo de un bloque de atlas.  Los bloques mas pequenos dejan al
+# empaquetador llenar las paginas mucho mejor.
+BLOCK_SIZE = 256
+
 # Tipos de entidad que el motor VR dibuja realmente (los que le envia el
 # juego).  Con --only-listed el atlas se reduce a lo que hace falta.
-LISTED_ENTITY_TYPES = [
+LISTED_ENTITY_NAMES = [
     # la maquinaria basica de una fabrica
     "assembling-machine-1", "assembling-machine-2", "assembling-machine-3",
     "burner-mining-drill", "electric-mining-drill",
@@ -146,21 +150,39 @@ LISTED_ENTITY_TYPES = [
     "iron-chest", "steel-chest",
     "gun-turret", "radar", "roboport",
     "splitter", "underground-belt", "substation",
-    # los recursos y los arboles
+    # los recursos
     "iron-ore", "copper-ore", "coal", "uranium-ore", "stone", "crude-oil",
+]
+
+# Tipos que se incluyen enteros (todos sus variantes)
+LISTED_ENTITY_TYPES = [
     "tree",
 ]
 
+LISTED_ENTITY_TYPES_ALL = LISTED_ENTITY_NAMES + LISTED_ENTITY_TYPES
+
 
 def _avg2(a, b):
-    """Promedio de dos cadenas de bytes, byte a byte, sin acarreo entre bytes."""
+    """Promedio de dos cadenas de bytes, byte a byte, sin acarreo entre bytes.
+
+    Se hace con aritmetica de entero grande (SWAR): se separan los nibbles
+    altos y bajos para que ninguna suma intermediate desborde un byte, de
+    modo que el resultado es exactamente (a_i + b_i) // 2 en cada byte."""
     n = len(a)
     if n == 0:
         return b""
-    mask = int.from_bytes(b"\x7f" * n, "big")
-    x = int.from_bytes(a, "big") & mask
-    y = int.from_bytes(b, "big") & mask
-    return (((x + y) >> 1) & mask).to_bytes(n, "big")
+    m0f = int.from_bytes(b"\x0f" * n, "little")
+    m1f = int.from_bytes(b"\x1f" * n, "little")
+    m7f = int.from_bytes(b"\x7f" * n, "little")
+    mf8 = int.from_bytes(b"\xf8" * n, "little")
+    x = int.from_bytes(a, "little")
+    y = int.from_bytes(b, "little")
+    high = ((x >> 4) & m0f) + ((y >> 4) & m0f)      # <= 30 por byte
+    low = (x & m0f) + (y & m0f)                    # <= 30 por byte
+    # (a+b)//2 == 8*high + low//2   (las dos partes caben en un byte)
+    hi = ((high & m1f) << 3) & mf8
+    lo = (low >> 1) & m7f
+    return (hi + lo).to_bytes(n, "little")
 
 
 def downscale_2x2(row0, row1, dest_width):
@@ -185,6 +207,42 @@ def downscale_nearest(row, dest_width, factor):
     for c in range(4):
         out[c::4] = row[c::stride][:dest_width]
     return bytes(out)
+
+
+def resample_block_generic(rows, src_x0, src_y0, src_w, src_h, dest_w, dest_h):
+    """Filtro de caja general: promedia los pixeles origen de cada rect.
+
+    Es la version correcta para cuando el frame no se puede reducir justo a
+    la mitad (anchos impares, escalas que no dividen).  Es mas lenta que el
+    camino rapido 2x2 pero solo se usa en esas capas."""
+    out = []
+    base = src_x0 * 4
+    for r in range(dest_h):
+        r0 = src_y0 + (r * src_h) // dest_h
+        r1 = src_y0 + ((r + 1) * src_h) // dest_h
+        if r1 <= r0:
+            r1 = r0 + 1
+        acc = [0] * (dest_w * 4)
+        counts = [0] * dest_w
+        for sy in range(r0, r1):
+            row = rows.get(sy)
+            if row is None:
+                continue
+            for c in range(dest_w):
+                c0 = (c * src_w) // dest_w
+                c1 = ((c + 1) * src_w) // dest_w
+                if c1 <= c0:
+                    c1 = c0 + 1
+                counts[c] += c1 - c0
+                for k in range(4):
+                    acc[c * 4 + k] += sum(
+                        row[base + c0 * 4 + k:base + c1 * 4 + k:4])
+        for c in range(dest_w):
+            if counts[c]:
+                for k in range(4):
+                    acc[c * 4 + k] //= counts[c]
+        out.append(bytes(acc))
+    return out
 
 
 class ExtractError(Exception):
@@ -1618,11 +1676,16 @@ ICON_PATH_MARKER = "/graphics/icons/"
 def extract_layers(proto, warnings):
     """Devuelve la lista de capas de sprite de un prototipo, en orden."""
     layers = []
-    _walk_layers(proto, layers, warnings, set())
+    _walk_layers(proto, layers, warnings, set(), ())
     return layers
 
 
-def _walk_layers(value, out, warnings, visited, depth=0):
+# Contenedores de graficos "principales" de un prototipo: la capa que vive
+# dentro de ellos es la que define el cuerpo de la entidad.
+MAIN_GRAPHICS_KEYS = ("graphics_set", "pictures", "sprite", "sprites")
+
+
+def _walk_layers(value, out, warnings, visited, path, depth=0):
     if depth > 14:
         return
     if isinstance(value, LuaTable):
@@ -1632,13 +1695,14 @@ def _walk_layers(value, out, warnings, visited, depth=0):
         if is_layer_table(value):
             filename = value.get("filename")
             if ICON_PATH_MARKER not in filename.replace("\\", "/"):
-                out.append(value)
+                out.append((value, path))
                 return
-        for _k, v in value.items():
-            _walk_layers(v, out, warnings, visited, depth + 1)
+        for key, v in value.items():
+            sub = path + (key,) if isinstance(key, str) else path + ("[]",)
+            _walk_layers(v, out, warnings, visited, sub, depth + 1)
     elif isinstance(value, LuaOpaque):
         for a in value.args:
-            _walk_layers(a, out, warnings, visited, depth + 1)
+            _walk_layers(a, out, warnings, visited, path, depth + 1)
 
 
 # ===========================================================================
@@ -2360,14 +2424,26 @@ def detect_version(data_dir):
     return "unknown"
 
 
-def detect_graphics_layout(data_dir):
-    """'2.1' si usa la estructura de tiras con .lua, '2.0' en caso contrario."""
+def detect_graphics_layout(data_dir, version=None):
+    """'2.1' si usa la estructura de tiras con .lua, '2.0' en caso contrario.
+
+    La version es lo mas fiable: 2.1 cambio los sprites a <tipo>-<capa>.png +
+    <tipo>-<capa>.lua.  Si no se puede leer la version se mira si hay
+    ficheros .lua de definicion de tira junto a los PNG."""
+    if version and version[0].isdigit():
+        if version.startswith("2.1"):
+            return "2.1"
+        if version.startswith("2.0"):
+            return "2.0"
     entity_dir = os.path.join(data_dir, "base", "graphics", "entity")
     if not os.path.isdir(entity_dir):
         return "unknown"
     for dirpath, _dirnames, filenames in os.walk(entity_dir):
         for filename in filenames:
-            if filename.endswith(".lua"):
+            if not filename.endswith(".lua"):
+                continue
+            stem = filename[:-4]
+            if os.path.isfile(os.path.join(dirpath, stem + ".png")):
                 return "2.1"
     return "2.0"
 
@@ -2412,7 +2488,7 @@ class LayerAsset(object):
                  "geometry", "header", "frames", "omitted", "flags", "shift",
                  "scale", "anim_speed", "frame_count", "direction_count",
                  "table", "is_body", "z_order", "atlas_x", "atlas_y",
-                 "animation_frames", "blocks", "grid_cols", "grid_rows")
+                 "animation_frames", "blocks", "grid_cols", "grid_rows", "path")
 
     def __init__(self):
         self.entity = ""
@@ -2440,6 +2516,7 @@ class LayerAsset(object):
         self.blocks = []
         self.grid_cols = 1
         self.grid_rows = 1
+        self.path = ()
 
 
 def _lua_to_json(value):
@@ -2469,23 +2546,24 @@ def build_entity_assets(runtime, data_dir, proto_dir, warnings):
         # aporta (p.ej. gun-turret usa gun-turret-raising.png en varias fases)
         chosen = {}
         order = []
-        for table in layers_tables:
+        for table, path in layers_tables:
             ref = table.get("filename")
             if not isinstance(ref, str):
                 continue
             score = _layer_score(table)
             if ref not in chosen:
-                chosen[ref] = (score, table)
+                chosen[ref] = (score, table, path)
                 order.append(ref)
             elif score > chosen[ref][0]:
-                chosen[ref] = (score, table)
+                chosen[ref] = (score, table, path)
         for ref in order:
-            _score, table = chosen[ref]
+            _score, table, path = chosen[ref]
             layer = LayerAsset()
             layer.entity = pname
             layer.ref = ref
             layer.rel_path = relative_asset_path(data_dir, ref)
             layer.abs_path = resolve_asset_path(data_dir, ref)
+            layer.path = path
             priority = table.get("priority")
             layer.priority = priority if isinstance(priority, str) else "normal"
             flags = table.get("flags")
@@ -2497,9 +2575,8 @@ def build_entity_assets(runtime, data_dir, proto_dir, warnings):
             entity.layers.append(layer)
         for i, layer in enumerate(entity.layers):
             layer.index = i
-        # direction_count del prototipo (si lo declara) y deteccion de cuerpo
+        # direction_count del prototipo (si lo declara)
         entity.direction_count = _as_int(proto.get("direction_count")) or 0
-        _classify_layers(entity)
         if entity.layers:
             orders = [PRIORITY_DRAW_ORDER.get(l.priority, DEFAULT_DRAW_ORDER)
                       for l in entity.layers]
@@ -2550,17 +2627,34 @@ def is_body_layer(layer):
 
 
 def _classify_layers(entity):
-    """Marca is_body y calcula los mapas de variantes por direccion."""
-    body_found = False
+    """Marca is_body y calcula los mapas de variantes por direccion.
+
+    El cuerpo es la primera capa "de dibujo" (ni sombra, ni luz, ni reflejo)
+    que vive dentro del contenedor principal de graficos del prototipo
+    (graphics_set, pictures, sprite...).  Si no hay ninguno, se usa la
+    primera capa de dibujo que haya."""
+    candidates = [l for l in entity.layers if is_body_layer(l)]
+    main = [l for l in candidates
+            if any(key in MAIN_GRAPHICS_KEYS for key in l.path)]
+    body = (main or candidates)
+    body_ids = set(id(l) for l in body[:1]) if body else set()
+    # si hay varias capas de cuerpo del mismo tamano (las 4 direcciones de
+    # una perforadora), todas son cuerpo y se distinguen por 'variants'
+    if body:
+        biggest = max(l.geometry.frame_pixels for l in body) if \
+            all(l.geometry is not None for l in body) else 0
+        if biggest:
+            same = [l for l in body if l.geometry is not None and
+                    l.geometry.frame_pixels == biggest]
+            if len(same) > 1 and len(main) == 1:
+                body_ids = set(id(l) for l in same)
     for layer in entity.layers:
-        body = is_body_layer(layer)
-        if body and not body_found:
-            body_found = True
-            layer.is_body = True
-        else:
-            layer.is_body = False
+        layer.is_body = id(layer) in body_ids
+        # las variantes por direccion: una capa por direccion (N/E/S/W).
+        # is_body se queda solo en la capa por defecto, pero el motor puede
+        # pedir la variante concreta de cada direccion
         direction, flipped = detect_variant(layer.ref)
-        if direction and layer.is_body:
+        if direction:
             if flipped:
                 entity.flipped[direction] = layer.index
             else:
@@ -2626,6 +2720,8 @@ def resolve_layer_geometry(entities, data_dir, warnings, missing):
         if kept:
             entity.draw_order = max(PRIORITY_DRAW_ORDER.get(l.priority, DEFAULT_DRAW_ORDER)
                                     for l in kept)
+        # ahora ya se sabe el tamano de cada capa: se elige el cuerpo
+        _classify_layers(entity)
     return entities
 
 
@@ -2697,7 +2793,7 @@ def main(argv=None):
         return 1
 
     version = detect_version(data_dir)
-    layout = detect_graphics_layout(data_dir)
+    layout = detect_graphics_layout(data_dir, version)
     if args.version:
         print("Factorio data version: %s (layout de sprites: %s)" % (version, layout))
         if not args.out:
@@ -2728,14 +2824,22 @@ def main(argv=None):
     # filtro --types / --only-listed
     wanted = [t.strip() for t in args.types.split(",") if t.strip()]
     if args.only_listed:
-        wanted = wanted + LISTED_ENTITY_TYPES
-    if wanted:
+        # por nombre, y los tipos de la lista entera (los arboles)
+        names = set(LISTED_ENTITY_NAMES) | set(wanted)
+        types = set(LISTED_ENTITY_TYPES)
+        entities = [e for e in entities
+                    if e.name in names or e.ptype in types]
+        if not entities:
+            sys.stderr.write("ERROR: --only-listed no coincide con ninguna "
+                             "entidad\n")
+            return 1
+    elif wanted:
         wset = set(wanted)
         entities = [e for e in entities
                     if e.name in wset or e.ptype in wset]
         if not entities:
             sys.stderr.write("ERROR: el filtro %s no coincide con ninguna "
-                             "entidad\n" % (args.types or "--only-listed"))
+                             "entidad\n" % args.types)
             return 1
 
     # segunda pasada: geometria de cada capa (cabeceras PNG + definicion de tira)
@@ -2830,8 +2934,11 @@ def main(argv=None):
             return []
         cols, rows = used_grid(layer)
         cell_w, cell_h = scaled_cell(layer)
-        cols_per = max(1, page_size // cell_w)
-        rows_per = max(1, page_size // cell_h)
+        # los bloques no son mas grandes que BLOCK_SIZE: asi el empaquetador
+        # puede llenar las paginas mucho mejor (los sprites de Factorio tienen
+        # formas muy dispares)
+        cols_per = max(1, min(page_size // cell_w, BLOCK_SIZE // cell_w))
+        rows_per = max(1, min(page_size // cell_h, BLOCK_SIZE // cell_h))
         blocks = []
         r0 = 0
         while r0 < rows:
@@ -3028,29 +3135,35 @@ def main(argv=None):
                 src_h = blk["rows"] * geo.frame_height
                 dest_w = blk["width"]
                 dest_h = blk["height"]
-                fx = geo.frame_width / max(1, dest_w // max(1, blk["cols"]))
-                fy = geo.frame_height / max(1, dest_h // max(1, blk["rows"]))
-                for r in range(dest_h):
-                    sy = src_y0 + int(r * fy)
-                    src = rows.get(sy)
-                    if src is None:
-                        continue
-                    block_row = src[src_x0 * 4:(src_x0 + src_w) * 4]
-                    if len(block_row) < src_w * 4:
-                        continue
-                    if fx == 2.0 and fy == 2.0:
+                cell_w, cell_h = scaled_cell(layer)
+                exact_2x = (geo.frame_width == 2 * cell_w and
+                            geo.frame_height == 2 * cell_h)
+                if exact_2x:
+                    # camino rapido: filtro de caja 2x2 exacto
+                    for r in range(dest_h):
+                        sy = src_y0 + 2 * r
+                        src = rows.get(sy)
+                        if src is None:
+                            continue
+                        block_row = src[src_x0 * 4:(src_x0 + src_w) * 4]
+                        if len(block_row) < src_w * 4:
+                            continue
                         other = rows.get(sy + 1)
                         block_row2 = None
                         if other is not None:
                             block_row2 = other[src_x0 * 4:(src_x0 + src_w) * 4]
                         line = downscale_2x2(block_row, block_row2, dest_w)
-                    elif fx == int(fx) and fx >= 1:
-                        line = downscale_nearest(block_row, dest_w, int(fx))
-                    else:
-                        line = block_row[:dest_w * 4]
-                    dst_off = ((blk["atlas_y"] + r) * page_size +
-                               blk["atlas_x"]) * 4
-                    page[dst_off:dst_off + len(line)] = line
+                        dst_off = ((blk["atlas_y"] + r) * page_size +
+                                   blk["atlas_x"]) * 4
+                        page[dst_off:dst_off + len(line)] = line
+                else:
+                    # camino general: promedia las filas y columnas
+                    lines = resample_block_generic(rows, src_x0, src_y0,
+                                                  src_w, src_h, dest_w, dest_h)
+                    for r, line in enumerate(lines):
+                        dst_off = ((blk["atlas_y"] + r) * page_size +
+                                   blk["atlas_x"]) * 4
+                        page[dst_off:dst_off + len(line)] = line
             # frames: un rectangulo por celda de la rejilla, en orden de fila
             fw, fh = geo.frame_width, geo.frame_height
             cell_w, cell_h = scaled_cell(layer)
@@ -3086,6 +3199,10 @@ def main(argv=None):
         for layer in entity.layers:
             layer.frames.sort(key=lambda f: f["index"])
             layer.z_order = layer.index
+            # una capa sin frames tiene que estar marcada SIEMPRE: el motor
+            # la toma como dibujable si no ve el flag
+            if not layer.frames and not layer.omitted:
+                layer.omitted = "sin-frames"
 
     # --- escritura de las paginas ----------------------------------------
     # Cada pagina se escribe en RAW (el motor Android no decodifica PNG) y
@@ -3165,9 +3282,13 @@ def main(argv=None):
             layer_entry = {
                 "filename": layer.rel_path,
                 "priority": layer.priority,
+                # tamano LOGICO del frame (no se reescala): el motor lo usa
+                # para calcular el tamano en el mundo
                 "frame_width": geo.frame_width,
                 "frame_height": geo.frame_height,
-                "frame_count": layer.frame_count,
+                # frames totales de la capa (los que hay en el atlas)
+                "frame_count": len(layer.frames),
+                "source_frame_count": layer.frame_count,
                 "direction_count": layer.direction_count,
                 "animation_frames": layer.animation_frames,
                 "animation": {"frames": geo.anim_frames, "speed": layer.anim_speed},
@@ -3178,8 +3299,11 @@ def main(argv=None):
                 "layer_order": layer.index,
                 "z_order": layer.z_order,
                 "is_body": layer.is_body,
-                "atlas_x": layer.atlas_x,
-                "atlas_y": layer.atlas_y,
+                # las coordenadas de los rects son absolutas dentro de su
+                # pagina, asi que el origen de la capa se deja a 0
+                "atlas_x": 0,
+                "atlas_y": 0,
+                "page": layer.blocks[0]["page"] if layer.blocks else 0,
                 "frames": layer.frames,
             }
             if len(layer.blocks) > 1:

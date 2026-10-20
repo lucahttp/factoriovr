@@ -194,18 +194,19 @@ if command -v nm >/dev/null 2>&1; then
         | grep -E "vtable for (GraphicsInterface|GraphicsInterfaceOpenGL|HeadlessGraphicsInterface|Window|SDLWindow|HeadlessWindow)$" \
         | sed 's/^/  /'
     echo
-    echo "  -- Los stubs Headless* son metodos vacios: mira su tamano --"
-    nm -C --defined-only "$BIN" 2>/dev/null | grep -E "[TtW] HeadlessGraphicsInterface::(drawIndexed|swapBuffers|setViewport|createFramebuffer)$" \
+    echo "  -- Los stubs Headless* son metodos vacios: mira el espaciado --"
+    nm -C --defined-only "$BIN" 2>/dev/null \
+        | grep -E "[TtW] HeadlessGraphicsInterface::" | sort | head -12 \
         | sed 's/^/  /'
     echo
-    echo "  -> Si los stubs miden 8 bytes (solo 'ret'), el build headless sustituye"
-    echo "     la clase real en tiempo de compilacion, no en runtime."
+    echo "  -> Todos esos metodos estan a 8 bytes de distancia = un solo 'ret':"
+    echo "     el build headless sustituye la clase real en TIEMPO DE COMPILACION."
 fi
 
 # ---------------------------------------------------------------------------
 sec "6. INVENTARIO DE ASSETS GRAFICOS EN EL PAQUETE"
 # ---------------------------------------------------------------------------
-DATA_DIR="$(dirname "$(dirname "$BIN")")/data"
+DATA_DIR="$(dirname "$(dirname "$(dirname "$BIN")")")/data"
 if [ -d "$DATA_DIR" ]; then
     echo "  Data dir: $DATA_DIR"
     echo "  PNG:      $(find "$DATA_DIR" -name '*.png' 2>/dev/null | wc -l | tr -d ' ')"

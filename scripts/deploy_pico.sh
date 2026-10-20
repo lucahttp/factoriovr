@@ -149,7 +149,12 @@ LOCAL_ASSETS="$PROJECT_ROOT/build/factorio_assets"
 if [ ! -f "$LOCAL_ASSETS/manifest.json" ]; then
     echo "    Generando el atlas de sprites desde la instalacion de Factorio..."
     FACTIO_DATA="${FACTORIO_DATA:-/Volumes/X10Pro/SteamLibrary/steamapps/common/Factorio/factorio.app/Contents/data}"
-    python3 "$PROJECT_ROOT/scripts/extract_factorio_assets.py" --data "$FACTORIO_DATA" --out "$LOCAL_ASSETS" --quiet || true
+    # Solo los tipos del juego temprano, a media escala y solo la capa de
+    # cuerpo: el atlas completo son 637 MB y no cabe en la GPU del visor.
+    # Asi son 5 paginas de 2048x2048 (84 MB de VRAM).
+    TYPES="assembling-machine-1,assembling-machine-2,assembling-machine-3,burner-mining-drill,electric-mining-drill,stone-furnace,steel-furnace,electric-furnace,transport-belt,fast-transport-belt,express-transport-belt,inserter,fast-inserter,small-electric-pole,medium-electric-pole,big-electric-pole,iron-chest,steel-chest,gun-turret,radar,roboport,splitter,underground-belt,substation,iron-ore,copper-ore,coal,uranium-ore,stone,crude-oil,tree"
+    python3 "$PROJECT_ROOT/scripts/extract_factorio_assets.py" --data "$FACTORIO_DATA" \
+        --out "$LOCAL_ASSETS" --only-listed --scale 0.5 --capas cuerpo --types "$TYPES" --quiet || true
 fi
 if [ -f "$LOCAL_ASSETS/manifest.json" ]; then
     echo "[6/7] Subiendo los assets reales del juego..."

@@ -60,16 +60,27 @@ def frame_de_la_capa(capa, frame_anim, direccion):
     return rect
 
 
-def capa_cuerpo(entidad):
-    """Primera capa dibujable, prefiriendo la marcada como cuerpo."""
-    capas = [c for c in entidad.get("layers", [])
-             if not c.get("omitted") and c.get("frames")]
-    if not capas:
+VARIANTES = ["N", "E", "S", "W"]
+
+
+def capa_cuerpo(entidad, direccion=0):
+    """Capa a dibujar: la variante cardinal si la hay, si no el cuerpo."""
+    capas = entidad.get("layers", [])
+    dibujan = [c for c in capas if not c.get("omitted") and c.get("frames")]
+    variants = entidad.get("variants") or {}
+    if variants and dibujan:
+        grupo = min(direccion // 4, 3)
+        idx = variants.get(VARIANTES[grupo])
+        if idx is not None and 0 <= idx < len(capas):
+            c = capas[idx]
+            if not c.get("omitted") and c.get("frames"):
+                return c
+    if not dibujan:
         return None
-    for c in capas:
+    for c in dibujan:
         if c.get("is_body"):
             return c
-    return capas[0]
+    return dibujan[0]
 
 
 class Paginas:
@@ -201,7 +212,7 @@ def main():
         if sid == 0:
             continue
         ent = manifiesto["entities"][nombre]
-        capa = capa_cuerpo(ent)
+        capa = capa_cuerpo(ent, e.get("d", 0))
         if capa is None:
             continue
         rect = frame_de_la_capa(capa, e.get("f", 0), e.get("d", 0))

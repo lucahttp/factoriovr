@@ -88,9 +88,17 @@ pub struct AssetEntity {
     pub name: String,
     #[serde(default)]
     pub layers: Vec<SpriteLayer>,
+    /// Variantes cardinales: {"N": 0, "E": 2, "S": 4, "W": 6}, donde el valor
+    /// es el indice de la capa en `layers`. Las entidades con una sola
+    /// direccion no lo tienen.
+    #[serde(default)]
+    pub variants: HashMap<String, u32>,
     #[serde(default)]
     pub draw_order: i32,
 }
+
+/// Direccion de Factorio (0..15) a variante cardinal.
+const VARIANTES_CARDINALES: [&str; 4] = ["N", "E", "S", "W"];
 
 /// Manifiesto completo del atlas.
 #[derive(Debug, Clone, Deserialize)]
@@ -236,8 +244,21 @@ pub fn sprite_frame_in(
     names.sort();
     let name = names.get((sprite_id - 1) as usize)?;
     let entity = m.entities.get(*name)?;
-    // Se prefiere la capa marcada como cuerpo; si no hay, la primera con
-    // frames utilizables (una capa "omitida" no se puede dibujar).
+    // Capa de la variante cardinal (N/E/S/W) si la entidad la tiene: una
+    // perforadora tiene cuatro sprites distintos, uno por orientacion.
+    let capa_de_variante = if entity.variants.is_empty() {
+        None
+    } else {
+        let grupo = ((direction as usize) / 4).min(3);
+        entity
+            .variants
+            .get(VARIANTES_CARDINALES[grupo])
+            .and_then(|idx| entity.layers.get(*idx as usize))
+            .filter(|l| l.omitted.is_none() && !l.frames.is_empty())
+    };
+
+    // Si no, se prefiere la capa marcada como cuerpo; si no hay, la primera
+    // con frames utilizables (una capa "omitida" no se puede dibujar).
     let mut candidatas: Vec<&SpriteLayer> = entity
         .layers
         .iter()
@@ -246,10 +267,9 @@ pub fn sprite_frame_in(
     if candidatas.is_empty() {
         return None;
     }
-    let layer = match candidatas.iter().find(|l| l.is_body) {
-        Some(l) => *l,
-        None => candidatas[0],
-    };
+    let layer = capa_de_variante
+        .or_else(|| candidatas.iter().find(|l| l.is_body).copied())
+        .unwrap_or(candidatas[0]);
 
     let anim = layer.animation.as_ref().map(|a| a.frames).unwrap_or(1).max(1);
     let dirs = layer.direction_count.max(1);

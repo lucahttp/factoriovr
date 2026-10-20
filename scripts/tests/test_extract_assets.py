@@ -499,8 +499,42 @@ class TestVariants(unittest.TestCase):
     def test_listed_entity_types_cover_the_factory(self):
         for name in ("assembling-machine-1", "transport-belt", "inserter",
                      "iron-chest", "gun-turret", "radar", "roboport",
-                     "resource", "tree"):
-            self.assertIn(name, ex.LISTED_ENTITY_TYPES)
+                     "stone-furnace", "splitter", "underground-belt"):
+            self.assertIn(name, ex.LISTED_ENTITY_NAMES)
+        # los arboles entran por tipo entero
+        self.assertIn("tree", ex.LISTED_ENTITY_TYPES)
+        # y el filtro NO debe traer los tipos pesados que no estan en la lista
+        for name in ("fast-splitter", "express-splitter",
+                     "fast-underground-belt", "express-underground-belt",
+                     "small-biter", "boss-biter"):
+            self.assertNotIn(name, ex.LISTED_ENTITY_NAMES)
+
+    def test_swar_average_matches_python(self):
+        import random
+        random.seed(11)
+        for size in (1, 3, 16, 100):
+            a = bytes(random.randrange(256) for _ in range(size))
+            b = bytes(random.randrange(256) for _ in range(size))
+            self.assertEqual(ex._avg2(a, b),
+                             bytes((x + y) // 2 for x, y in zip(a, b)))
+
+    def test_downscale_2x2_averages_four_pixels(self):
+        # dos pixeles de 2x2: R=10 G=20 B=30 A=40 y R=14 G=24 B=34 A=44
+        row0 = bytes([10, 20, 30, 40, 14, 24, 34, 44])
+        row1 = bytes([12, 22, 32, 42, 16, 26, 36, 46])
+        out = ex.downscale_2x2(row0, row1, 1)
+        self.assertEqual(list(out), [13, 23, 33, 43])
+
+    def test_resample_block_generic_matches_box_average(self):
+        # un bloque de 4x2 pixeles reducido a 2x1
+        rows = {0: bytes([0, 0, 0, 0, 10, 10, 10, 10,
+                          20, 20, 20, 20, 30, 30, 30, 30]),
+                1: bytes([0, 0, 0, 0, 10, 10, 10, 10,
+                          20, 20, 20, 20, 30, 30, 30, 30])}
+        out = ex.resample_block_generic(rows, 0, 0, 4, 2, 2, 1)
+        self.assertEqual(len(out), 1)
+        # los dos primeros pixeles valen 0 y los dos ultimos 10 -> 5
+        self.assertEqual(list(out[0][:4]), [5, 5, 5, 5])
 
 
 # ===========================================================================
@@ -585,11 +619,16 @@ class TestHelpers(unittest.TestCase):
                       encoding="utf-8") as handle:
                 json.dump({"name": "base", "version": "2.1.22"}, handle)
             self.assertEqual(ex.detect_version(tmp), "2.1.22")
-            # sin ficheros .lua de tira al lado de los PNG es layout 2.0
+            # la version manda: 2.1 usa tiras, 2.0 no
+            self.assertEqual(ex.detect_graphics_layout(tmp, "2.1.22"), "2.1")
+            self.assertEqual(ex.detect_graphics_layout(tmp, "2.0.77"), "2.0")
+            # sin version se mira si hay un .lua de tira junto a su PNG
+            entity = os.path.join(tmp, "base", "graphics", "entity")
+            with open(os.path.join(entity, "x.png"), "wb") as handle:
+                handle.write(b"\x89PNG\r\n\x1a\n")
             self.assertEqual(ex.detect_graphics_layout(tmp), "2.0")
-            # en cuanto aparece un .lua de tira se detecta el layout 2.1
-            with open(os.path.join(tmp, "base", "graphics", "entity",
-                                   "x.lua"), "w", encoding="utf-8") as handle:
+            with open(os.path.join(entity, "x.lua"), "w",
+                      encoding="utf-8") as handle:
                 handle.write("return { width = 1, height = 1 }\n")
             self.assertEqual(ex.detect_graphics_layout(tmp), "2.1")
         finally:

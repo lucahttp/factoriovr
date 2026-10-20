@@ -93,8 +93,26 @@ else
     fi
 fi
 
-# SDL: sin servidor X, se dibuja fuera de pantalla.
-export SDL_VIDEODRIVER="${SDL_VIDEODRIVER:-offscreen}"
+# SDL: la transicion de estado del motor (cargar partida, abrir menus) toca el
+# GUI, asi que con el driver "offscreen" se queda colgado. Si hay un servidor X
+# disponible (termux-x11 en Android, Xvfb en el banco), se usa; si no, se
+# intenta igual con offscreen.
+if [ -z "${DISPLAY:-}" ]; then
+    # Busca un X de termux-x11 o Xvfb si hay alguno vivo.
+    for d in :99 :0 :1; do
+        if [ -e "/tmp/.X11-unix/X${d#:}" ] || [ -S "/tmp/.X11-unix/X${d#:}" ]; then
+            export DISPLAY="$d"
+            break
+        fi
+    done
+fi
+if [ -n "${DISPLAY:-}" ]; then
+    export SDL_VIDEODRIVER="${SDL_VIDEODRIVER:-x11}"
+    log "servidor X: $DISPLAY (driver ${SDL_VIDEODRIVER})"
+else
+    export SDL_VIDEODRIVER="${SDL_VIDEODRIVER:-offscreen}"
+    log "sin servidor X: driver ${SDL_VIDEODRIVER} (el cambio de estado puede fallar)"
+fi
 export SDL_AUDIODRIVER="${SDL_AUDIODRIVER:-dummy}"
 export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/data/local/tmp/xdg-runtime}"
 mkdir -p "$XDG_RUNTIME_DIR" 2>/dev/null || true

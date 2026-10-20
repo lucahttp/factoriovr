@@ -20,7 +20,9 @@
 pub mod autostart;
 pub mod demangle;
 pub mod detour;
+pub mod diagnostico;
 pub mod elf;
+pub mod fase_juego;
 pub mod gnu_unwind;
 pub mod hooks;
 pub mod log;
@@ -34,7 +36,30 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// necesita, pero normalmente lo invoca el constructor de `.init_array`.
 #[no_mangle]
 pub extern "C" fn xfactorvr_injector_init() {
+    // El .so se preloadea en TODOS los procesos que hereden el entorno
+    // (grep, tail, python, shells...). Si el inyector hiciera su trabajo en
+    // cualquiera, ensuciaria la salida de todas las herramientas y podria
+    // tocar memoria de procesos ajenos. Solo se activa en el juego.
+    if !es_el_juego() {
+        return;
+    }
     hooks::instalar();
+}
+
+/// ¿El proceso actual es el ejecutable de Factorio?
+fn es_el_juego() -> bool {
+    if std::env::var("XFACTORVR_FORZAR").is_ok() {
+        return true;
+    }
+    let exe = match std::fs::read_link("/proc/self/exe") {
+        Ok(p) => p,
+        Err(_) => return false,
+    };
+    let nombre = exe
+        .file_name()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_default();
+    nombre == "factorio" || nombre.starts_with("factorio-")
 }
 
 /// Version numerica, por si el contenedor la consulta.

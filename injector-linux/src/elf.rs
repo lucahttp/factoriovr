@@ -22,6 +22,8 @@ const SHT_SYMTAB: u32 = 2;
 const SHT_DYNSYM: u32 = 11;
 
 const STT_FUNC: u8 = 2;
+/// Tipo (`st_info & 0xf`): 1 = STT_OBJECT (datos, p.ej. tablas virtuales).
+const STT_OBJECT: u8 = 1;
 const SHN_UNDEF: u16 = 0;
 
 const PT_LOAD: u32 = 1;
@@ -144,7 +146,12 @@ impl ElfImage {
             if st_shndx == SHN_UNDEF {
                 continue;
             }
-            if (st_info & 0xf) != STT_FUNC {
+            // Se guardan las funciones (STT_FUNC) y tambien los objetos
+            // (STT_OBJECT): hacen falta las tablas virtuales (`_ZTV6InGame`,
+            // etc.) para poder empujar un estado `InGame` con la vtable
+            // correcta.
+            let tipo = st_info & 0xf;
+            if tipo != STT_FUNC && tipo != STT_OBJECT {
                 continue;
             }
             if st_name == 0 || st_name >= strdata.len() {

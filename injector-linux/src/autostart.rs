@@ -47,6 +47,7 @@ use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::OnceLock;
 
+use crate::fase_juego;
 use crate::log;
 use crate::resolver::Simbolos;
 
@@ -71,6 +72,15 @@ const MANGLE_APP_POP_STATE: &str = "_ZN10AppManager8popStateEv";
 const MANGLE_APP_POP_STATE_INTERNAL: &str = "_ZN10AppManager16popStateInternalEv";
 /// `AppManager::pushState(AppManagerState*)`.
 const MANGLE_APP_PUSH_STATE: &str = "_ZN10AppManager9pushStateEP15AppManagerState";
+
+/// `AppManager::startRconIfEnabled()`.
+///
+/// Es la **unica** via que tiene el motor para abrir el RCON: la llama el
+/// `InLoadingGameBox::process()` (AppManagerStates.cpp:1659) cuando la carga
+/// ha terminado. Como la caja de carga se autodestruye en cuanto el estado de
+/// la cima no es un `InGame` (ver ADR-004 seccion 12), el RCON nunca llega a
+/// abrirse; llamandolo desde aqui se abre igual.
+const MANGLE_APP_START_RCON: &str = "_ZN10AppManager18startRconIfEnabledEv";
 /// `InLoadingGameBox::InLoadingGameBox(string const&, Filesystem::Path const&, LoadType, bool, NamedBool<DoSpaceAgeFixUpTag>)`.
 ///
 /// Es el estado que usa el propio juego para CARGAR UNA PARTIDA GUARDADA (el
@@ -88,6 +98,15 @@ const MANGLE_SL_CTOR: &str =
 /// `ScenarioExecutionContext::ScenarioExecutionContext(ScenarioLocation const&, Difficulty, NamedBool<EnableReplayTag>)`.
 const MANGLE_SEC_CTOR: &str =
     "_ZN24ScenarioExecutionContextC2ERK16ScenarioLocation10Difficulty9NamedBoolI15EnableReplayTagE";
+/// `_ZTV6InGame`: la tabla virtual de la clase `InGame`.
+///
+/// El puntero a la vtable que lleva el objeto es `_ZTV6InGame + 16` (los
+/// primeros 16 bytes de la tabla son el "offset to top" y el typeinfo).
+/// `InGame` es el estado de "estoy en una partida" y su tipo (`getStateType()`)
+/// es 4: el motor usa ese tipo para saber que la carga va en serio.
+const MANGLE_VTABLE_IN_GAME: &str = "_ZTV6InGame";
+/// Desplazamiento del puntero a la vtable dentro de la tabla virtual.
+const OFFSET_VTABLE_OBJETO: usize = 16;
 
 // ---------------------------------------------------------------------------
 // Tamanos deducidos del desensamblado
@@ -167,11 +186,23 @@ static F_PUSH_STATE: AtomicU64 = AtomicU64::new(0);
 static F_LOADING_GAME_BOX: AtomicU64 = AtomicU64::new(0);
 static F_FS_PATH_CTOR: AtomicU64 = AtomicU64::new(0);
 static F_OP_NEW: AtomicU64 = AtomicU64::new(0);
+/// `AppManager::startRconIfEnabled()`: la unica via para abrir el RCON.
+static F_START_RCON: AtomicU64 = AtomicU64::new(0);
+/// Puntero a la vtable del objeto `InGame` (`_ZTV6InGame + 16`).
+static VTABLE_IN_GAME: AtomicU64 = AtomicU64::new(0);
+/// Puntero al estado `InLoadingGameBox` vivo (el que carga el mapa).
+static ESTADO_CARGA: AtomicUsize = AtomicUsize::new(0);
+/// Contador de ticks de la fase de carga (diagnostico).
+static TICKS_CARGA: AtomicU64 = AtomicU64::new(0);
 
 /// Puntero `this` del `AppManager` (0 hasta que se captura).
 static APP_MANAGER: AtomicUsize = AtomicUsize::new(0);
 /// 1 cuando ya se ha disparado el arranque.
 static DISPARADO: AtomicBool = AtomicBool::new(false);
+/// 1 cuando ya se ha llamado a `AppManager::startRconIfEnabled()`.
+static RCON_ABIERTO: AtomicBool = AtomicBool::new(false);
+/// Numero de intentos de abrir el RCON.
+static RCON_INTENTOS: AtomicU64 = AtomicU64::new(0);
 /// Numero de ticks de `AppManager::process()` vistos.
 static TICKS: AtomicU64 = AtomicU64::new(0);
 /// Milisegundos (reloj del sistema) del primer tick.
@@ -360,6 +391,18 @@ pub fn resolver_funciones(simbolos: &Simbolos) {
         lineas.push_str(&format!("operatorNew=0x{:x} ", r.direccion));
     } else {
         lineas.push_str("operatorNew=NO ");
+    }
+    if let Some(r) = simbolos.resolver_exacto(MANGLE_VTABLE_IN_GAME) {
+        VTABLE_IN_GAME.store(r.direccion + OFFSET_VTABLE_OBJETO as u64, Ordering::SeqCst);
+        lineas.push_str(&format!("vtableInGame=0x{:x} ", r.direccion + OFFSET_VTABLE_OBJETO as u64));
+    } else {
+        lineas.push_str("vtableInGame=NO ");
+    }
+    if let Some(r) = simbolos.resolver_exacto(MANGLE_APP_START_RCON) {
+        F_START_RCON.store(r.direccion, Ordering::SeqCst);
+        lineas.push_str(&format!("startRcon=0x{:x} ", r.direccion));
+    } else {
+        lineas.push_str("startRcon=NO ");
     }
     log::info(&format!("funciones del motor para el autostart: {lineas}"));
 }
@@ -617,6 +660,75 @@ fn arrancar_guardado(app_manager: *mut c_void, ruta: &str) -> bool {
         let f_push: unsafe extern "C" fn(*mut c_void, *mut c_void) = std::mem::transmute(push);
         f_push(app_manager, objeto);
     }
+
+    // Encima del `InLoadingGameBox` hay que poner un estado de tipo `InGame`
+    // (4). Motivo (ver modulo `fase_juego`): `InLoadingGameBox::process()`
+    // comprueba el tipo del estado de la CIMA y, si no es `InGame`, da la
+    // carga por perdida (`popStateToMainMenu()` + `pushState(InGame)`), lo
+    // que destruye este mismo estado y con el el hilo del cargador: la carga
+    // se queda en "Checksum for script __level__/control.lua" para siempre.
+    //
+    // El motor llama al `process()` del estado de la cima en cada frame, asi
+    // que con el `InGame` encima es el `InGame::process()` quien corre, y el
+    // inyector llama a mano al `process()` del `InLoadingGameBox` (que es el
+    // que consulta el cargador y el que abre el RCON).
+    if empujar_estado_in_game_habilitado() {
+        if !empujar_estado_in_game(app_manager) {
+            log::error("no se pudo empujar el estado InGame encima del InLoadingGameBox");
+        }
+    }
+
+    // El estado de carga queda apuntado para poder llamar a su `process()`.
+    ESTADO_CARGA.store(objeto as usize, Ordering::SeqCst);
+    true
+}
+
+/// Si hay que empujar el estado `InGame` encima del `InLoadingGameBox`.
+///
+/// **Por defecto NO**: el `InGame` de 16 bytes que empuja el motor es un
+/// objeto a medio construir, y `InGame::process()` lo saca de la pila (hace
+/// `popStateToMainMenu()`) cuando no encuentra la vista de control. El motor
+/// sigue llamando a su `process()` y el juego peta con un SIGSEGV por usar
+/// memoria liberada. Se deja como experimento con
+/// `XFACTORVR_ESTADO_INGAME=1`.
+fn empujar_estado_in_game_habilitado() -> bool {
+    match std::env::var("XFACTORVR_ESTADO_INGAME") {
+        Ok(v) => v == "1",
+        Err(_) => false,
+    }
+}
+
+/// Crea y empuja un estado `InGame` (16 bytes: vtable + puntero a null) encima
+/// del estado actual.
+///
+/// Es el mismo objeto que crea el propio motor en
+/// `InLoadingGameBox::process()` (`new(16)` con la vtable de `InGame` y un
+/// puntero a null): 16 bytes, la vtable en el primer word y un puntero nulo
+/// en el segundo.
+fn empujar_estado_in_game(app_manager: *mut c_void) -> bool {
+    let vtable = VTABLE_IN_GAME.load(Ordering::SeqCst);
+    let op_new = F_OP_NEW.load(Ordering::SeqCst);
+    let push = F_PUSH_STATE.load(Ordering::SeqCst);
+    if vtable == 0 || op_new == 0 || push == 0 {
+        return false;
+    }
+    // SAFETY: `operator new` del motor (mismo allocator que usa el motor para
+    // los estados, asi que el destructor tambien usa el de freed del motor).
+    let objeto = unsafe {
+        let f: unsafe extern "C" fn(usize) -> *mut c_void = std::mem::transmute(op_new);
+        f(16)
+    };
+    if objeto.is_null() {
+        return false;
+    }
+    // SAFETY: el objeto tiene 16 bytes: vtable en +0 y puntero nulo en +8.
+    unsafe {
+        let p = objeto as *mut u64;
+        p.write(vtable);
+        p.add(1).write(0);
+        let f_push: unsafe extern "C" fn(*mut c_void, *mut c_void) = std::mem::transmute(push);
+        f_push(app_manager, objeto);
+    }
     true
 }
 
@@ -773,6 +885,67 @@ fn arrancar_escenario(
     true
 }
 
+/// Abre el RCON llamando a `AppManager::startRconIfEnabled()`.
+///
+/// Es la **UNICA** via que tiene el motor para abrir el RCON: la llama el
+/// `InLoadingGameBox::process()` (AppManagerStates.cpp:1659) cuando la carga
+/// ha terminado. Pero la caja de carga se autodestruye en cuanto el estado de
+/// la cima de la pila no es un `InGame` (ADR-004, seccion 12.2), asi que por
+/// la via normal el RCON **nunca** llega a abrirse.
+///
+/// Se llama **una sola vez**: la funcion crea una interfaz nueva en el
+/// `RemoteCommandProcessor`, asi que llamarla dos veces intentaria abrir dos
+/// sockets en el mismo puerto.
+pub fn abrir_rcon(app_manager: *mut c_void) -> bool {
+    let dir = F_START_RCON.load(Ordering::SeqCst);
+    if dir == 0 {
+        log::error("no esta resuelta AppManager::startRconIfEnabled()");
+        return false;
+    }
+    log::info("abriendo el RCON (AppManager::startRconIfEnabled)");
+    // SAFETY: la direccion viene del symtab del motor y la firma es `void(this)`.
+    unsafe {
+        let f: FnThisVoid = std::mem::transmute(dir);
+        f(app_manager);
+    }
+    true
+}
+
+/// Abre el RCON en cuanto la partida esta en marcha, y solo una vez.
+///
+/// Se llama desde el hook de render, que corre FUERA de
+/// `AppManager::process()` (llamar ahi dentro seria reentrante y el juego se
+/// SIGSEGV).
+///
+/// OJO: `startRconIfEnabled()` crea la interfaz del RCON en el
+/// `RemoteCommandProcessor`, que **todavia no esta en marcha** en el instante
+/// en que el motor empuja el `InGame` (el mapa se crea despues). Por eso se
+/// reintenta cada pocos frames: el motor, en su flujo normal, tambien la
+/// llama manyas veces (la `InLoadingGameBox::process()` la llama en cada
+/// frame mientras la carga esta terminada).
+pub fn tick_rcon() {
+    let app = APP_MANAGER.load(Ordering::Relaxed) as *mut c_void;
+    if app.is_null() {
+        return;
+    }
+    // Solo cuando hay un `InGame` en la cima: si no, la partida no esta en
+    // marcha y el RCON no serviria de nada.
+    if !crate::diagnostico::es_in_game(app) {
+        return;
+    }
+    let intentos = RCON_INTENTOS.fetch_add(1, Ordering::SeqCst) + 1;
+    // Cada 30 frames (el motor va a ~1 fps con el rasterizador por software).
+    if intentos % 30 != 0 && intentos > 1 {
+        return;
+    }
+    if intentos > 600 {
+        return;
+    }
+    if abrir_rcon(app) {
+        RCON_ABIERTO.store(true, Ordering::SeqCst);
+    }
+}
+
 /// Llama a `AppManager::createTutorial()`.
 fn arrancar_tutorial(app_manager: *mut c_void) -> bool {
     let crear_tutorial = F_CREATE_TUTORIAL.load(Ordering::SeqCst);
@@ -824,6 +997,121 @@ fn now_millis() -> u64 {
     }
 }
 
+/// Valor con el que se fuerza `AppManager+0x58` ("estado de la app").
+///
+/// 0 = no se toca (por defecto). 1 = "hay una partida cargandose".
+fn estado_app_configurado() -> i32 {
+    match std::env::var("XFACTORVR_ESTADO_APP") {
+        Ok(v) => v.parse::<i32>().unwrap_or(0),
+        Err(_) => 0,
+    }
+}
+
+/// Avanza la carga de la partida: llama al `process()` del `InLoadingGameBox`.
+///
+/// Se llama desde el hook de render (`GameRenderer::render`), que corre una
+/// vez por frame FUERA de `AppManager::process()`. Es importante que sea
+/// fuera: dentro seria reentrante (el motor esta recorriendo la pila de
+/// estados) y el juego se SEGSEGV.
+///
+/// El `InLoadingGameBox::process()` es el estado que:
+///
+///   * consulta el hilo del cargador (`ParallelScenarioLoader`),
+///   * engancha el `Scenario` que se esta cargando (`MainLoop+0x78`), y
+///   * llama a `AppManager::startRconIfEnabled()`, que es la UNICA via para
+///     abrir el RCON.
+///
+/// El motor solo llama al `process()` del estado de la CIMA de la pila, y en
+/// la cima esta el `InGame` (que se empuja para que el motor no destruya la
+/// caja de carga al ver que la cima no es de tipo `InGame`), asi que la caja
+/// de carga hay que empujarla a mano.
+pub fn tick_carga() {
+    let carga = ESTADO_CARGA.load(Ordering::SeqCst);
+    if carga == 0 {
+        return;
+    }
+    let app = APP_MANAGER.load(Ordering::Relaxed) as *mut c_void;
+    if app.is_null() {
+        return;
+    }
+    let estado = carga as *mut c_void;
+    // Diagnostico: estado del cargador y de la pila de estados.
+    {
+        let ticks = TICKS_CARGA.fetch_add(1, Ordering::Relaxed) + 1;
+        if ticks % 120 == 0 || ticks == 1 {
+            // El cargador esta en el +0x18 del `InLoadingGameBox`; su estado
+            // esta en el +0x78 y el flag de "cargado" en el +0xa8.
+            let cargador = unsafe { (estado as *const u8).add(0x18).cast::<u64>().read() };
+            let (est_cargador, flag) = if cargador == 0 {
+                (0xffff_ffffu32, 0xffff_ffffu32)
+            } else {
+                unsafe {
+                    (
+                        (cargador as *const u8).add(0x78).cast::<u32>().read(),
+                        (cargador as *const u8).add(0xa8).cast::<u32>().read(),
+                    )
+                }
+            };
+            let cima = fase_juego::estado_cima(app);
+            log::info(&format!(
+                "carga: tick={ticks} estado_cargador={est_cargador} flag={flag} cima_tipo={} estados={} app_estado={}",
+                fase_juego::tipo_de(cima),
+                numero_estados(app),
+                fase_juego::estado_app(app),
+            ));
+        }
+    }
+    // Si la caja de carga ya no esta en la pila, la carga se acabo (o
+    // fallo): no se llama a un objeto destruido.
+    let cima = fase_juego::estado_cima(app);
+    if cima.is_null() {
+        return;
+    }
+    let sigue = (cima as usize) != (estado as usize);
+    if !sigue {
+        // La cima es otra cosa: el `InGame`. La caja de carga esta debajo.
+        // Comprobar que sigue en la pila (puede que se haya sacado).
+        let inicio = fase_juego::inicio_pila(app);
+        let fin = fase_juego::fin_pila(app);
+        let mut dentro = false;
+        let mut p = inicio;
+        while p < fin {
+            // SAFETY: `p` va desde el principio hasta el final de la pila.
+            if unsafe { *p as usize } == (estado as usize) {
+                dentro = true;
+                break;
+            }
+            // SAFETY: `p` avanza de uno en uno dentro de la pila.
+            p = unsafe { p.add(1) };
+        }
+        if !dentro {
+            return;
+        }
+    }
+    // El motor llama al `process()` del estado de la CIMA de la pila, y en la
+    // fase de carga esa cima es el `InLoadingGameBox`: ya lo llama el solo.
+    // Llamarlo tambien desde aqui es REENTRANTE y, peor, su rama de
+    // "abandono" hace `AppManager::popState()`, que toca el GUI y revienta
+    // si se llama desde fuera del bucle de la aplicacion (ADR-004 7.4).
+    // Por defecto NO se llama; queda como experimento con
+    // `XFACTORVR_LLAMAR_CARGA=1`.
+    if llamar_carga_habilitado() {
+        fase_juego::llamar_process(estado, app);
+    }
+}
+
+/// Si hay que llamar a mano al `process()` del `InLoadingGameBox`.
+///
+/// **Por defecto NO** (ver `tick_carga`): el motor ya lo llama y la llamada
+/// manual acaba en `popState()`, que revienta. `XFACTORVR_LLAMAR_CARGA=1` lo
+/// activa.
+fn llamar_carga_habilitado() -> bool {
+    match std::env::var("XFACTORVR_LLAMAR_CARGA") {
+        Ok(v) => v == "1",
+        Err(_) => false,
+    }
+}
+
 /// Hook de `AppManager::process()`.
 ///
 /// Hace dos cosas:
@@ -840,6 +1128,13 @@ pub extern "C" fn xfv_hook_app_process(this: *mut c_void) -> bool {
     if !this.is_null() && APP_MANAGER.load(Ordering::Relaxed) == 0 {
         APP_MANAGER.store(this as usize, Ordering::SeqCst);
         log::info(&format!("AppManager capturado en 0x{:x}", this as usize));
+    }
+
+    // Diagnostico de la pila de estados (XFACTORVR_DIAG_PILA=1): solo lee, no
+    // toca nada. Sirve para ver en que estado se queda el motor cuando la
+    // carga no avanza (ver ADR-004, seccion 12).
+    if crate::diagnostico::habilitado() {
+        crate::diagnostico::tick(this);
     }
 
     // Disparar el arranque automatico.
@@ -892,19 +1187,55 @@ pub extern "C" fn xfv_hook_app_process(this: *mut c_void) -> bool {
         f(this)
     };
 
-    // Una vez disparado el arranque automatico se fuerza el retorno a "false".
-    //
-    // `AppManager::process()` devuelve true cuando la app ya no esta en el
-    // menu, y `MainLoop::prePrepare()` (su unico llamador) usa ese valor para
-    // decidir si sigue en la fase de preparacion o salta al bucle principal
-    // del juego. Si salta, `AppManager::process()` deja de llamarse y la
-    // maquina de estados (la que carga el nivel y abre el RCON) se queda sin
-    // mover: la partida se queda a medio cargar.
-    //
-    // Devolviendo false se sigue en la fase de preparacion, que es donde el
-    // motor procesa los estados de la aplicacion.
+    // La FASE DE LA CARGA se lleva desde el hook de render (ver `tick_carga`):
+    // llamar al `process()` de un estado desde dentro de
+    // `AppManager::process()` es REENTRANTE y el motor esta iterating la pila
+    // de estados en ese momento: con eso el juego se SEGSEGV.
     if DISPARADO.load(Ordering::Relaxed) {
+        let carga = ESTADO_CARGA.load(Ordering::SeqCst);
+        if carga != 0 {
+            let app = APP_MANAGER.load(Ordering::Relaxed) as *mut c_void;
+            if !app.is_null() {
+                // Valor de `AppManager+0x58` ("estado de la app"). 0 = no
+                // tocarlo (el motor se queda en la fase de menu). 1 = "hay
+                // una partida cargandose": es lo que `InGame::process()`
+                // comprueba antes de crear la vista de control
+                // (`MainLoop+0x2c0`).
+                let valor = estado_app_configurado();
+                if valor != 0 {
+                    fase_juego::poner_estado_app(app, valor);
+                }
+            }
+        }
+    }
+
+    // El valor de retorno de `AppManager::process()` decide la FASE del bucle
+    // principal: `MainLoop::prePrepare()` (su unico llamador) devuelve ese
+    // mismo valor, y `MainLoop::run()` usa el retorno de `prePrepare()` para
+    // quedarse en la fase de preparacion o entrar en el bucle del juego.
+    //
+    // ERROR ANTIGUO (ver ADR-004 seccion 9): aqui se forzaba el retorno a
+    // "false" porque se creia que al saltar al bucle del juego
+    // `AppManager::process()` dejaria de llamarse y la maquina de estados se
+    // quedaria parada. FALSO: `prePrepare()` llama a `AppManager::process()`
+    // en CADA frame, tanto en la fase de preparacion como en la del juego
+    // (MainLoop.cpp:731).
+    //
+    // El valor se puede forzar con XFACTORVR_FASE=menu (fase de preparacion,
+    // el motor se queda pintando el menu) o =natural (el valor del motor).
+    if forzar_fase_menu() {
         return false;
     }
     r
+}
+
+/// Si hay que forzar la fase de preparacion (el menu).
+///
+/// `XFACTORVR_FASE=menu` lo fuerza. Por defecto se deja el valor natural del
+/// motor, que es el que sabe si la app sigue en el menu o ya esta jugando.
+fn forzar_fase_menu() -> bool {
+    match std::env::var("XFACTORVR_FASE") {
+        Ok(v) => v == "menu",
+        Err(_) => false,
+    }
 }

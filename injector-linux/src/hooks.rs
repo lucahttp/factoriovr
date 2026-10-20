@@ -23,6 +23,8 @@ static TRAMPOLIN: AtomicUsize = AtomicUsize::new(0);
 
 /// Direccion del trampolin de `AppManager::process()`.
 static TRAMPOLIN_APP: AtomicUsize = AtomicUsize::new(0);
+/// Trampolin de `MainLoop::processEvents(bool)`.
+static TRAMPOLIN_EVENTS: AtomicUsize = AtomicUsize::new(0);
 
 /// Cada cuantos frames se imprime el "pull" de depuracion.
 static CADA: AtomicU64 = AtomicU64::new(60);
@@ -55,6 +57,37 @@ pub fn trampolin_app_process() -> usize {
     TRAMPOLIN_APP.load(Ordering::Relaxed)
 }
 
+/// Trampolin de `MainLoop::processEvents(bool)`.
+pub fn trampolin_process_events() -> usize {
+    TRAMPOLIN_EVENTS.load(Ordering::Relaxed)
+}
+
+/// Hook de `MainLoop::processEvents(bool)`.
+///
+/// Es el punto correcto para avanzar la carga: se llama **una vez por frame**
+/// en todas las fases (menu, carga y juego), mientras que
+/// `GameRenderer::render` solo se llama cuando se dibuja el juego (y en la
+/// fase de carga no se dibuja, asi que ahi no se puede).
+#[no_mangle]
+pub extern "C" fn xfv_hook_process_events(this: *mut c_void, in_game: u8) -> u8 {
+    // Avanzo de la carga de la partida (si la hay). Se hace aqui, y no en el
+    // hook de `AppManager::process()`, porque el `process()` de un estado no
+    // se puede llamar desde dentro de `AppManager::process()` (es
+    // reentrante: el motor esta recorriendo la pila de estados).
+    crate::autostart::tick_carga();
+
+    let tramp = TRAMPOLIN_EVENTS.load(Ordering::Relaxed);
+    if tramp == 0 {
+        return in_game;
+    }
+    // SAFETY: el trampolin contiene el bloque original reubicado y salta al
+    // resto de la funcion; los argumentos se pasan intactos.
+    unsafe {
+        let f: extern "C" fn(*mut c_void, u8) -> u8 = std::mem::transmute(tramp);
+        f(this, in_game)
+    }
+}
+
 /// Cuerpo del hook.
 extern "C" fn hook_render(this: *mut c_void) {
     // Traza minima de la entrada (diagnostico): se escribe con write(2) para
@@ -84,6 +117,15 @@ extern "C" fn hook_render(this: *mut c_void) {
             crate::log::escribir_stderr(&linea[..n1]);
         }
     }
+
+    // Avanzo de la carga de la partida (si la hay). Se hace aqui, y no en el
+    // hook de `AppManager::process()`, porque el `process()` de un estado no
+    // se puede llamar desde dentro de `AppManager::process()` (es
+    // reentrante: el motor esta recorriendo la pila de estados).
+    crate::autostart::tick_carga();
+
+    // Abrir el RCON cuando la partida ya esta en marcha (una sola vez).
+    crate::autostart::tick_rcon();
 
     // Llamar al original a traves del trampolin, pasando `this` intacto.
     let tramp = TRAMPOLIN.load(Ordering::Relaxed);
@@ -190,8 +232,10 @@ pub fn instalar() {
     // --- funciones del motor para el arranque automatico ---
     // Se resuelven siempre (es barato) para poder informar de lo que falta.
     crate::autostart::resolver_funciones(&simbolos);
-    if autostart_activo() {
+    crate::diagnostico::resolver_vtables(&simbolos);
+    if autostart_activo() || diagnostico_activo() {
         instalar_hook_app_manager(&simbolos);
+        instalar_hook_process_events(&simbolos);
     }
 
     // --- resolver ---
@@ -294,10 +338,59 @@ fn autostart_activo() -> bool {
     }
 }
 
+/// Si hay que instalar el hook del `AppManager` solo para el diagnostico.
+///
+/// El diagnostico de la pila de estados (`XFACTORVR_DIAG_PILA=1`) necesita el
+/// `this` del `AppManager`, que solo se puede sacar de `AppManager::process()`.
+/// Con el autostart vacio el motor no arranca ninguna partida (el hook solo
+/// lee), asi que se puede usar sin tocar nada.
+fn diagnostico_activo() -> bool {
+    crate::diagnostico::habilitado()
+}
+
 /// Instala el detour sobre `AppManager::process()`.
 ///
-/// Se engancha ahi (y no en el render) por dos razones:
-///   * `process()` recibe el `this` del `AppManager` en x0, que es lo que
+/// Instala el detour sobre `MainLoop::processEvents(bool)`.
+///
+/// Se engancha aqui (y no en el render) porque `processEvents()` se llama una
+/// vez por frame en TODAS las fases (menu, carga y juego), mientras que
+/// `GameRenderer::render` solo se llama cuando se dibuja el juego.
+fn instalar_hook_process_events(simbolos: &resolver::Simbolos) {
+    const MANGLE: &str = "_ZN8MainLoop13processEventsEb";
+    let encontrado = match simbolos.resolver_exacto(MANGLE) {
+        Some(r) => r,
+        None => {
+            log::error("no se encontro MainLoop::processEvents() en el symtab");
+            return;
+        }
+    };
+    log::info(&format!(
+        "resuelto: MainLoop::processEvents() -> 0x{:x}",
+        encontrado.direccion
+    ));
+    let hook_addr = match direccion_de_ejecucion_de("xfv_hook_process_events") {
+        Some(a) => a,
+        None => {
+            log::aviso("dlsym no devolvio el hook de processEvents; se usa la direccion de enlace");
+            return;
+        }
+    };
+    match detour::instalar(encontrado.direccion, hook_addr, None) {
+        Ok(d) => {
+            TRAMPOLIN_EVENTS.store(d.trampolin as usize, Ordering::SeqCst);
+            log::info(&format!(
+                "detour instalado sobre MainLoop::processEvents(): parche de {} bytes, trampolin en 0x{:x}",
+                d.estilo.bytes(),
+                d.trampolin
+            ));
+        }
+        Err(e) => {
+            log::error(&format!("no se pudo instalar el detour de processEvents(): {e}"));
+        }
+    }
+}
+
+/// Se engancha ahi (y no en el render) por dos razones:///   * `process()` recibe el `this` del `AppManager` en x0, que es lo que
 ///     hace falta para llamar a `createGame`/`createTutorial`; y
 ///   * el disparo ocurre al principio del tick, antes de que se procese el
 ///     estado actual, asi que `createGame` puede empujar su estado sin

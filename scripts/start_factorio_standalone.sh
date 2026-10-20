@@ -110,6 +110,24 @@ CONFIG_DIR="$FACTORIO_DIR/config"
 SETTINGS_FILE="$CONFIG_DIR/server-settings.json"
 mkdir -p "$CONFIG_DIR" 2>/dev/null || true
 
+# El motor deduce sus rutas (read-data / write-data) de /proc/self/exe.  En
+# Android se arranca a traves del linker de glibc (/data/local/tmp/glibc/lib),
+# asi que /proc/self/exe apunta AL LINKER y el motor busca el juego en
+# /usr/share/factorio: "There is no package core".  Se le da un config.ini
+# propio con las rutas en absoluto, igual que hace el cliente grafico.
+SERVER_CONFIG="$CONFIG_DIR/config.ini"
+if [ ! -f "$SERVER_CONFIG" ]; then
+    log "Creando el config.ini del servidor (rutas absolutas)..."
+    cat > "$SERVER_CONFIG" <<CFG
+[path]
+read-data=$FACTORIO_DIR/data
+write-data=$FACTORIO_DIR
+
+[other]
+check-updates=false
+CFG
+fi
+
 # En modo CAMPANA el auto_pause debe ser TRUE: el servidor congela el mapa
 # hasta que llega el jugador, porque si no el nivel de campana muere antes
 # (usa game.players[1] en su init). Verificado en el banco MP.
@@ -228,9 +246,13 @@ fi
 if [ -z "$SAVE_FILE" ]; then
     log "Creando la partida inicial ($SAVE_NAME)..."
     mkdir -p "$SAVE_DIR"
-    ( cd "$FACTORIO_DIR" && LD_LIBRARY_PATH="$GLIBC_LIB" \
+    # Ruta ABSOLUTA: con un nombre relativo el motor la crea en el directorio
+    # de trabajo (la raiz del juego) y luego el script no la encuentra en
+    # saves/ y da la partida por perdida.
+    ( cd "$FACTORIO_DIR" && \
         "$LOADER" --library-path "$GLIBC_LIB" "$FACTORIO_BIN" \
-        --create "$SAVE_NAME" --mod-directory "$MOD_DIR" ) >>"$LOG_FILE" 2>&1
+            --config "$SERVER_CONFIG" \
+        --create "$SAVE_DIR/$SAVE_NAME" --mod-directory "$MOD_DIR" ) >>"$LOG_FILE" 2>&1
 
     for _cand in "$SAVE_DIR/$SAVE_NAME" "$SAVE_DIR/${SAVE_NAME%.zip}.zip"; do
         [ -f "$_cand" ] && SAVE_FILE="$_cand" && break
@@ -260,8 +282,9 @@ launch() {
     cd "$FACTORIO_DIR" || return 1
     if [ -n "${SCENARIO:-}" ]; then
         log "Arrancando el escenario de campana: $SCENARIO"
-        LD_LIBRARY_PATH="$GLIBC_LIB" nohup \
+        nohup \
             "$LOADER" --library-path "$GLIBC_LIB" "$FACTORIO_BIN" \
+            --config "$SERVER_CONFIG" \
             --start-server-load-scenario "$SCENARIO" \
             --port "${SERVER_PORT:-34197}" \
             --rcon-port "$RCON_PORT" \
@@ -269,8 +292,9 @@ launch() {
             --mod-directory "$MOD_DIR" \
             >>"$LOG_FILE" 2>&1 &
     else
-        LD_LIBRARY_PATH="$GLIBC_LIB" nohup \
+        nohup \
             "$LOADER" --library-path "$GLIBC_LIB" "$FACTORIO_BIN" \
+            --config "$SERVER_CONFIG" \
             --start-server "$SAVE_FILE" \
             --rcon-port "$RCON_PORT" \
             --rcon-password "$RCON_PASSWORD" \
@@ -303,8 +327,9 @@ while [ "$_waited" -lt "$WAIT_TIMEOUT" ]; do
         # Reintento con la variante --start-server-load-latest: la aceptacion
         # de una ruta absoluta de partida depende de la version del motor.
         log "Reintentando con --start-server-load-latest..."
-        SERVER_PID=$(cd "$FACTORIO_DIR" && LD_LIBRARY_PATH="$GLIBC_LIB" nohup \
+        SERVER_PID=$(cd "$FACTORIO_DIR" && nohup \
             "$LOADER" --library-path "$GLIBC_LIB" "$FACTORIO_BIN" \
+            --config "$SERVER_CONFIG" \
             --start-server-load-latest \
             --rcon-port "$RCON_PORT" \
             --rcon-password "$RCON_PASSWORD" \

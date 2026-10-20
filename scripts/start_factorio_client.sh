@@ -42,24 +42,33 @@ MESA_LIB="$MESA_DIR/usr/lib/aarch64-linux-gnu"
 LOADER="$MESA_DIR/lib/ld-linux-aarch64.so.1"
 
 # --- 2. Localizar el ICD de Vulkan de Android (el driver de Adreno) ---------
-# Android guarda los ICD del fabricante en /vendor/lib64/hw/vulkan. El nombre
-# del fichero cambia entre fabricantes y versiones, asi que se busca.
-VENDOR_VULKAN_DIR="${VENDOR_VULKAN_DIR:-/vendor/lib64/hw/vulkan}"
+# Android guarda el ICD del fabricante en /vendor/lib64/hw (no en un
+# subdirectorio "vulkan/", como en el escritorio). En la Pico 4 Ultra el
+# driver es /vendor/lib64/hw/vulkan.adreno.so.
+#
+# PERO ese driver es un .so de BIONIC (depende de libc.so, libdl.so, liblog.so,
+# libllvm-glnext.so y librerias HIDL). El cliente de Factorio es un binario
+# GLIBC: cargar un driver bionic dentro de un proceso glibc mete dos libc en el
+# mismo proceso y el driver revienta (o corrompe memoria sin avisar).
+# Por eso aqui NO se usa el ICD del fabricante: se usa lavapipe (Vulkan por
+# software, va con el payload de Mesa) para que el cliente tenga contexto GL.
+# El render de verdad lo pone la app OpenXR, que si es nativa de Android.
+VENDOR_VULKAN_DIR="${VENDOR_VULKAN_DIR:-/vendor/lib64/hw}"
 ICD_JSON="$MESA_DIR/adreno_icd.json"
 
-if [ ! -f "$ICD_JSON" ]; then
+if [ "${XFACTORVR_USE_ADRENO_ICD:-0}" = "1" ]; then
     ICD_SO=""
-    for cand in "$VENDOR_VULKAN_DIR"/libvulkan_adreno.so \
-                "$VENDOR_VULKAN_DIR"/vulkan.adreno.so \
-                "$VENDOR_VULKAN_DIR"/libvulkan_qcom.so \
-                "$VENDOR_VULKAN_DIR"/*.so; do
+    for cand in "$VENDOR_VULKAN_DIR"/vulkan.adreno.so \
+                "$VENDOR_VULKAN_DIR"/vulkan/*.so \
+                "$VENDOR_VULKAN_DIR"/libvulkan_adreno.so \
+                "/system/lib64/hw/vulkan"/*.so; do
         if [ -f "$cand" ]; then
             ICD_SO="$cand"
             break
         fi
     done
     if [ -n "$ICD_SO" ]; then
-        log "ICD de Vulkan encontrado: $ICD_SO"
+        log "ICD de Vulkan del fabricante: $ICD_SO"
         cat > "$ICD_JSON" <<JSON
 {
     "file_format_version": "1.0.0",
@@ -71,8 +80,11 @@ if [ ! -f "$ICD_JSON" ]; then
 JSON
     else
         log "AVISO: no se encontro un ICD de Vulkan en $VENDOR_VULKAN_DIR"
-        log "       se usara lavapipe (Vulkan por software) si esta disponible"
     fi
+else
+    log "ICD del fabricante ignorado (es bionic y el cliente es glibc)."
+    log "  Se usa lavapipe (Vulkan por software) via Zink."
+    log "  Para forzarlo: XFACTORVR_USE_ADRENO_ICD=1"
 fi
 
 # --- 3. Entorno de Mesa -----------------------------------------------------

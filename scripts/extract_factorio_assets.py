@@ -3358,6 +3358,7 @@ def main(argv=None):
                 shutil.copyfile(src, os.path.join(dst_terrain, filename))
                 manifest["terrain"][filename[:-4]] = "terrain/" + filename
                 terrain_count += 1
+            _empaquetar_atlas_terreno(src_terrain, out_dir, manifest, terrain_count)
 
     # --- sonidos ----------------------------------------------------------
     sound_count = 0

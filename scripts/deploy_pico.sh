@@ -103,6 +103,29 @@ PAYLOAD_TAR="$PROJECT_ROOT/build/factorio_arm64.tar"
 STAGE_DIR="$PROJECT_ROOT/build/factorio_stage"
 mkdir -p "$PROJECT_ROOT/build"
 
+# 3 bis. Modo CAMPANA: dejar el nivel listo para multijugador ANTES de
+# empaquetar el motor, para que el escenario viaje dentro del tar y llegue al
+# servidor (el nivel de campana es single-player: usa game.players[1] en su
+# init, asi que hay que esperar al jugador y usar el helper
+# story_show_message_dialog, que es el unico que funciona en MP.
+# Ver docs/ADR-005-campana-headless-mp.md.
+if [ "$MODO_CAMPANA" -eq 1 ]; then
+    NIVEL="$LOCAL_FACTORIO/data/base/campaigns/tutorial/level-01"
+    # El motor carga los escenarios de data/<mod>/scenarios/<nombre>, asi que
+    # el nivel tiene que quedar en base/scenarios/xfv-nivel (no dentro de
+    # campaigns/, que es donde el nivel original vive).
+    ESC_DIR="$LOCAL_FACTORIO/data/base/scenarios/xfv-nivel"
+    if [ -f "$NIVEL/control.lua" ]; then
+        echo "    Preparando el nivel de campana para multijugador..."
+        mkdir -p "$(dirname "$ESC_DIR")"
+        rm -rf "$ESC_DIR"
+        cp -R "$NIVEL" "$ESC_DIR"
+        python3 "$PROJECT_ROOT/scripts/preparar_campana_mp.py" "$ESC_DIR" 2>&1 | tail -3 || true
+    else
+        echo "    AVISO: no se encuentra el nivel de campana en $NIVEL"
+    fi
+fi
+
 # COPYFILE_DISABLE evita que bsdtar meta los metadatos de macOS (AppleDouble)
 # dentro del tar: en Linux aparecerian como ficheros basura ._* al extraer.
 COPYFILE_DISABLE=1 tar -cf "$PAYLOAD_TAR" -C "$LOCAL_FACTORIO" data config-path.cfg
@@ -173,7 +196,20 @@ if [ "$MODO_CLIENT" -eq 1 ]; then
     CLIENT_TAR="$PROJECT_ROOT/build/factorio_client.tar"
     MESA_TAR="$PROJECT_ROOT/build/mesa.tar.gz"
     COPYFILE_DISABLE=1 tar -cf "$CLIENT_TAR" -C "$(dirname "$LOCAL_CLIENT")" "$(basename "$LOCAL_CLIENT")"
-    tar -czf "$MESA_TAR" -C "$(dirname "$LOCAL_MESA")" "$(basename "$LOCAL_MESA")"
+    # El tar del payload de Mesa lo hace prepare_mesa.py con Python y
+    # dereference=True: nunca guarda enlaces duros.  Con el tar del sistema
+    # (bsdtar en macOS) no se puede pedir eso, y si el tar llevase enlaces
+    # duros al extraer en Android el link() falla con "Permission denied"
+    # (SELinux no deja crear enlaces duros en shell_data_file) y el cliente
+    # grafico se queda sin Zink.
+    if [ ! -f "$MESA_TAR" ] || [ "$LOCAL_MESA/usr/lib/aarch64-linux-gnu/libEGL_mesa.so.0" -nt "$MESA_TAR" ]; then
+        echo "    empaquetando el payload de Mesa..."
+        python3 "$PROJECT_ROOT/scripts/prepare_mesa.py" --solo-tar >/dev/null 2>&1 || true
+    fi
+    if [ ! -f "$MESA_TAR" ]; then
+        echo "    ERROR: no se pudo empaquetar el payload de Mesa."
+        exit 1
+    fi
 
     echo "    cliente: $(du -h "$CLIENT_TAR" | cut -f1)  mesa: $(du -h "$MESA_TAR" | cut -f1)"
     "$ADB" shell "mkdir -p $REMOTE_CLIENT $REMOTE_MESA"
@@ -181,6 +217,14 @@ if [ "$MODO_CLIENT" -eq 1 ]; then
     "$ADB" shell "cd $REMOTE_CLIENT && tar -xf client.tar && rm -f client.tar && chmod 755 factorio/bin/arm64/factorio && mkdir -p factorio/mods factorio/config factorio/saves"
     "$ADB" push "$MESA_TAR" "$REMOTE_MESA/mesa.tar.gz"
     "$ADB" shell "cd $REMOTE_MESA && tar -xzf mesa.tar.gz && rm -f mesa.tar.gz && chmod 755 mesa/lib/ld-linux-aarch64.so.1"
+    # Se comprueba que Zink llego de verdad: si no, el cliente arranca sin
+    # aceleracion (o no arranca) y el fallo se ve mucho mas tarde.
+    if ! "$ADB" shell "test -f $REMOTE_MESA/mesa/usr/lib/aarch64-linux-gnu/dri/zink_dri.so"; then
+        echo "    ERROR: el payload de Mesa no llego completo (falta zink_dri.so)."
+        echo "           Revisa que el tar se haya extraido sin errores."
+        exit 1
+    fi
+    echo "    Zink presente en el visor."
     if [ -f "$LOCAL_INJECTOR" ]; then
         "$ADB" push "$LOCAL_INJECTOR" "$REMOTE_INJECTOR"
         "$ADB" shell "chmod 755 $REMOTE_INJECTOR"
@@ -250,20 +294,14 @@ if [ "$MODO_CLIENT" -eq 1 ]; then
     "$ADB" shell "chmod 755 $REMOTE_CLIENT_SCRIPT"
 fi
 
-# 7b. Modo campana: preparar el nivel y arrancar servidor + cliente.
+# 7b. Modo campana: el nivel ya se preparó antes de empaquetar el motor (paso
+# 3 bis), asi que el escenario xfv-nivel viaja dentro del tar y llega al
+# servidor en data/base/scenarios/xfv-nivel.
 if [ "$MODO_CAMPANA" -eq 1 ]; then
-    echo "    Preparando el nivel de campana para multijugador..."
-    # El nivel de campana es de single-player: hay que esperar al jugador en su
-    # init y usar el helper story_show_message_dialog (que es el unico que
-    # funciona en MP). Ver docs/ADR-005-campana-headless-mp.md.
-    NIVEL="$LOCAL_CLIENT/factorio/data/base/campaigns/tutorial/level-01"
-    if [ -f "$NIVEL/control.lua" ]; then
-        # Se copia el nivel a data/base/scenarios/xfv-nivel (una carpeta de
-        # escenario) y se parchea para multijugador.
-        python3 "$PROJECT_ROOT/scripts/preparar_campana_mp.py" "$NIVEL" \
-            --copiar-como xfv-nivel 2>&1 | tail -3 || true
+    if "$ADB" shell "test -d $REMOTE_FACTORIO/data/base/scenarios/xfv-nivel"; then
+        echo "    Escenario de campana en el servidor: base/xfv-nivel"
     else
-        echo "    AVISO: no se encuentra el nivel de campana en $NIVEL"
+        echo "    AVISO: el escenario de campana no llego al servidor."
     fi
 fi
 

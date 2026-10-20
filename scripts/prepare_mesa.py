@@ -38,7 +38,7 @@ PAQUETES = [
     "libc6", "libgcc-s1", "libstdc++6", "zlib1g",
     # Mesa
     "libgl1", "libglx-mesa0", "libgl1-mesa-dri", "libgl1-mesa-glx",
-    "libglapi-mesa", "libegl1", "libgbm1", "libdrm2", "libdrm-common",
+    "libglapi-mesa", "libegl1", "libegl-mesa0", "libgbm1", "libdrm2", "libdrm-common",
     "libvulkan1", "mesa-vulkan-drivers", "mesa-zink", "libllvm15", "libsensors5",
     "libxcb1", "libx11-6", "libxau6", "libxdmcp6", "libxext6", "libbsd0",
     "libmd0",
@@ -52,6 +52,10 @@ ESPERADOS = [
     "usr/lib/aarch64-linux-gnu/dri/zink_dri.so",
     "usr/lib/aarch64-linux-gnu/libGL.so.1",
     "usr/lib/aarch64-linux-gnu/libEGL.so.1",
+    # El vendor EGL de Mesa. Sin el, libEGL.so.1 (glvnd) no tiene a quien
+    # repartir y el driver "offscreen" de SDL2 no puede crear contexto: eso
+    # es lo que usa el cliente grafico en Android, donde no hay servidor X.
+    "usr/lib/aarch64-linux-gnu/libEGL_mesa.so.0",
     "usr/lib/aarch64-linux-gnu/libvulkan.so.1",
     # lavapipe: Vulkan por software, para validar sin GPU.
     "usr/lib/aarch64-linux-gnu/libvulkan_lvp.so",
@@ -153,11 +157,115 @@ def extraer_deb(ruta_deb, destino):
             os.chmod(target, 0o755)
 
 
+def podar_alias_dri(out):
+    """Deja un solo nombre por fichero del megadriver de Mesa.
+
+    El paquete de Debian trae los 43 drivers de DRI (radeonsi, zink, lima,
+    panfrost...) como enlaces duros al MISMO binario de 24 MB.  En el host
+    eso no ocupa nada, pero al empaquetar con tar se guardan como enlaces
+    duros y al extraer en Android el `link()` falla con "Permission denied"
+    (SELinux no deja crear enlaces duros en shell_data_file), dejando el
+    payload a medias y el cliente grafico sin Zink.
+
+    Se queda solo el driver que se usa (zink) y se borran los alias: el
+    contenido es identico, asi que el nombre es lo unico que cambia."""
+    dri = os.path.join(out, "usr", "lib", "aarch64-linux-gnu", "dri")
+    if not os.path.isdir(dri):
+        return 0
+    # Se agrupa por inodo: un solo nombre puede sobreviver por inodo.
+    por_inodo = {}
+    for f in sorted(os.listdir(dri)):
+        p = os.path.join(dri, f)
+        if os.path.islink(p) or not os.path.isfile(p):
+            continue
+        try:
+            st = os.stat(p)
+        except OSError:
+            continue
+        por_inodo.setdefault((st.st_dev, st.st_ino), []).append(f)
+
+    borrados = 0
+    for _clave, nombres in por_inodo.items():
+        if len(nombres) < 2:
+            continue
+        # Se elige el mejor nombre: zink es el que se usa en el visor.
+        elegido = None
+        for pref in ("zink_dri.so", "kms_swrast_dri.so", "swrast_dri.so"):
+            if pref in nombres:
+                elegido = pref
+                break
+        if elegido is None:
+            elegido = nombres[0]
+        for f in nombres:
+            if f == elegido:
+                continue
+            try:
+                os.remove(os.path.join(dri, f))
+                borrados += 1
+            except OSError:
+                pass
+    if borrados:
+        log(f"Podados {borrados} alias del megadriver (mismo binario, otro nombre)")
+    return borrados
+
+
+def enlaces_duros(out):
+    """Devuelve los grupos de ficheros que comparten inodo (enlaces duros)."""
+    grupos = {}
+    for r, _ds, fs in os.walk(out):
+        for f in fs:
+            p = os.path.join(r, f)
+            try:
+                st = os.lstat(p)
+            except OSError:
+                continue
+            if st.st_nlink > 1:
+                grupos.setdefault(st.st_ino, []).append(p)
+    return [g for g in grupos.values() if len(g) > 1]
+
+
+def empaquetar_tar(out, ruta_tar):
+    """Empaqueta el payload en un .tar.gz que Android pueda extraer.
+
+    En Android el `tar` de toybox no puede crear enlaces duros: falla con
+    "Permission denied" (SELinux no lo permite sobre shell_data_file) y deja
+    el payload a medias.  Por eso, antes de empaquetar, se comprueba que no
+    quede ni un enlace duro en el payload; si queda, se corta el empaquetado
+    en vez de subir un tar que no se va a poder extraer.
+
+    Los symlinks se dejan como symlinks: el payload tiene un farm de ellos
+    (libGL.so.1 -> libGL.so.1.7.0, /usr/share/doc/...) y toybox los crea sin
+    problema.  Con dereference=True, ademas, Python reventaba con los symlinks
+    rotos que apuntan fuera del paquete."""
+    duros = enlaces_duros(out)
+    if duros:
+        raise RuntimeError(
+            "el payload todavia tiene %d grupos de enlaces duros (ej. %s). "
+            "Ejecuta la poda antes de empaquetar."
+            % (len(duros), duros[0][0]))
+
+    import tarfile
+    base = os.path.dirname(out.rstrip("/"))
+    nombre = os.path.basename(out.rstrip("/"))
+    with tarfile.open(ruta_tar, "w:gz") as tf:
+        tf.add(out, arcname=nombre, recursive=True)
+    tam = os.path.getsize(ruta_tar)
+    log(f"Empaquetado {ruta_tar} ({tam/1e6:.1f} MB, sin enlaces duros)")
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", default="build/mesa")
     ap.add_argument("--cache", default="build/debs")
     ap.add_argument("--no-download", action="store_true")
+    ap.add_argument("--no-tar", action="store_true",
+                    help="no empaquetar el payload en un .tar.gz")
+    ap.add_argument("--solo-tar", action="store_true",
+                    help="no reextraer los .deb: solo podar y empaquetar lo que "
+                         "ya hay en el payload (para redesplegar)")
+    ap.add_argument("--tar", default="build/mesa.tar.gz",
+                    help="ruta del .tar.gz que se genera (por defecto "
+                         "build/mesa.tar.gz)")
     args = ap.parse_args()
 
     raiz = os.path.abspath(os.path.dirname(os.path.dirname(__file__)))
@@ -181,15 +289,21 @@ def main():
     else:
         idx = {}
 
-    log("Extrayendo los paquetes...")
-    os.makedirs(out, exist_ok=True)
-    for deb in sorted(os.listdir(cache)):
-        if not deb.endswith(".deb"):
-            continue
-        try:
-            extraer_deb(os.path.join(cache, deb), out)
-        except Exception as exc:  # noqa: BLE001
-            log(f"  aviso: no se pudo extraer {deb}: {exc}")
+    if args.solo_tar:
+        log("Modo --solo-tar: no se reextraen los .deb")
+    else:
+        log("Extrayendo los paquetes...")
+        os.makedirs(out, exist_ok=True)
+        for deb in sorted(os.listdir(cache)):
+            if not deb.endswith(".deb"):
+                continue
+            try:
+                extraer_deb(os.path.join(cache, deb), out)
+            except Exception as exc:  # noqa: BLE001
+                log(f"  aviso: no se pudo extraer {deb}: {exc}")
+
+    log("Podando los alias del megadriver de DRI...")
+    podar_alias_dri(out)
 
     log("")
     log("Comprobando los ficheros clave:")
@@ -224,6 +338,9 @@ def main():
     if faltan:
         log("Faltan: " + ", ".join(faltan))
         return 1
+    if not args.no_tar:
+        ruta_tar = os.path.join(raiz, args.tar) if not os.path.isabs(args.tar) else args.tar
+        empaquetar_tar(out, ruta_tar)
     log("El payload tiene Mesa con Zink, el loader de Vulkan y glibc.")
     return 0
 

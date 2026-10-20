@@ -438,6 +438,18 @@ fn montar_trampolin(destino: u64, original: &[u8], bytes: usize) -> Result<u64, 
     bloque.extend_from_slice(&OP_BR_X17.to_le_bytes());
     bloque.extend_from_slice(&(destino + bytes as u64).to_le_bytes());
 
+    // Diagnostico: el bloque original que se va a copiar y donde va a parar.
+    {
+        let mut hex = String::new();
+        for b in original.iter().take(16) {
+            hex.push_str(&format!("{:02x}", b));
+        }
+        crate::log::info(&format!(
+            "bloque original ({} bytes): {} -> reubicado en 0x{:x} (bloque de {} bytes)",
+            original.len(), hex, addr, bloque.len()
+        ));
+    }
+
     unsafe {
         std::ptr::copy_nonoverlapping(bloque.as_ptr(), addr as *mut u8, bloque.len());
         // La pagina se deja en RWX: el codigo tiene que ser ejecutable.
@@ -557,7 +569,7 @@ pub fn reescribir_pc_relativa(
             // mascara debe ser de 21 bits: con 19 se perdian los dos bits
             // altos y el ADRP relocated apuntaba a la pagina equivocada
             // (el juego se moria al ejecutar el salto).
-            let nuevo = ((delta >> 12) as u32) & 0x1_FFFF;
+            let nuevo = ((delta >> 12) as u32) & 0x1F_FFFF;
             let nuevo_immlo = nuevo & 0x3;
             let nuevo_immhi = (nuevo >> 2) & 0x7_FFFF;
             return Reescritura::Corregida(
@@ -571,7 +583,7 @@ pub fn reescribir_pc_relativa(
             return Reescritura::Imposible;
         }
         // ADR: alcance +-1 MB. El inmediato tambien es de 21 bits con signo.
-        let nuevo = (delta as u32) & 0x1_FFFF;
+        let nuevo = (delta as u32) & 0x1F_FFFF;
         let nuevo_immlo = nuevo & 0x3;
         let nuevo_immhi = (nuevo >> 2) & 0x7_FFFF;
         return Reescritura::Corregida(
@@ -604,7 +616,7 @@ pub fn reescribir_pc_relativa(
         if delta % 4 != 0 || delta < -(1i64 << 26) || delta > (1i64 << 26) {
             return Reescritura::Imposible;
         }
-        let nuevo = ((delta / 4) as u32) & 0x03FF_FFFF;
+        let nuevo = ((delta / 4) as u32) & 0x7_FFFF;
         return Reescritura::Corregida((insn & 0xFC00_0000) | nuevo);
     }
 
@@ -725,3 +737,59 @@ fn limpiar_cache(inicio: *mut c_void, fin: *mut c_void) {
 /// cache la garantiza el propio cargador al marcar la pagina ejecutable.
 #[cfg(not(target_arch = "aarch64"))]
 fn limpiar_cache(_inicio: *mut c_void, _fin: *mut c_void) {}
+
+#[cfg(test)]
+mod tests_adrp_real {
+    use super::*;
+
+    /// Caso REAL del motor 2.1.22 ARM64:
+    ///   GameRenderer::render empieza con
+    ///     0x17837e0  stp  x29, x30, [sp, #-0x20]!
+    ///     0x17837e4  stp  x20, x19, [sp, #0x10]
+    ///     0x17837e8  mov  x29, sp
+    ///     0x17837ec  adrp x8, 0x3eba000
+    /// El ADRP debe seguir apuntando a la MISMA pagina cuando se reubica en el
+    /// trampolin, que esta a otra pagina.
+    const ADRP: u32 = 0xf001_39a8;
+    const VIEJO_PC: u64 = 0xAAAA_BBBF_37EC;
+    const NUEVO_PC: u64 = 0xAAAA_BFBF_300C;
+    /// Pagina a la que apunta el ADRP original: (pc & !0xFFF) + imm21<<12.
+    const PAGINA_ESPERADA: u64 = 0xAAAA_BE32_A000;
+
+    /// Pagina a la que apunta una instruccion ADRP ya reescrita.
+    fn pagina_de(instruccion: u32, pc: u64) -> u64 {
+        let immlo = (instruccion >> 29) & 0x3;
+        let immhi = (instruccion >> 5) & 0x7_FFFF;
+        let imm21 = (immhi << 2) | immlo;
+        let imm21 = if (imm21 & 0x10_0000) != 0 {
+            imm21 | 0xFFE0_0000
+        } else {
+            imm21
+        };
+        (pc & !0xFFF).wrapping_add(((imm21 as i64) << 12) as u64)
+    }
+
+    #[test]
+    fn adrp_reubicado_apunta_a_la_misma_pagina() {
+        // El ADRP original apunta a esta pagina:
+        assert_eq!(
+            pagina_de(ADRP, VIEJO_PC),
+            PAGINA_ESPERADA,
+            "el ADRP original no apunta donde se espera"
+        );
+
+        match reescribir_pc_relativa(ADRP, VIEJO_PC, NUEVO_PC, VIEJO_PC, 16) {
+            Reescritura::Corregida(nueva) => {
+                assert_eq!(
+                    pagina_de(nueva, NUEVO_PC),
+                    PAGINA_ESPERADA,
+                    "el ADRP reubicado (0x{nueva:08x}) apunta a 0x{:x} en vez de 0x{:x}",
+                    pagina_de(nueva, NUEVO_PC),
+                    PAGINA_ESPERADA
+                );
+            }
+            Reescritura::Igual => panic!("el ADRP no se reescribio"),
+            Reescritura::Imposible => panic!("el ADRP se dio por imposible"),
+        }
+    }
+}

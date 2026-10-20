@@ -99,6 +99,19 @@ export SDL_AUDIODRIVER="${SDL_AUDIODRIVER:-dummy}"
 export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/data/local/tmp/xdg-runtime}"
 mkdir -p "$XDG_RUNTIME_DIR" 2>/dev/null || true
 
+# --- Inyector del mod 3D -------------------------------------------------
+# El .so engancha el pipeline de render del juego (resuelve los hooks por
+# nombre desde el symtab del ELF) y es lo que permite arrancar la partida y
+# dibujar el mundo en 3D. Es opcional: sin el, el juego funciona igual.
+INJECTOR="${INJECTOR:-/data/local/tmp/libxfactorvr_injector.so}"
+if [ -f "$INJECTOR" ] && [ "${XFACTORVR_USE_INJECTOR:-1}" = "1" ]; then
+    export LD_PRELOAD="$INJECTOR${LD_PRELOAD:+:$LD_PRELOAD}"
+    log "inyector: $INJECTOR"
+    # Destino de los hooks: por defecto el render del juego.
+    export XFACTORVR_HOOK_TARGET="${XFACTORVR_HOOK_TARGET:-GameRenderer::render}"
+    export XFACTORVR_HOOK_EVERY="${XFACTORVR_HOOK_EVERY:-60}"
+fi
+
 # --- 4. Estado inicial ------------------------------------------------------
 mkdir -p "$LOG_DIR" "$FACTORIO_DIR/config" "$FACTORIO_DIR/saves" 2>/dev/null || true
 if [ ! -f "$FACTORIO_DIR/config/config-path.cfg" ]; then

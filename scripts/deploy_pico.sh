@@ -43,13 +43,24 @@ print(d['name'] + '_' + d['version'])
 STREAM=0
 START_SERVER=1
 STRIP=0
+MODO_CLIENT=0
 for arg in "$@"; do
     case "$arg" in
         --stream)   STREAM=1 ;;
         --no-start) START_SERVER=0 ;;
         --strip)    STRIP=1 ;;
+        --client)   MODO_CLIENT=1 ;;
     esac
 done
+
+# El cliente GRAFICO (con Zink) es lo que permite jugar la campana: el
+# headless no tiene jugador. Necesita el payload de Mesa y el inyector.
+REMOTE_CLIENT="/data/local/tmp/factorio_client"
+REMOTE_MESA="/data/local/tmp/mesa"
+REMOTE_INJECTOR="/data/local/tmp/libxfactorvr_injector.so"
+LOCAL_CLIENT="$PROJECT_ROOT/factorio_client_arm64/factorio"
+LOCAL_MESA="$PROJECT_ROOT/build/mesa"
+LOCAL_INJECTOR="$PROJECT_ROOT/injector-linux/target/aarch64-unknown-linux-gnu/release/libxfactorvr_injector.so"
 
 echo "=== Desplegando XFactorVR en Pico 4 Ultra (modo standalone) ==="
 
@@ -133,14 +144,66 @@ else
     echo "    'pkg install glibc' el motor usara ese linker automaticamente."
 fi
 
+# 4b. Modo CLIENTE GRAFICO: el motor con graficos + Mesa/Zink + inyector.
+#
+# Es lo que hace falta para JUGAR LA CAMPANA: el headless no tiene jugador y
+# la campana lo exige (game.players[1] en on_init). Ademas el cliente
+# grafico es el que se puede enganchar con el inyector del mod 3D.
+if [ "$MODO_CLIENT" -eq 1 ]; then
+    echo "[4b/7] Desplegando el cliente GRAFICO con Mesa+Zink y el inyector..."
+
+    if [ ! -d "$LOCAL_CLIENT" ]; then
+        echo "    falta el cliente grafico en $LOCAL_CLIENT"
+        echo "    descomprime factorio_linux-arm64_2.1.22.tar.xz ahi."
+        exit 1
+    fi
+    if [ ! -f "$LOCAL_MESA/usr/lib/aarch64-linux-gnu/dri/zink_dri.so" ]; then
+        echo "    generando el payload de Mesa con Zink..."
+        python3 "$PROJECT_ROOT/scripts/prepare_mesa.py" >/dev/null 2>&1 || true
+    fi
+    if [ ! -f "$LOCAL_INJECTOR" ]; then
+        echo "    compilando el inyector para aarch64..."
+        cargo build --release --manifest-path "$PROJECT_ROOT/injector-linux/Cargo.toml" \
+            --target aarch64-unknown-linux-gnu >/dev/null 2>&1 || true
+    fi
+
+    CLIENT_TAR="$PROJECT_ROOT/build/factorio_client.tar"
+    MESA_TAR="$PROJECT_ROOT/build/mesa.tar.gz"
+    COPYFILE_DISABLE=1 tar -cf "$CLIENT_TAR" -C "$(dirname "$LOCAL_CLIENT")" "$(basename "$LOCAL_CLIENT")"
+    tar -czf "$MESA_TAR" -C "$(dirname "$LOCAL_MESA")" "$(basename "$LOCAL_MESA")"
+
+    echo "    cliente: $(du -h "$CLIENT_TAR" | cut -f1)  mesa: $(du -h "$MESA_TAR" | cut -f1)"
+    "$ADB" shell "mkdir -p $REMOTE_CLIENT $REMOTE_MESA"
+    "$ADB" push "$CLIENT_TAR" "$REMOTE_CLIENT/client.tar"
+    "$ADB" shell "cd $REMOTE_CLIENT && tar -xf client.tar && rm -f client.tar && chmod 755 factorio/bin/arm64/factorio && mkdir -p factorio/mods factorio/config factorio/saves"
+    "$ADB" push "$MESA_TAR" "$REMOTE_MESA/mesa.tar.gz"
+    "$ADB" shell "cd $REMOTE_MESA && tar -xzf mesa.tar.gz && rm -f mesa.tar.gz && chmod 755 mesa/lib/ld-linux-aarch64.so.1"
+    if [ -f "$LOCAL_INJECTOR" ]; then
+        "$ADB" push "$LOCAL_INJECTOR" "$REMOTE_INJECTOR"
+        "$ADB" shell "chmod 755 $REMOTE_INJECTOR"
+        echo "    inyector: $REMOTE_INJECTOR"
+    else
+        echo "    AVISO: sin inyector compilado."
+    fi
+    "$ADB" push "$PROJECT_ROOT/scripts/start_factorio_client.sh" "$REMOTE_SCRIPT"
+    "$ADB" shell "chmod 755 $REMOTE_SCRIPT"
+fi
+
 # 5. Mod puente
 # El nombre de la carpeta DEBE coincidir con <nombre>_<version> de info.json
 # o Factorio no carga el mod y el puente RCON no existe.
 echo "[5/7] Instalando el mod puente $MOD_ID..."
-"$ADB" shell "mkdir -p $REMOTE_FACTORIO/mods/$MOD_ID"
-"$ADB" push "$LOCAL_MOD/control.lua" "$REMOTE_FACTORIO/mods/$MOD_ID/control.lua"
-"$ADB" push "$LOCAL_MOD/info.json" "$REMOTE_FACTORIO/mods/$MOD_ID/info.json"
-"$ADB" shell "chmod 644 $REMOTE_FACTORIO/mods/$MOD_ID/control.lua $REMOTE_FACTORIO/mods/$MOD_ID/info.json"
+# En modo cliente el mod va al directorio del cliente grafico; en modo
+# headless, al del motor headless.
+if [ "$MODO_CLIENT" -eq 1 ]; then
+    MODS_DIR="$REMOTE_CLIENT/factorio/mods"
+else
+    MODS_DIR="$REMOTE_FACTORIO/mods"
+fi
+"$ADB" shell "mkdir -p $MODS_DIR/$MOD_ID"
+"$ADB" push "$LOCAL_MOD/control.lua" "$MODS_DIR/$MOD_ID/control.lua"
+"$ADB" push "$LOCAL_MOD/info.json" "$MODS_DIR/$MOD_ID/info.json"
+"$ADB" shell "chmod 644 $MODS_DIR/$MOD_ID/control.lua $MODS_DIR/$MOD_ID/info.json"
 
 # 6. Assets reales del juego (atlas de sprites, iconos y textos).
 # El motor VR dibuja los sprites que usa Factorio: sin el atlas se dibujan

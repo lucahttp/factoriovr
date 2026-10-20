@@ -110,7 +110,24 @@ CONFIG_DIR="$FACTORIO_DIR/config"
 SETTINGS_FILE="$CONFIG_DIR/server-settings.json"
 mkdir -p "$CONFIG_DIR" 2>/dev/null || true
 
-if [ ! -f "$SETTINGS_FILE" ]; then
+# En modo CAMPANA el auto_pause debe ser TRUE: el servidor congela el mapa
+# hasta que llega el jugador, porque si no el nivel de campana muere antes
+# (usa game.players[1] en su init). Verificado en el banco MP.
+if [ -n "${SCENARIO:-}" ]; then
+    log "Modo campana: auto_pause=true (el mapa espera al jugador)"
+    cat > "$SETTINGS_FILE" <<'JSON'
+{
+  "name": "XFactorVR",
+  "description": "Factorio para Realidad Mixta",
+  "visibility": { "public": false, "lan": true },
+  "require_user_verification": false,
+  "auto_pause": true,
+  "auto_pause_when_players_connect": false,
+  "autosave_interval": 10,
+  "autosave_slots": 3
+}
+JSON
+elif [ ! -f "$SETTINGS_FILE" ]; then
     log "Creando $SETTINGS_FILE con auto_pause desactivado..."
     cp /data/local/tmp/server-settings.json "$SETTINGS_FILE" 2>/dev/null \
         || cat > "$SETTINGS_FILE" <<'JSON'
@@ -233,15 +250,33 @@ fi
 # ---------------------------------------------------------------------------
 # Se lanza con nohup para que sobreviva al cierre de la shell de adb: el
 # servidor debe seguir corriendo con el visor desconectado del PC.
+#
+# Modo CAMPANA (SCENARIO=base/<campaña>): el servidor carga un escenario de
+# campaña en vez de una partida guardada. La campana necesita un JUGADOR real
+# (el nivel usa game.players[1]), asi que en este modo el cliente grafico se
+# conecta despues con --mp-connect. Y necesita auto_pause=true: con false el
+# mapa avanza antes de que llegue el jugador y el nivel muere.
 launch() {
     cd "$FACTORIO_DIR" || return 1
-    LD_LIBRARY_PATH="$GLIBC_LIB" nohup \
-        "$LOADER" --library-path "$GLIBC_LIB" "$FACTORIO_BIN" \
-        --start-server "$SAVE_FILE" \
-        --rcon-port "$RCON_PORT" \
-        --rcon-password "$RCON_PASSWORD" \
-        --mod-directory "$MOD_DIR" \
-        >>"$LOG_FILE" 2>&1 &
+    if [ -n "${SCENARIO:-}" ]; then
+        log "Arrancando el escenario de campana: $SCENARIO"
+        LD_LIBRARY_PATH="$GLIBC_LIB" nohup \
+            "$LOADER" --library-path "$GLIBC_LIB" "$FACTORIO_BIN" \
+            --start-server-load-scenario "$SCENARIO" \
+            --port "${SERVER_PORT:-34197}" \
+            --rcon-port "$RCON_PORT" \
+            --rcon-password "$RCON_PASSWORD" \
+            --mod-directory "$MOD_DIR" \
+            >>"$LOG_FILE" 2>&1 &
+    else
+        LD_LIBRARY_PATH="$GLIBC_LIB" nohup \
+            "$LOADER" --library-path "$GLIBC_LIB" "$FACTORIO_BIN" \
+            --start-server "$SAVE_FILE" \
+            --rcon-port "$RCON_PORT" \
+            --rcon-password "$RCON_PASSWORD" \
+            --mod-directory "$MOD_DIR" \
+            >>"$LOG_FILE" 2>&1 &
+    fi
     echo $!
 }
 

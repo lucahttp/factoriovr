@@ -154,10 +154,52 @@ if [ ! -f "$FACTORIO_DIR/config/server-settings.json" ]; then
 JSON
 fi
 
-# --- 5. Arranque ------------------------------------------------------------
-GAME_BIN="$FACTORIO_DIR/bin/arm64/factorio"
-SAVE="${SAVE:-$FACTORIO_DIR/saves/xfactorvr.zip}"
+# --- 5. Configuracion propia del cliente ------------------------------------
+# El motor deduce sus rutas de donde esta el config-path.cfg. Para que el
+# servidor y el cliente compartan el MISMO arbol de datos (1,4 GB) pero tengan
+# cada uno su write-data (y su .lock), el cliente usa un config.ini propio:
+#   [path]
+#   read-data=<raiz del juego>/data
+#   write-data=<directorio del cliente>
+# Es la unica forma de que el motor lo acepte: si el ejecutable esta en otro
+# sitio, deduce el write-data por si mismo y choca con el del servidor.
+GAME_DIR="${GAME_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
+GAME_DIR="${GAME_DIR_OVERRIDE:-/data/local/tmp/factorio}"
+CLIENT_DIR="${CLIENT_DIR:-/data/local/tmp/factorio_cliente}"
+SERVER_PORT="${SERVER_PORT:-34197}"
 
+mkdir -p "$CLIENT_DIR/config" "$CLIENT_DIR/saves" "$CLIENT_DIR/logs" 2>/dev/null || true
+CLIENT_CONFIG="$CLIENT_DIR/config/config.ini"
+if [ ! -f "$CLIENT_CONFIG" ]; then
+    log "Creando el config.ini del cliente..."
+    cat > "$CLIENT_CONFIG" <<CFG
+[path]
+read-data=$GAME_DIR/data
+write-data=$CLIENT_DIR
+
+[other]
+check-updates=false
+CFG
+fi
+
+# --- 6. Arranque ------------------------------------------------------------
+GAME_BIN="$GAME_DIR/bin/arm64/factorio"
+
+if [ -n "${SERVER_ADDR:-}" ]; then
+    # Modo campana: el juego corre en dos procesos del mismo arbol. El
+    # SERVIDOR simula y tiene el RCON (el RCON es funcion del servidor) y el
+    # CLIENTE se conecta para aportar el jugador que el nivel de campana
+    # exige (usa game.players[1]) y para pintar el mundo en 3D.
+    log "Conectando al servidor $SERVER_ADDR:$SERVER_PORT..."
+    exec "$LOADER" "$GAME_BIN" \
+        --config "$CLIENT_CONFIG" \
+        --window-size "${WIDTH}x${HEIGHT}" \
+        --mp-connect "$SERVER_ADDR:$SERVER_PORT"
+fi
+
+# Modo simple: el cliente juega en single-player (sin RCON, que en single
+# player no existe) sobre una partida guardada.
+SAVE="${SAVE:-$FACTORIO_DIR/saves/xfactorvr.zip}"
 if [ ! -f "$SAVE" ]; then
     log "Creando la partida inicial..."
     "$LOADER" "$GAME_BIN" --create "$SAVE" --config "$FACTORIO_DIR/config/config-path.cfg" \
@@ -170,8 +212,6 @@ log "  SDL: $SDL_VIDEODRIVER"
 
 exec "$LOADER" "$GAME_BIN" \
     --config "$FACTORIO_DIR/config/config-path.cfg" \
-    --width "$WIDTH" --height "$HEIGHT" \
+    --window-size "${WIDTH}x${HEIGHT}" \
     --fullscreen \
-    --rcon-port "$RCON_PORT" \
-    --rcon-password "$RCON_PASSWORD" \
     "$SAVE"

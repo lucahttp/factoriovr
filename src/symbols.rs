@@ -21,6 +21,13 @@ pub fn find_game_executable() -> Result<PathBuf> {
     }
 
     // 2. Rutas conocidas en dispositivo (Pico 4 Ultra) y host de desarrollo:
+    //
+    // OJO: el orden importa. Los `fallback_rva` de `offsets.rs` se derivaron del
+    // binario HEADLESS 2.1.22 (`factorio_arm64/`), así que ese debe seguir siendo
+    // el primero que resuelve. El cliente GRÁFICO ARM64 2.1.22 (standalone de
+    // factorio.com) va AL FINAL a propósito: son otro build, con otras
+    // direcciones. Para migrar a él hay que re-derivar los `fallback_rva` desde
+    // su propio `.symtab` (ver docs/ADR-001-factorio-grafico-en-android.md).
     let candidates = [
         PathBuf::from("/sdcard/XFactorVR/factorio"),
         PathBuf::from("factorio_arm64/bin/arm64/factorio"),
@@ -28,6 +35,9 @@ pub fn find_game_executable() -> Result<PathBuf> {
         PathBuf::from("factorio_linux/bin/x64/factorio"),
         PathBuf::from("/Volumes/X10Pro/SteamLibrary/steamapps/common/Factorio_Linux/bin/x64/factorio"),
         PathBuf::from("factorio/bin/x64/factorio"),
+        // Cliente gráfico ARM64 nativo 2.1.22 (standalone oficial, con PNGs)
+        PathBuf::from("factorio_linux_arm64/factorio/bin/arm64/factorio"),
+        PathBuf::from("/Volumes/X10Pro/Projects/xfactorvr/factorio_linux_arm64/factorio/bin/arm64/factorio"),
     ];
 
     for path in &candidates {

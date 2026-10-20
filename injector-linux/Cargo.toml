@@ -1,0 +1,30 @@
+[package]
+name = "xfactorvr-injector"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.70"
+description = "Inyector LD_PRELOAD para Factorio 2.1.22 ARM64 Linux: detour ARM64 + resolucion de simbolos por nombre desde el symtab del ELF"
+license = "MIT"
+publish = false
+
+[lib]
+name = "xfactorvr_injector"
+crate-type = ["cdylib", "rlib"]
+path = "src/lib.rs"
+
+# Sin dependencias externas: solo std. El .so se carga con LD_PRELOAD y no
+# debe arrastrar nada que el juego no tenga ya cargado.
+[dependencies]
+
+[profile.release]
+opt-level = 2
+lto = true
+codegen-units = 1
+# panic=abort: el juego es un proceso ajeno y una excepcion no debe matarlo.
+# Por eso el codigo del hook esta escrito sin panic posible (nada de unwrap).
+panic = "abort"
+overflow-checks = false
+strip = true
+
+# El crate es independiente del workspace raiz del proyecto.
+[workspace]

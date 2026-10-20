@@ -28,6 +28,7 @@ REMOTE_DATA="/sdcard/XFactorVR"
 REMOTE_FACTORIO="/data/local/tmp/factorio_arm64"
 REMOTE_GLIBC="/data/local/tmp/glibc"
 REMOTE_SCRIPT="/data/local/tmp/start_factorio_standalone.sh"
+REMOTE_CLIENT_SCRIPT="/data/local/tmp/start_factorio_client.sh"
 
 # Payload local del motor headless ARM64.
 LOCAL_FACTORIO="$PROJECT_ROOT/factorio_arm64"
@@ -44,12 +45,14 @@ STREAM=0
 START_SERVER=1
 STRIP=0
 MODO_CLIENT=0
+MODO_CAMPANA=0
 for arg in "$@"; do
     case "$arg" in
         --stream)   STREAM=1 ;;
         --no-start) START_SERVER=0 ;;
         --strip)    STRIP=1 ;;
         --client)   MODO_CLIENT=1 ;;
+        --campana)  MODO_CLIENT=1; MODO_CAMPANA=1 ;;
     esac
 done
 
@@ -242,16 +245,51 @@ fi
 echo "[7/7] Subiendo el script de arranque standalone..."
 "$ADB" push "$PROJECT_ROOT/scripts/start_factorio_standalone.sh" "$REMOTE_SCRIPT"
 "$ADB" shell "chmod 755 $REMOTE_SCRIPT"
+if [ "$MODO_CLIENT" -eq 1 ]; then
+    "$ADB" push "$PROJECT_ROOT/scripts/start_factorio_client.sh" "$REMOTE_CLIENT_SCRIPT"
+    "$ADB" shell "chmod 755 $REMOTE_CLIENT_SCRIPT"
+fi
+
+# 7b. Modo campana: preparar el nivel y arrancar servidor + cliente.
+if [ "$MODO_CAMPANA" -eq 1 ]; then
+    echo "    Preparando el nivel de campana para multijugador..."
+    # El nivel de campana es de single-player: hay que esperar al jugador en su
+    # init y usar el helper story_show_message_dialog (que es el unico que
+    # funciona en MP). Ver docs/ADR-005-campana-headless-mp.md.
+    NIVEL="$LOCAL_CLIENT/factorio/data/base/campaigns/tutorial/level-01"
+    if [ -f "$NIVEL/control.lua" ]; then
+        # Se copia el nivel a data/base/scenarios/xfv-nivel (una carpeta de
+        # escenario) y se parchea para multijugador.
+        python3 "$PROJECT_ROOT/scripts/preparar_campana_mp.py" "$NIVEL" \
+            --copiar-como xfv-nivel 2>&1 | tail -3 || true
+    else
+        echo "    AVISO: no se encuentra el nivel de campana en $NIVEL"
+    fi
+fi
 
 # 8. Arrancar el servidor Factorio
 if [ "$START_SERVER" -eq 1 ]; then
-    echo "Arrancando el servidor Factorio headless..."
-    if "$ADB" shell "sh $REMOTE_SCRIPT" 2>&1 | tee /tmp/xfactorvr_standalone.log; then
-        echo "Servidor Factorio en marcha."
+    if [ "$MODO_CAMPANA" -eq 1 ]; then
+        echo "Arrancando el servidor con el escenario de campana..."
+        "$ADB" shell "SCENARIO=base/xfv-nivel sh $REMOTE_SCRIPT" 2>&1 | tee /tmp/xfactorvr_campana.log || true
     else
-        echo "AVISO: el servidor no arranco. Revisa /tmp/xfactorvr_standalone.log"
-        echo "       y el registro en el visor: /data/local/tmp/factorio_arm64/logs/standalone.log"
+        echo "Arrancando el servidor Factorio headless..."
+        if "$ADB" shell "sh $REMOTE_SCRIPT" 2>&1 | tee /tmp/xfactorvr_standalone.log; then
+            echo "Servidor Factorio en marcha."
+        else
+            echo "AVISO: el servidor no arranco. Revisa /tmp/xfactorvr_standalone.log"
+            echo "       y el registro en el visor: /data/local/tmp/factorio_arm64/logs/standalone.log"
+        fi
     fi
+fi
+
+# 8b. Arrancar el cliente grafico (modo campana): se conecta al servidor y
+# aporta el JUGADOR que el nivel de campana exige.
+if [ "$MODO_CAMPANA" -eq 1 ] && [ "$MODO_CLIENT" -eq 1 ]; then
+    echo "Arrancando el cliente grafico (conecta al servidor, aporta el jugador)..."
+    "$ADB" shell "SERVER_ADDR=127.0.0.1 GAME_DIR=$REMOTE_CLIENT/factorio sh $REMOTE_CLIENT_SCRIPT" \
+        >/dev/null 2>&1 &
+    sleep 3
 fi
 
 # 8. Iniciar la aplicación

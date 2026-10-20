@@ -106,7 +106,77 @@ El port es, por tanto, el mismo trabajo que hizo el autor pero sobre ELF: un `.s
 └───────────────────────────────────────────────────────────────────────┘
 ```
 
-## 5. Los dos caminos, y por cual vamos
+## 5. Resultados de la validacion en contenedor (ARM64, sin GPU)
+
+Todo lo de abajo esta **verificado**, no supuesto. Contenedor `ubuntu:24.04` arm64 con Mesa
+25.2.8 y el cliente grafico ARM64 2.1.22 real.
+
+### 5.1 Zink da OpenGL 4.6 sobre Vulkan
+
+Con `MESA_LOADER_DRIVER_OVERRIDE=zink`, `LIBGL_DRIVERS_PATH=.../dri`, `EGL_PLATFORM=surfaceless`
+y el ICD de lavapipe:
+
+```
+EGL driver name: zink
+OpenGL core profile renderer: zink Vulkan 1.4(llvmpipe (LLVM 20.1.2, 128 bits) (MESA_LLVMPIPE))
+OpenGL core profile version: 4.6 (Core Profile) Mesa 25.2.8
+```
+
+Factorio pide **OpenGL 3.3 core**: Zink da 4.6. Sobra.
+
+**Detalle que costo tiempo**: Zink rechaza por defecto los dispositivos Vulkan de tipo CPU
+(`VK_PHYSICAL_DEVICE_TYPE_CPU`, que es lavapipe) y falla con `ZINK: failed to choose pdev`.
+Se acepta con `LIBGL_ALWAYS_SOFTWARE=1`. **En el visor hay que dejar esa variable SIN poner**,
+porque con ella Mesa elegiria llvmpipe (software) en vez del driver de Adreno.
+
+### 5.2 El cliente grafico real arranca y renderiza
+
+```
+Factorio 2.1.22 (build 87719, linux-arm64, full)      <- "full": no es el headless
+Video driver: offscreen
+Initialised OpenGL:[1] zink Vulkan 1.4(...); driver: 4.6 (Core Profile) Mesa 25.2.8
+  [Version] 4.6
+Parallel sprite loader initialized (threads: 1, bitmaps: 4696)
+Texture processor created (2048). GPU accelerated compression Supported: yes
+Estimated VRAM usage for textures: 329.20 MB
+Factorio initialised
+```
+
+La cadena completa es: **Factorio (full) -> SDL2 (estatico, video driver offscreen) -> EGL
+surfaceless -> Mesa Zink -> Vulkan -> driver**. El cliente trae SDL2 estatico dentro del binario
+y carga la capa grafica en runtime con `dlopen` de `libGL.so.1` / `libEGL.so.1` /
+`libvulkan.so.1`, asi que basta con el payload de Mesa y las variables de entorno.
+
+El cliente grafico solo enloca `libc`, `libm` y `libresolv`: no necesita nada mas.
+
+### 5.3 El payload de Mesa para el visor
+
+`scripts/prepare_mesa.py` genera `build/mesa/` con glibc de Debian, Mesa (con `zink_dri.so`),
+loader de Vulkan, lavapipe y SDL2: **193 MB en disco, 56 MB comprimido**. El launcher
+`scripts/start_factorio_client.sh` configura el ICD de Adreno (que se busca en
+`/vendor/lib64/hw/vulkan`) y las variables de Mesa.
+
+### 5.4 Lo que NO hay todavia: el jugador de la campana
+
+La campana **necesita un jugador real**. El nivel `base/campaigns/tutorial/level-01/control.lua`
+usa `game.players[1]` en `on_init` (linea 11: `game.players[1].surface.create_entity(...)`), asi
+que en un servidor headless revienta con "attempt to index a nil value".
+
+Y el cliente grafico **no tiene opcion de linea de comandos para arrancar una partida en
+single-player**: `--start-server`, `--start-server-load-scenario` y `--run-replay` pasan todos a
+"Running in headless mode" (sin graficos), y sin ellos el cliente se queda en el menu sin
+abrir RCON.
+
+De ahi la pieza que falta: **el inyector nativo** (el `.so` del port de factorio-3d-mod), que
+ademas de enganchar el render puede **arrancar la partida programaticamente** dentro del
+proceso del cliente grafico. Los simbolos existen: `AppManager::restartGame`, `Game::process`,
+`Scenario::loadFactory`, `MainMenu::process`.
+
+Por eso el port de factorio-3d-mod no es opcional en la via de la campana: es el unico
+componente que vive en el proceso del cliente y por tanto el unico que puede crear la partida
+con su jugador.
+
+## 6. Los dos caminos, y por cual vamos
 
 **A. El juego renderiza (GZH-XR puro).** El cliente gráfico corre con Zink, el mod 3D sustituye
 las entidades por modelos 3D y deforma la camara; nosotros capturamos el framebuffer y lo
@@ -123,7 +193,7 @@ el motor real).
 **A es el objetivo**: es el unico que cumple "Factorio Steam Linux Version ARM64" y el unico que
 da un jugador real para la campaña.
 
-## 6. Orden de trabajo de A
+## 7. Orden de trabajo de A
 
 1. **Validar Zink en el contenedor ARM64** (sin GPU): Mesa + lavapipe (Vulkan por software) +
    `SDL_VIDEODRIVER=offscreen`. Si el cliente arranca y abre RCON, la cadena esta montada y solo
@@ -140,7 +210,7 @@ da un jugador real para la campaña.
 
 Los puntos 1-2 no requieren el visor: se validan en el contenedor. El punto 3 es el grueso.
 
-## 7. Riesgos
+## 8. Riesgos
 
 | Riesgo | Mitigacion |
 |---|---|

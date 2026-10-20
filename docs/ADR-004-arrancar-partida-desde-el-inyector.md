@@ -323,6 +323,10 @@ la transicion se hace **sin crashing**. El banco usa ahora Xvfb.
 | `XFACTORVR_AUTOSTART_DELAY_S` | Segundos que espera desde que el motor esta listo antes de arrancar (por defecto 3). |
 | `XFACTORVR_AUTOSTART_DIFFICULTY` | Dificultad del contexto (0..3, por defecto 1, que es lo que usa `ScenarioExecutionContext::getDefault()`). |
 | `XFACTORVR_AUTOSTART_DEBUG=1` | Vuelca la pila de estados del AppManager antes de arrancar. |
+| `XFACTORVR_FASE` | `menu` = fuerza el retorno de `AppManager::process()` a "false" (el motor se queda en la fase de preparacion). `natural` (por defecto) = devuelve el valor del motor. |
+| `XFACTORVR_ESTADO_APP` | Valor con el que se fuerza `AppManager+0x58` ("estado de la app"). 0 = no se toca (por defecto). |
+| `XFACTORVR_ESTADO_INGAME` | 1 = empuja el estado `InGame` encima del `InLoadingGameBox` (por defecto 0: con el `InGame` puesto el juego peta con un SIGSEGV). |
+| `XFACTORVR_LLAMAR_CARGA` | 1 = llama a mano al `process()` del `InLoadingGameBox` desde el hook de `processEvents` (por defecto 0: con la llamada manual el juego peta con un SIGSEGV). |
 
 ## 10. Como se comprueba
 
@@ -332,6 +336,194 @@ bash scripts/test_autostart.sh          # el juego arranca solo y el RCON respon
 ```
 
 `scripts/test_autostart.sh` **no se da por bueno un caso que no se ha
-comprobado**: sale con 0 solo si el log del cliente muestra la carga del
-nivel **y** el RCON responde de verdad; con 1 si no arranca o si el RCON no
-contesta; con 2 si no se ha podido ni hacer la prueba.
+comprobado**: sale con 0 solo si el RCON **abre y contesta** **y** el tick del
+juego **avanza** (dos consultas a `/time` separadas unos segundos dan valores
+distintos); con 1 si no arranca, si el RCON no contesta o si el tick no
+avanza; con 2 si no se ha podido ni hacer la prueba.
+
+Ojo: leer "Loading map ..." en el log **no** prueba que la partida arranque: el
+motor lee el fichero del save y se puede quedar atascado ahi sin llegar a
+crear el mapa. Por eso el banco comprueba el RCON y el tick, no el log.
+
+## 11. La fase del bucle: lo que se ha averiguado con `gdb` (2026-10-20)
+
+Este apartado recoge la investigacion hecha con `gdb` sobre el proceso real
+(conteneror `xfactorvr-client`, cliente grafico 2.1.22 ARM64). **La idea que
+se iba a probar (forzar `isAppInMenu()` a `false`) resulto ser falsa**, y lo
+que se ha encontrado es otra cosa.
+
+### 11.1 La hipotesis de `isAppInMenu()` NO funciona: no se llama
+
+Se puso un punto de ruptura en `AppManager::isAppInMenu()` y otro de control en
+`MainLoop::processEvents(bool)`, y se conto en 40 frames:
+
+```
+FINAL processEvents=40  InLoadingGameBox::process=0  isAppInMenu=0
+```
+
+* `MainLoop::processEvents(bool)` -> **40 de 40** (se llama en cada frame).
+* `AppManager::isAppInMenu()` -> **0**.
+* `InLoadingGameBox::process()` -> **0**.
+
+**`isAppInMenu()` no se llama ni una vez en el bucle**, asi que engancharlo
+para que devuelva `false` no puede cambiar nada. La razon: solo lo llama
+`MainLoop::processEvents()` en un camino raro (el de "escapar del menu"), y el
+motor decide si esta en el menu con la **misma comprobacion pero enlineada**
+dentro de `AppManager::process()` (el tipo del estado de la cima: 2 = menu,
+0 y 3 tambien cuentan como menu).
+
+### 11.2 Quien llama al `process()` de los estados
+
+`AppManager::process()` (AppManager.cpp:264) llama al `process(AppManager*)`
+**del estado que esta en lo alto de la pila**, en cada frame. Con un punto de
+ruptura en esa llamada se vio que el motor estaba llamando a
+`InGame::process(AppManager*)` y no a `InLoadingGameBox::process()`.
+
+La tabla virtual de `AppManagerState` (sacada de las relocalizaciones de
+`_ZTV10InMainMenu` y `_ZTV16InLoadingGameBox`) es:
+
+```text
+  +0x38  getName() const          +0x60  isListeningToEvent() const
+  +0x40  getStateType() const      +0x68  isSavingMap() const
+  +0x48  process(AppManager*)      +0x70  shouldQueueEvents() const
+  +0x50  processAction(...)        +0x78  isLoadingMap() const
+  +0x58  processEvent(...)         +0x80  isToggleable() const
+```
+
+Los tipos de estado (`getStateType()`) son: 0 = `AppManagerState` (y
+`InLoadingGameBox`, `InCreatingGame`, ...), 1 = `InEmptyScreen`, 2 = los menus
+(`InMainMenu`, `InSinglePlayerMenu`, ...), 3 = los dialogos, **4 = `InGame`**,
+6 = `InTutorial`, 7 = las cajas de guardado, 8 = la pantalla de fin.
+
+### 11.3 El bloqueo de verdad: la caja de carga se autodestruye
+
+`InLoadingGameBox::process()` (AppManagerStates.cpp:1659) tiene un guardia:
+
+```asm
+2b38e90: ldr  x8, [x19, #0x260]      ; fin de la pila de estados
+2b38e94: ldur x0, [x8, #-0x8]       ; el estado de la CIMA
+2b38e98: ldr  x8, [x0]
+2b38e9c: ldr  x8, [x8, #0x40]       ; getStateType()
+2b38ea0: blr  x8
+2b38ea4: cmp  w0, #0x4              ; es un InGame?
+2b38ea8: b.eq 0x2b38ed4            ; si: solo startRconIfEnabled()
+2b38eac: mov  x0, x19
+2b38eb0: bl   AppManager::popStateToMainMenu()   ; si no: ABANDONA la carga
+2b38eb4: mov  w0, #0x10
+2b38eb8: bl   operator new          ; un InGame de 16 bytes
+2b38ec8: stp  x8, xzr, [x1]         ; vtable de InGame
+2b38ed0: bl   AppManager::pushState()
+2b38ed4: bl   AppManager::startRconIfEnabled()
+```
+
+O sea: **si el estado de la cima no es de tipo `InGame` (4), el motor da la
+carga por perdida, saca TODOS los estados hasta el menu (y con ello destruye
+el `InLoadingGameBox` y su hilo del cargador) y empuja un `InGame` de 16
+bytes**. Eso es exactamente lo que pasaba: el log del cliente lo delata con
+
+```
+Warning Map.cpp:372: Map loading failed: Loading cancelled.
+```
+
+y la pila de estados acababa siendo `[InMainMenu(2), InGame(4)]` en vez de
+`[InMainMenu(2), InLoadingGameBox(0)]`.
+
+### 11.4 Que falta para que el mapa llegue a existir
+
+`InGame::process()` (AppManagerStates.cpp:94) es el estado que de verdad
+conduce la partida, y para crear el mapa necesita dos cosas:
+
+```asm
+2b3d140: ldr  x8, [x22, #0x78]      ; el Scenario que se esta cargando
+2b3d144: cbz  x8, 0x2b3d228        ; sin Scenario: se rinde
+2b3d148: ldr  x8, [x22, #0x2c0]     ; la vista de control (GameView)
+...
+2b3d190: ldr  w8, [x19, #0x58]      ; AppManager+0x58 ("estado de la app")
+2b3d198: cmp  w8, #0x1
+2b3d19c: b.ne 0x2b3d254
+2b3d1a0: ldr  w8, [x9, #0x770]      ; Scenario+0x770
+2b3d1a4: cmp  w8, #0x2
+```
+
+Medido en el proceso real: `MainLoop+0x78` (el Scenario) **si** estaba puesto
+(lo pone el propio `InLoadingGameBox::process()`), pero `MainLoop+0x2c0` (la
+vista de control) estaba a **NULL**, `AppManager+0x58` valia **0** (y el motor
+solo escribe 1, 2 y 3 en el campo, nunca 0) y `Scenario+0x770` valia **1**
+(la carga no habia terminado).
+
+### 11.5 Lo que se ha cambiado en el inyector
+
+* Modulo nuevo `injector-linux/src/fase_juego.rs`: la tabla virtual de
+  `AppManagerState`, los offsets de la pila de estados del `AppManager`, el
+  campo "estado de la app" y los helpers para leer la cima y llamar a su
+  `process()`.
+* Se engancha `MainLoop::processEvents(bool)` (ademas de
+  `AppManager::process()`): se llama **una vez por frame en todas las fases**,
+  mientras que `GameRenderer::render` solo se llama cuando se dibuja el
+  juego, y en la fase de carga no se dibuja. Es el sitio correcto para
+  diagnosticar la carga, y (con `XFACTORVR_LLAMAR_CARGA=1`) para llamar a
+  mano al `process()` del `InLoadingGameBox`.
+  **Por defecto NO se llama a mano**: el motor ya lo llama (es el estado de la
+  cima) y la llamada manual acaba en su rama de "abandono", que hace
+  `AppManager::popState()`, y `popState()` toca el GUI y revienta si se llama
+  desde fuera del bucle de la aplicacion (ver 7.4). Con la llamada manual el
+  juego peta con un SIGSEGV.
+* Se empuja un estado `InGame` encima del `InLoadingGameBox` para que el
+  guardia de 11.3 no mate la carga. **Va desactivado por defecto**
+  (`XFACTORVR_ESTADO_INGAME=1` lo activa): el `InGame` de 16 bytes es un
+  objeto a medio construir, y su `process()` lo saca de la pila (hace
+  `popStateToMainMenu()`) cuando no encuentra la vista de control; el motor
+  sigue llamando a su `process()` sobre memoria ya liberada y el juego peta
+  con un SIGSEGV. Con el `InGame` puesto la carga ya no se cancela (desaparece
+  el "Map loading failed: Loading cancelled."), pero el mapa no llega a
+  crearse.
+* Ya **no** se fuerza el retorno de `AppManager::process()` a "false": el
+  razonamiento de 7.1 era erroneo, `prePrepare()` llama a
+  `AppManager::process()` en cada frame tambien en la fase del juego. Se
+  puede volver al comportamiento antiguo con `XFACTORVR_FASE=menu`.
+* El parser del ELF ahora guarda tambien los simbolos de tipo objeto
+  (`STT_OBJECT`), que hacen falta para resolver `_ZTV6InGame`.
+
+### 11.6 Lo que SIGUE sin funcionar
+
+**El banco sigue en rojo** (`scripts/test_autostart.sh` sale con 1): el RCON no
+abre y el tick no avanza. La carga se queda en
+
+```
+Loading map /factorio/saves/client_test.zip: 523809 bytes.
+Loading level.dat: 620896 bytes.
+Info Scenario.cpp:152: Map version 2.1.22-1
+Loading script.dat: 1184 bytes.
+Checksum for script __level__/control.lua: 3704017257
+```
+
+y de ahi no pasa. Con los puntos de ruptura puestos se vio que:
+
+* `InLoadingGameBox::process()` **no se llama** (0 de 40 frames) y
+  `InGame::process()` **si** (40 de 40): el motor esta llamando al `process()`
+  del `InGame` que el propio motor empujo al abandonar la carga.
+* El diagnostico del inyector lo confirma en vivo:
+
+  ```
+  carga: tick=1   estado_cargador=0xffffffff flag=0xffffffff cima_tipo=0 estados=2
+  carga: tick=960 estado_cargador=0xffffffff flag=0xffffffff cima_tipo=4 estados=2
+  ```
+
+  Al principio la cima es el `InLoadingGameBox` (tipo 0) y un frame despues ya
+  es un `InGame` (tipo 4) con la caja de carga **destruida** (el puntero al
+  cargador se ha puesto a NULL): el motor se ha cargado el mapa a si mismo
+  con su rama de abandono de 11.3.
+* `MainLoop+0x78` (el `Scenario`) **si** esta puesto, pero `MainLoop+0x2c0`
+  (la vista de control) esta a **NULL**, y `InGame::process()` sin vista de
+  control no crea el mapa.
+* Los hilos de trabajo del motor estan todos parados en
+  `WorkerThread::loop()` esperando trabajo: **nadie esta cargando el mapa**.
+
+O sea: falta poner al motor en el estado en que el GUI de verdad pondria las
+cosas (la vista de control y el `Scenario` con el estado "cargado"), en vez de
+empujar a mano estados a medio construir. La via que queda es la que usa el
+propio GUI: `InLoadGameDialog::process()` (que es quien crea la vista de
+control, `MainLoop+0x2b8` y `MainLoop+0x2c0`) y despues el
+`InLoadingGameBox`, en ese orden.
+
+

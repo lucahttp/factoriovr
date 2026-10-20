@@ -205,7 +205,121 @@ def main():
                     escena[off + 1] = int(escena[off + 1] * (1 - al) + g * al)
                     escena[off + 2] = int(escena[off + 2] * (1 - al) + b * al)
 
-    # Orden de dibujo: primero lo que esta mas abajo (terreno), luego objetos.
+    # --- Terreno real -------------------------------------------------------
+    # El mod manda el tile dominante y las celdas que difieren. Cada textura de
+    # terreno es una rejilla de 32x32 variantes de 32 px, igual que en el
+    # juego: se coge la variante que toca a cada casilla.
+    terreno = snap.get("terrain") or {}
+    nombres = terreno.get("names") or []
+    if nombres and terreno.get("w") and terreno.get("h"):
+        x0, y0 = terreno.get("x0", 0), terreno.get("y0", 0)
+        w, h = terreno["w"], terreno["h"]
+        base = terreno.get("base", 0)
+        excepciones = {}
+        for c in terreno.get("tiles", []):
+            excepciones[(c[0], c[1])] = c[2]
+
+        def nombre_en(cx, cy):
+            rx, ry = cx - x0, cy - y0
+            if rx < 0 or ry < 0 or rx >= w or ry >= h:
+                return None
+            i = excepciones.get((rx, ry), base)
+            return nombres[i] if i < len(nombres) else None
+
+        # TEXTUR por nombre (32 px por variante dentro de la textura).
+        TEXTUR = {}
+
+        # Las texturas de terreno son una TIRA de 4096 px con variantes de
+        # 32 px (128 columnas) y bandas de 32 filas; hay bandas transparentes
+        # que no sirven. SeSampling de las 3 primeras bandas.
+        ANCHO_VARIANTES = 128
+        BANDAS = 3
+
+        def variante(cx, cy):
+            """Celda de la textura que usa cada casilla (hash de la posicion)."""
+            vx = ((cx * 73856093) ^ (cy * 23)) % ANCHO_VARIANTES
+            vy = ((cx * 19349663) ^ (cy * 83492791)) % BANDAS
+            return vx, vy * 32
+
+        # Filas de textura que hacen falta por cada tipo de terreno.
+        filas_por_terreno = {}
+        for cy in range(y0, y0 + h):
+            for cx in range(x0, x0 + w):
+                nombre = nombre_en(cx, cy)
+                if not nombre:
+                    continue
+                vx, vy = variante(cx, cy)
+                needed = filas_por_terreno.setdefault(nombre, set())
+                for k in range(32):
+                    needed.add(vy + k)
+
+        def cargar_textura(nombre):
+            """Decodifica solo las filas de textura que hacen falta."""
+            if nombre in TEXTUR:
+                return TEXTUR[nombre]
+            ruta = os.path.join(args.assets, "terrain", f"{nombre}.png")
+            if not os.path.exists(ruta):
+                TEXTUR[nombre] = None
+                return None
+            try:
+                cab = ext.read_png_header(ruta)
+                filas = {}
+                for idx, fila in ext.decode_png_rows(
+                    ruta, wanted_rows=filas_por_terreno.get(nombre, set())
+                ):
+                    filas[idx] = fila
+                TEXTUR[nombre] = (filas, cab)
+            except Exception as exc:  # noqa: BLE001
+                print(f"  aviso: no se pudo decodificar {ruta}: {exc}", file=sys.stderr)
+                TEXTUR[nombre] = None
+            return TEXTUR[nombre]
+
+        for cy in range(y0, y0 + h):
+            for cx in range(x0, x0 + w):
+                nombre = nombre_en(cx, cy)
+                if not nombre:
+                    continue
+                tex = cargar_textura(nombre)
+                if not tex:
+                    continue
+                filas, cab = tex
+                tw = cab.width
+                th = cab.height
+                if tw <= 0 or th <= 0:
+                    continue
+                # Variante: 32x32 celdas de 32 px dentro de la textura.
+                # Se elige con un hash de la posicion (como hace Factorio),
+                # si no salen bandas repetidas.
+                vx = ((cx * 73856093) ^ (cy * 193)) % 32
+                vy = ((cx * 19349663) ^ (cy * 83492791)) % 32
+                sx = vx * 32
+                sy = vy * 32
+                if sx + 32 > tw or sy + 32 > th:
+                    continue
+                # La escena dibuja una casilla como T x T px.
+                dx = int((cx - x0) * T)
+                dy = int((cy - y0) * T)
+                for py in range(T):
+                    ty = dy + py
+                    if ty < 0 or ty >= H:
+                        continue
+                    fila = filas.get(sy + py * 32 // T) if filas else None
+                    if fila is None:
+                        continue
+                    for px in range(T):
+                        tx = dx + px
+                        if tx < 0 or tx >= W:
+                            continue
+                        off = (sx + px * 32 // T) * 4
+                        if off + 3 >= len(fila):
+                            continue
+                        r, g, b = fila[off], fila[off + 1], fila[off + 2]
+                        o = (ty * W + tx) * 4
+                        escena[o] = r
+                        escena[o + 1] = g
+                        escena[o + 2] = b
+
+    # --- Entidades por encima del terreno ------------------------------------
     for e in sorted(entidades, key=lambda z: z.get("y", 0.0)):
         nombre = e.get("t", "")
         sid = ids.get(nombre, 0)

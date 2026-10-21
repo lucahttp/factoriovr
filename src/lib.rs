@@ -888,6 +888,66 @@ pub unsafe extern "C" fn xfactorvr_get_terrain_tile(
     }
 }
 
+/// Area de terreno visible: casilla origen y tamaño.
+///
+/// Devuelve false si todavia no hay terreno (el mundo aun no ha llegado).
+#[no_mangle]
+pub unsafe extern "C" fn xfactorvr_get_terrain_area(
+    out_x0: *mut i32,
+    out_y0: *mut i32,
+    out_w: *mut i32,
+    out_h: *mut i32,
+) -> bool {
+    if out_x0.is_null() || out_y0.is_null() || out_w.is_null() || out_h.is_null() {
+        return false;
+    }
+    let mundo = match game_bridge::get_simulation_world().read() {
+        Ok(m) => m,
+        Err(_) => return false,
+    };
+    let t = &mundo.terrain;
+    if t.is_empty() {
+        return false;
+    }
+    *out_x0 = t.x0;
+    *out_y0 = t.y0;
+    *out_w = t.w as i32;
+    *out_h = t.h as i32;
+    true
+}
+
+/// Nombre del terreno en una casilla del area visible.
+///
+/// Las coordenadas son relativas al area (0..w, 0..h).  Escribe el nombre
+/// en `out_name` (como mucho `out_len` bytes, con terminador) y devuelve
+/// false si la casilla no tiene terreno o el nombre no cabe.
+#[no_mangle]
+pub unsafe extern "C" fn xfactorvr_get_terrain_at(
+    rel_x: i32,
+    rel_y: i32,
+    out_name: *mut std::os::raw::c_char,
+    out_len: i32,
+) -> bool {
+    if out_name.is_null() || out_len <= 1 {
+        return false;
+    }
+    let mundo = match game_bridge::get_simulation_world().read() {
+        Ok(m) => m,
+        Err(_) => return false,
+    };
+    let nombre = match mundo.terrain.tile_at(rel_x, rel_y) {
+        Some(n) => n,
+        None => return false,
+    };
+    let bytes = nombre.as_bytes();
+    if bytes.len() + 1 > out_len as usize {
+        return false;
+    }
+    std::ptr::copy_nonoverlapping(bytes.as_ptr(), out_name as *mut u8, bytes.len());
+    *out_name.add(bytes.len()) = 0;
+    true
+}
+
 /// Pixeles de una pagina del atlas en RGBA8 crudo, listos para subir a la GPU.
 ///
 /// El atlas se parte en paginas porque una textura de mas de 4096 px de alto no

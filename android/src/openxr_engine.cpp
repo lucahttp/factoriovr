@@ -560,9 +560,44 @@ static pfn_xfactorvr_get_atlas_page_size    s_get_atlas_page_size    = nullptr;
 static pfn_xfactorvr_get_atlas_page_pixels  s_get_atlas_page_pixels  = nullptr;
 static pfn_xfactorvr_get_sprite_frame       s_get_sprite_frame       = nullptr;
 
+// --- Atlas del suelo --------------------------------------------------------
+// El terreno real del mapa (hierba, tierra, arena...) viene en celdas de
+// 32x32 recortadas de las hojas del juego y empaquetadas en un atlas
+// paginado, igual que los sprites.  Android no decodifica PNG, asi que el
+// Rust lo entrega en crudo.
+
 // El atlas se parte en paginas: una textura de mas de 4096 px de alto no se
 // puede subir en la GPU movil (GL_MAX_TEXTURE_SIZE).
 #define XFACTORVR_MAX_ATLAS_PAGES 32
+
+typedef int  (*pfn_xfactorvr_get_terrain_page_count)();
+typedef bool (*pfn_xfactorvr_get_terrain_page_size)(uint32_t page, int* out_w, int* out_h);
+typedef int  (*pfn_xfactorvr_get_terrain_page_pixels)(uint32_t page, uint8_t* out, int max_len);
+typedef int  (*pfn_xfactorvr_get_terrain_tile_size)();
+typedef int  (*pfn_xfactorvr_get_terrain_variant_count)(const char* nombre);
+typedef bool (*pfn_xfactorvr_get_terrain_tile)(const char* nombre, uint32_t variant, float* out);
+typedef bool (*pfn_xfactorvr_get_terrain_area)(int* x0, int* y0, int* w, int* h);
+typedef bool (*pfn_xfactorvr_get_terrain_at)(int rel_x, int rel_y, char* out_name, int out_len);
+
+static pfn_xfactorvr_get_terrain_page_count    s_get_terrain_page_count    = nullptr;
+static pfn_xfactorvr_get_terrain_page_size     s_get_terrain_page_size     = nullptr;
+static pfn_xfactorvr_get_terrain_page_pixels   s_get_terrain_page_pixels   = nullptr;
+static pfn_xfactorvr_get_terrain_tile_size     s_get_terrain_tile_size     = nullptr;
+static pfn_xfactorvr_get_terrain_variant_count s_get_terrain_variant_count = nullptr;
+static pfn_xfactorvr_get_terrain_tile          s_get_terrain_tile          = nullptr;
+static pfn_xfactorvr_get_terrain_area          s_get_terrain_area          = nullptr;
+static pfn_xfactorvr_get_terrain_at            s_get_terrain_at            = nullptr;
+
+static GLuint s_tex_terrain[XFACTORVR_MAX_ATLAS_PAGES] = {0};
+static int    s_terrain_page_w[XFACTORVR_MAX_ATLAS_PAGES] = {0};
+static int    s_terrain_page_h[XFACTORVR_MAX_ATLAS_PAGES] = {0};
+static int    s_terrain_page_count = 0;
+static bool   s_terrain_probed = false;
+// Contador de fotogramas: la malla del suelo se rehace cada 30 frames.
+static int    s_terrain_frame = 0;
+
+// El atlas se parte en paginas: una textura de mas de 4096 px de alto no se
+// puede subir en la GPU movil (GL_MAX_TEXTURE_SIZE).
 static GLuint s_tex_atlas[XFACTORVR_MAX_ATLAS_PAGES] = {0};
 static int    s_atlas_page_w[XFACTORVR_MAX_ATLAS_PAGES] = {0};
 static int    s_atlas_page_h[XFACTORVR_MAX_ATLAS_PAGES] = {0};
@@ -576,6 +611,8 @@ struct SpriteBatch {
     std::vector<DioramaVertex> verts;
 };
 static SpriteBatch s_sprite_batches[XFACTORVR_MAX_ATLAS_PAGES];
+// El suelo va en sus propios lotes (una por pagina del atlas de terreno).
+static SpriteBatch s_terrain_batches[XFACTORVR_MAX_ATLAS_PAGES];
 typedef bool (*pfn_xfactorvr_get_player_inventory)(PlayerItemFfi* out_items, uint32_t max_items, uint32_t* out_count);
 typedef bool (*pfn_xfactorvr_craft_item)(uint32_t item_id, uint32_t count);
 typedef bool (*pfn_xfactorvr_get_resource_patches)(ResourcePatchFfi* out_patches, uint32_t max_patches, uint32_t* out_count);
@@ -1077,6 +1114,46 @@ static bool ensure_atlas_texture() {
     return s_atlas_page_count > 0;
 }
 
+// --- Atlas del suelo real ----------------------------------------------------
+// El suelo del mapa (hierba, tierra, arena...) son celdas de 32x32 recortadas
+// de las hojas de terreno del juego.  Van en su propio atlas, paginado por el
+// mismo motivo que los sprites.
+static bool ensure_terrain_texture() {
+    if (s_terrain_probed) return s_terrain_page_count > 0;
+    s_terrain_probed = true;
+    if (!s_get_terrain_page_count || !s_get_terrain_page_size || !s_get_terrain_page_pixels) return false;
+
+    int pages = s_get_terrain_page_count();
+    if (pages <= 0 || pages > XFACTORVR_MAX_ATLAS_PAGES) {
+        LOGI("openxr_engine: no hay atlas de suelo (paginas=%d)", pages);
+        return false;
+    }
+
+    for (int p = 0; p < pages; ++p) {
+        int w = 0, h = 0;
+        if (!s_get_terrain_page_size((uint32_t)p, &w, &h) || w <= 0 || h <= 0) continue;
+        size_t bytes = (size_t)w * (size_t)h * 4u;
+        std::vector<uint8_t> pixels(bytes);
+        int written = s_get_terrain_page_pixels((uint32_t)p, pixels.data(), (int)bytes);
+        if (written <= 0) continue;
+
+        GLuint tex = 0;
+        glGenTextures(1, &tex);
+        glBindTexture(GL_TEXTURE_2D, tex);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, pixels.data());
+        s_tex_terrain[p] = tex;
+        s_terrain_page_w[p] = w;
+        s_terrain_page_h[p] = h;
+        s_terrain_page_count = p + 1;
+    }
+    LOGI("openxr_engine: atlas de suelo cargado (%d paginas)", s_terrain_page_count);
+    return s_terrain_page_count > 0;
+}
+
 // Anade al lote un quad plano: el sprite tumbado sobre la mesa. El arte de
 // Factorio es una vista cenital, asi que tumbado es la proyeccion correcta.
 static void add_sprite_quad(std::vector<DioramaVertex>& verts,
@@ -1111,8 +1188,10 @@ static void add_sprite_quad(std::vector<DioramaVertex>& verts,
 // Sube el lote de sprites de una pagina a la GPU y lo dibuja tumbado sobre la
 // mesa. Cada pagina del atlas es una textura y se pinta por separado.
 static void draw_sprite_batch(SpriteBatch& batch, uint32_t page,
-                              const float* model, const float* mvp) {
+                              const float* model, const float* mvp,
+                              const GLuint* texturas = nullptr) {
     if (batch.verts.empty() || page >= (uint32_t)s_atlas_page_count) return;
+    const GLuint* tex = texturas ? texturas : s_tex_atlas;
 
     if (batch.vao == 0) {
         batch.vao = create_mesh_vao(batch.verts, batch.vbo);
@@ -1127,7 +1206,7 @@ static void draw_sprite_batch(SpriteBatch& batch, uint32_t page,
     glUniformMatrix4fv(s_model_loc, 1, GL_FALSE, model);
     glUniformMatrix4fv(s_mvp_loc, 1, GL_FALSE, mvp);
     glActiveTexture(GL_TEXTURE0);
-    glBindTexture(GL_TEXTURE_2D, s_tex_atlas[page]);
+    glBindTexture(GL_TEXTURE_2D, tex[page]);
     glUniform1i(s_tex_loc, 0);
     glUniform1f(s_use_tex_loc, 1.0f);
     glUniform1f(s_lit_loc, 1.0f);
@@ -1142,6 +1221,61 @@ static void draw_sprite_batch(SpriteBatch& batch, uint32_t page,
 
     glUniform1f(s_use_tex_loc, 0.0f);
     glBindVertexArray(0);
+}
+
+// Malla del suelo real: un quad por casilla con la textura del terreno.
+//
+// El area la manda el mod (el tile dominante y las celdas que difieren), asi
+// que aqui solo hay que traducir cada casilla a su rect del atlas.  La
+// variante se elige con un hash de la posicion, igual que hace el juego, para
+// que las casillas contiguas no se repitan.
+static void build_terrain_mesh(float pan_x, float pan_y) {
+    for (int p = 0; p < XFACTORVR_MAX_ATLAS_PAGES; ++p) {
+        s_terrain_batches[p].verts.clear();
+    }
+    if (!s_get_terrain_area || !s_get_terrain_at || !s_get_terrain_tile) return;
+    if (!ensure_terrain_texture()) return;
+
+    int x0 = 0, y0 = 0, w = 0, h = 0;
+    if (!s_get_terrain_area(&x0, &y0, &w, &h) || w <= 0 || h <= 0) return;
+    // Tope de seguridad: el area visible no deberia pasar de esto.
+    if ((long)w * (long)h > 256L * 256L) return;
+
+    char nombre[64];
+    for (int ry = 0; ry < h; ++ry) {
+        for (int rx = 0; rx < w; ++rx) {
+            if (!s_get_terrain_at(rx, ry, nombre, (int)sizeof(nombre))) continue;
+            int variantes = s_get_terrain_variant_count
+                ? s_get_terrain_variant_count(nombre)
+                : 0;
+            if (variantes <= 0) continue;
+
+            int tx = x0 + rx;
+            int ty = y0 + ry;
+            uint32_t hash = (uint32_t)(tx * 73856093) ^ (uint32_t)(ty * 19349663);
+            uint32_t variante = hash % (uint32_t)variantes;
+
+            float rect[5];
+            if (!s_get_terrain_tile(nombre, variante, rect)) continue;
+            int page = (int)rect[4];
+            if (page < 0 || page >= XFACTORVR_MAX_ATLAS_PAGES) continue;
+            float pw = (float)s_terrain_page_w[page];
+            float ph = (float)s_terrain_page_h[page];
+            if (pw <= 0.0f || ph <= 0.0f) continue;
+
+            float u0 = rect[0] / pw;
+            float v0 = rect[1] / ph;
+            float u1 = (rect[0] + rect[2]) / pw;
+            float v1 = (rect[1] + rect[3]) / ph;
+            // Una casilla son 32 px en el juego y 0.04 m en la mesa.
+            float mx = (tx - pan_x) * 0.04f;
+            float mz = (ty - pan_y) * 0.04f;
+            // El suelo va justo encima del suelo de concreto de la mesa.
+            add_sprite_quad(s_terrain_batches[page].verts, mx, mz, 0.0009f,
+                            0.02f, 0.02f, u0, v0, u1, v1,
+                            1.0f, 1.0f, 1.0f, 1.0f);
+        }
+    }
 }
 
 static void init_glb_loader() {
@@ -1169,6 +1303,14 @@ static void init_glb_loader() {
     s_get_atlas_page_size = (pfn_xfactorvr_get_atlas_page_size)dlsym(handle, "xfactorvr_get_atlas_page_size");
     s_get_atlas_page_pixels = (pfn_xfactorvr_get_atlas_page_pixels)dlsym(handle, "xfactorvr_get_atlas_page_pixels");
     s_get_sprite_frame = (pfn_xfactorvr_get_sprite_frame)dlsym(handle, "xfactorvr_get_sprite_frame");
+    s_get_terrain_page_count = (pfn_xfactorvr_get_terrain_page_count)dlsym(handle, "xfactorvr_get_terrain_page_count");
+    s_get_terrain_page_size = (pfn_xfactorvr_get_terrain_page_size)dlsym(handle, "xfactorvr_get_terrain_page_size");
+    s_get_terrain_page_pixels = (pfn_xfactorvr_get_terrain_page_pixels)dlsym(handle, "xfactorvr_get_terrain_page_pixels");
+    s_get_terrain_tile_size = (pfn_xfactorvr_get_terrain_tile_size)dlsym(handle, "xfactorvr_get_terrain_tile_size");
+    s_get_terrain_variant_count = (pfn_xfactorvr_get_terrain_variant_count)dlsym(handle, "xfactorvr_get_terrain_variant_count");
+    s_get_terrain_tile = (pfn_xfactorvr_get_terrain_tile)dlsym(handle, "xfactorvr_get_terrain_tile");
+    s_get_terrain_area = (pfn_xfactorvr_get_terrain_area)dlsym(handle, "xfactorvr_get_terrain_area");
+    s_get_terrain_at = (pfn_xfactorvr_get_terrain_at)dlsym(handle, "xfactorvr_get_terrain_at");
 
     if (!s_load_glb || !s_get_live_entities) {
         void* mod_handle = dlopen("libxfactorvr.so", RTLD_NOW | RTLD_GLOBAL);
@@ -1650,6 +1792,20 @@ static void draw_tabletop_scene(const float* vp_mat,
                 }
             }
         }
+    }
+
+    // Suelo real del mapa: un quad por casilla con la textura del terreno.
+    // Se reconstruye cada pocos fotogramas (el terreno no cambia cada frame)
+    // y se pinta antes que las entidades, para que quede debajo.
+    if (is_primary_eye) {
+        s_terrain_frame = (s_terrain_frame + 1) % 30;
+        if (s_terrain_frame == 0) {
+            build_terrain_mesh(s_view_pan_x, s_view_pan_y);
+        }
+    }
+    for (int p = 0; p < s_terrain_page_count; ++p) {
+        draw_sprite_batch(s_terrain_batches[p], (uint32_t)p, active_model, vp_mat,
+                          s_tex_terrain);
     }
 
     // Lote de sprites reales de Factorio, tumbados sobre la mesa. Cada pagina

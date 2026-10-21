@@ -343,6 +343,8 @@ static N_ENTIDADES: AtomicUsize = AtomicUsize::new(0);
 
 type GlGetIntegerv = unsafe extern "C" fn(pname: u32, params: *mut i32);
 type GlGetError = unsafe extern "C" fn() -> u32;
+/// `glIsEnabled(capability)`.
+type GlIsEnabled = unsafe extern "C" fn(capability: u32) -> u8;
 /// `glBindFramebuffer(target, framebuffer)`.
 type GlBindFramebuffer = unsafe extern "C" fn(target: u32, framebuffer: u32);
 type GlCreateShader = unsafe extern "C" fn(shader_type: u32) -> u32;
@@ -411,6 +413,8 @@ const GL_TRIANGLES: u32 = 0x0004;
 const GL_FLOAT: u32 = 0x1406;
 const GL_UNSIGNED_INT: u32 = 0x1405;
 const GL_DEPTH_TEST: u32 = 0x0B71;
+const GL_SCISSOR_TEST: u32 = 0x0C11;
+const GL_SCISSOR_BOX: u32 = 0x0C10;
 const GL_CULL_FACE: u32 = 0x0B44;
 const GL_BLEND: u32 = 0x0BE2;
 const GL_SRC_ALPHA: u32 = 0x0302;
@@ -442,6 +446,7 @@ const GL_SAMPLES: u32 = 0x80A9;
 struct Gl {
     get_integerv: GlGetIntegerv,
     get_error: GlGetError,
+    is_enabled: GlIsEnabled,
     bind_framebuffer: GlBindFramebuffer,
     create_shader: GlCreateShader,
     shader_source: GlShaderSource,
@@ -477,6 +482,7 @@ struct Gl {
 struct GlAddr {
     get_integerv: usize,
     get_error: usize,
+    is_enabled: usize,
     bind_framebuffer: usize,
     create_shader: usize,
     shader_source: usize,
@@ -618,6 +624,7 @@ fn resolver_gl(simbolos: &resolver::Simbolos) -> Option<GlAddr> {
     Some(GlAddr {
         get_integerv: dir!("glad_glGetIntegerv"),
         get_error: dir!("glad_glGetError"),
+        is_enabled: dir!("glad_glIsEnabled"),
         bind_framebuffer: dir!("glad_glBindFramebuffer"),
         create_shader: dir!("glad_glCreateShader"),
         shader_source: dir!("glad_glShaderSource"),
@@ -672,6 +679,7 @@ fn construir_gl(dir: &GlAddr) -> Option<Gl> {
     Some(Gl {
         get_integerv: ptr!(get_integerv),
         get_error: ptr!(get_error),
+        is_enabled: ptr!(is_enabled),
         bind_framebuffer: ptr!(bind_framebuffer),
         create_shader: ptr!(create_shader),
         shader_source: ptr!(shader_source),
@@ -1368,8 +1376,12 @@ fn leer_framebuffer(gl: &Gl, vp: &[i32; 4], origen: &str) -> Option<()> {
             // no es lo que se ha pintado (y el cubo no sale nunca).
             let fb_dibujo = gl_int(gl, GL_DRAW_FRAMEBUFFER_BINDING);
             let fb_lectura = gl_int(gl, GL_READ_FRAMEBUFFER_BINDING);
+            let scissor = unsafe { (gl.is_enabled)(GL_SCISSOR_TEST) } != 0;
+            let mut caja_recorte = [0i32; 4];
+            unsafe { (gl.get_integerv)(GL_SCISSOR_BOX, caja_recorte.as_mut_ptr()) };
             log::info(&format!(
-                "diagnostico stream: framebuffer dibujo={fb_dibujo} lectura={fb_lectura} pixeles_cubo={pixeles}"
+                "diagnostico stream: framebuffer dibujo={fb_dibujo} lectura={fb_lectura} pixeles_cubo={pixeles} scissor={scissor} recorte={:?}",
+                caja_recorte
             ));
         }
         Some(())
@@ -1553,6 +1565,10 @@ fn dibujar_cajas(gl: &Gl, vp: &[i32; 4]) {
     let depth_previo = gl_int(gl, GL_DEPTH_TEST);
     let blend_previo = gl_int(gl, GL_BLEND);
     let cull_previo = gl_int(gl, GL_CULL_FACE);
+    // El motor dibuja el mundo por trozos con el recorte (scissor) activado:
+    // si esta puesto, el cubo solo se ve en el trozo que se este pintando en
+    // ese momento (y casi nunca). Se quita mientras se dibuja el cubo.
+    let scissor_previo = unsafe { (gl.is_enabled)(GL_SCISSOR_TEST) } != 0;
 
     // Estado de dibujo.
     //
@@ -1564,6 +1580,9 @@ fn dibujar_cajas(gl: &Gl, vp: &[i32; 4]) {
         (gl.disable)(GL_DEPTH_TEST);
         (gl.disable)(GL_CULL_FACE);
         (gl.disable)(GL_BLEND);
+        if scissor_previo {
+            (gl.disable)(GL_SCISSOR_TEST);
+        }
         (gl.blend_func_separate)(
             GL_SRC_ALPHA,
             GL_ONE_MINUS_SRC_ALPHA,
@@ -1645,6 +1664,9 @@ fn dibujar_cajas(gl: &Gl, vp: &[i32; 4]) {
         }
         if cull_previo != 0 {
             (gl.enable)(GL_CULL_FACE);
+        }
+        if scissor_previo {
+            (gl.enable)(GL_SCISSOR_TEST);
         }
         (gl.use_program)(prog_previo as u32);
     }

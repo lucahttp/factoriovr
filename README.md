@@ -2,7 +2,7 @@
 
 **Factorio** Mixed Reality port (Tabletop / 3D Diorama) designed to run **Standalone** on **Pico 4 Ultra** (Qualcomm Snapdragon XR2 Gen 2, PICO OS / Android 14).
 
-The factory is projected onto your real table as an interactive three-dimensional diorama with full-color stereo passthrough, support for `.glb` 3D models, and hardware upscaling via **Snapdragon Game Super Resolution (Qualcomm SGSR)**.
+The factory is projected onto your real table as an interactive three-dimensional diorama with full-color stereo passthrough and support for `.glb` 3D models. The game itself also runs for real: its own framebuffer is streamed to the headset and shown as a stereo panel, with the 3D mod drawn inside the game's own GL context.
 
 ---
 
@@ -54,12 +54,10 @@ The factory is projected onto your real table as an interactive three-dimensiona
 * [`src/game_bridge.rs`](src/game_bridge.rs): Real Factorio simulation engine (deposits, furnaces, assemblers, inventory) and Source RCON IPC client.
 * [`src/lib.rs`](src/lib.rs): Entry points `_init`, `xfactorvr_init`, `xfactorvr_load_glb`, `xfactorvr_free_glb`, inventory and crafting C FFI exports.
 * [`mods/xfactorvr_bridge/`](mods/xfactorvr_bridge/): Companion Factorio Lua mod implementing remote interfaces for entity placement, mining, inventory sync, and recipe crafting.
-* [`src/renderer/`](src/renderer/): OpenGL ES 3.2 graphics pipeline:
-  * [`warp.rs`](src/renderer/warp.rs): Original 2D ground deformation onto the 3D plane with sharp-bilinear filtering.
-  * [`model.rs`](src/renderer/model.rs): GLTF 3D model rendering with massive GPU instancing.
-  * [`sgsr.rs`](src/renderer/sgsr.rs): Qualcomm Snapdragon super-resolution module for Adreno 740.
-* [`src/openxr/`](src/openxr/): OpenXR stereoscopic session, dual eye matrices, color passthrough control, and Pico controller action mapping.
-* [`shaders/`](shaders/): GLSL ES 3.20 shaders (`warp.vert/frag`, `model.vert/frag`, `sky.vert/frag`, and `sgsr/`).
+* [`src/openxr/actions.rs`](src/openxr/actions.rs): Pico controller mapping to Factorio events and **what each hand does** (pick up from the ground, take from a chest, load the furnace). Pure logic, testable without the headset.
+* [`src/game_bridge.rs`](src/game_bridge.rs): RCON bridge to the real engine: world snapshot (entities, terrain, patches), inventory, orders.
+* [`src/assets.rs`](src/assets.rs) and [`src/terreno.rs`](src/terreno.rs): The game's own sprite atlas and terrain; the ground mesh is computed here (testable without the visor).
+* [`shaders/`](shaders/): GLSL ES 3.20 reference shaders taken from Generals-Zero-Hour-XR (`warp`, `model`, `sky` and `sgsr`). **The current engine does not use them** (it has its own inline in C++): they are the base for porting SGSR upscaling.
 * [`android/src/openxr_engine.cpp`](android/src/openxr_engine.cpp): Native C++ OpenXR engine based on Generals Zero Hour XR with STAGE space world-locking support, GLB model loading, multi-tab holographic UI, 3D AAudio spatial audio, and 90 FPS stereo rendering.
 * [`android/`](android/): Native app container (`AndroidManifest.xml` with PICO VR/MR intents and `launcher.cpp` launcher).
 * [`scripts/`](scripts/):

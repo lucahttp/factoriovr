@@ -261,6 +261,7 @@ impl InputManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tabletop::TabletopConfig;
 
     #[test]
     fn test_gatillo_sobre_item_suelto_lo_coge() {
@@ -352,5 +353,42 @@ mod tests {
             ),
             None
         );
+    }
+
+    /// El mapeo de mandos a eventos de Factorio: el gatillo es el raton
+    /// izquierdo y el gripo el derecho.  Este test vivia en openxr/mod.rs
+    /// (que se borro: la sesion OpenXR de Rust no la usaba nadie).
+    #[test]
+    fn test_controller_input_to_factorio_event() {
+        let mut input = InputManager::new();
+        let mut tabletop = TabletopManager::new(TabletopConfig::default());
+
+        let mut right_controller = ControllerState {
+            ray_origin: Vec3::new(0.0, 0.0, -1.0),
+            ray_direction: Vec3::new(0.0, -1.0, 0.0),
+            trigger_clicked: true,
+            ..Default::default()
+        };
+        let left_controller = ControllerState::default();
+
+        let events = input.process_controllers(
+            &right_controller,
+            &left_controller,
+            &mut tabletop,
+            0.016,
+        );
+
+        assert!(events.hovered_tile.is_some());
+        assert!(events.left_mouse_down, "Debe registrarse el clic izquierdo al presionar el gatillo");
+
+        // Soltar gatillo
+        right_controller.trigger_clicked = false;
+        let events2 = input.process_controllers(
+            &right_controller,
+            &left_controller,
+            &mut tabletop,
+            0.016,
+        );
+        assert!(events2.left_mouse_up, "Debe registrarse el levantamiento de boton");
     }
 }

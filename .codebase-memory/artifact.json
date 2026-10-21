@@ -1,0 +1,12 @@
+{
+    "schema_version": 2,
+    "commit": "8694b69462bbf05c62fc88fa8c1a2a45ae937990",
+    "indexed_at": "2026-10-21T22:00:20Z",
+    "project": "xfactorvr",
+    "nodes": 6493,
+    "edges": 12613,
+    "original_size": 8126464,
+    "compressed_size": 848212,
+    "compression_level": 9,
+    "reconcile_basis": "git-clean-head"
+}

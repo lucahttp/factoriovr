@@ -7,7 +7,6 @@ pub mod assets;
 pub mod game_bridge;
 pub mod offsets;
 pub mod openxr;
-pub mod renderer;
 pub mod symbols;
 pub mod tabletop;
 pub mod terreno;

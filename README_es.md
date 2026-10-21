@@ -2,7 +2,7 @@
 
 Port de **Factorio** en Realidad Mixta (Tabletop / Maqueta 3D) diseñado para ejecutarse de forma **Standalone** en **Pico 4 Ultra** (Qualcomm Snapdragon XR2 Gen 2, PICO OS / Android 14).
 
-La fábrica se proyecta sobre tu mesa real como un diorama tridimensional interactivo con Passthrough estéreo a color, soporte para modelos 3D `.glb` y reescalado de hardware mediante **Snapdragon[...]
+La fábrica se proyecta sobre tu mesa real como un diorama tridimensional interactivo con Passthrough estéreo a color y soporte para modelos 3D `.glb`. Y además el juego corre de verdad: su propio framebuffer viaja al visor y se ve como un panel estéreo, con el mod 3D dibujado dentro del contexto GL del juego (ADR-009). El reescalado de hardware mediante **Snapdragon[...]
 
 ---
 
@@ -48,13 +48,11 @@ La fábrica se proyecta sobre tu mesa real como un diorama tridimensional intera
 * [`src/offsets.rs`](src/offsets.rs): Definiciones de símbolos y offsets de Factorio bajo la ABI Itanium de GCC/Clang (`GameRenderer::render`, `AssemblingMachine::draw`, `RenderParameters::center[...]
 * [`src/tabletop.rs`](src/tabletop.rs): Matemáticas del volumen de mesa, anclaje espacial en metros, cargador de modelos `.glb` de `factorio-3d-mod` con muestreo de texturas y raycast de mando 6D[...]
 * [`src/lib.rs`](src/lib.rs): Puntos de entrada `_init`, `xfactorvr_init`, `xfactorvr_load_glb` y `xfactorvr_free_glb` (C FFI).
-* [`src/renderer/`](src/renderer/): Pipeline gráfico OpenGL ES 3.2:
-  * [`warp.rs`](src/renderer/warp.rs): Deformación del suelo 2D original sobre el plano 3D con filtrado *sharp-bilinear*.
-  * [`model.rs`](src/renderer/model.rs): Renderizado de modelos 3D GLTF con instanciación masiva en GPU.
-  * [`sgsr.rs`](src/renderer/sgsr.rs): Módulo de super-resolución de Qualcomm Snapdragon para Adreno 740.
-* [`src/openxr/`](src/openxr/): Sesión estereoscópica OpenXR, matrices oculares duales, control de Passthrough a color y mapeo de acciones de mandos Pico.
-* [`shaders/`](shaders/): Shaders GLSL ES 3.20 (`warp.vert/frag`, `model.vert/frag`, `sky.vert/frag`, y `sgsr/`).
-* [`android/src/openxr_engine.cpp`](android/src/openxr_engine.cpp): Motor OpenXR nativo en C++ basado en Generals Zero Hour XR con soporte para STAGE space world-locking, carga de modelos GLB, con[...]
+* [`src/openxr/actions.rs`](src/openxr/actions.rs): Mapeo de los mandos Pico a eventos de Factorio y **decisión de qué hace cada mano** (coger del suelo, sacar de la caja, meter en el horno). Lógica pura, se prueba sin dispositivo.
+* [`src/game_bridge.rs`](src/game_bridge.rs): Puente RCON con el motor real: instantánea del mundo (entidades, terreno, yacimientos), inventario, órdenes.
+* [`src/assets.rs`](src/assets.rs) y [`src/terreno.rs`](src/terreno.rs): Atlas de sprites y terreno reales del juego; la malla del suelo se calcula aquí (testeable sin visor).
+* [`android/src/openxr_engine.cpp`](android/src/openxr_engine.cpp): **Aquí se dibuja todo**: sesión OpenXR, contexto GLES, shaders, sprites, terreno, panel del render real del juego y las acciones de las manos. Sustituyó al pipeline gráfico que estuvo en Rust (ver ADR-010).
+* [`shaders/`](shaders/): Shaders GLSL ES 3.20 de referencia tomados de Generals-Zero-Hour-XR (`warp`, `model`, `sky` y `sgsr`). **El motor actual no los usa** (lleva los suyos en el C++): son la base para portar el reescalado SGSR.
 * [`android/`](android/): Contenedor de app nativa (`AndroidManifest.xml` con intents VR/MR de PICO y lanzador `launcher.cpp`).
 * [`scripts/`](scripts/):
   * [`build_apk.sh`](scripts/build_apk.sh): Compila la librería Rust para `aarch64-linux-android` con el NDK y genera el APK firmado.

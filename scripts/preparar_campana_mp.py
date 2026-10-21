@@ -110,14 +110,14 @@ local function _xfv_personaje_virtual()
     return remote.call("xfactorvr", "get_virtual_player")
   end)
   if ok then info = res end
-  if type(info) ~= "table" then return nil end
+  if type(info) ~= "table" then return nil, nil end
 
   local un = info.unit_number
-  if not un then return nil end
+  if not un then return nil, info end
   local ent = nil
   pcall(function() ent = game.get_entity_by_unit_number(un) end)
-  if ent and ent.valid then return ent end
-  return nil
+  if ent and ent.valid then return ent, info end
+  return nil, info
 end
 
 -- ¿Hay alguien jugando? El jugador real o el personaje virtual.
@@ -169,7 +169,6 @@ end
 local _xfv_metodos = {
   set_goal_description = function() end,
   clear_recipe_notifications = function() end,
-  get_quick_bar_slot = function() return nil end,
   set_controller = function() end,
   print = function() end,
   disable_recipe_groups = _xfv_desactivar_recetas,
@@ -181,13 +180,37 @@ local _xfv_metodos = {
 -- jugador, asi que casi todo (position, surface, force, opened, selected,
 -- crafting_queue_size, get_item_count, can_reach_entity, teleport...) sale
 -- directamente del personaje.
-local function _xfv_emulador(ch)
+--
+-- `info` es lo que contesta el mod por el remoto: de ahi sale la GUI virtual
+-- (un personaje no tiene GUI, pero el nivel de campana la mira).
+local function _xfv_emulador(ch, info)
+  -- La barra rapida virtual: un personaje no tiene barra rapida (es del
+  -- jugador con raton), pero el nivel de campana mira si el jugador tiene la
+  -- perforadora asignada a un hueco antes de dejarle colocarla.
+  local function get_quick_bar_slot(page, slot)
+    if not info or not info.quick_bar then return nil end
+    local nombre = info.quick_bar[tostring(page) .. "_" .. tostring(slot)]
+    if not nombre then return nil end
+    return { type = "filter", filter = { name = nombre } }
+  end
+
   return setmetatable({}, {
     __index = function(_, k)
       -- `character` es el propio personaje (un jugador tiene su personaje).
       if k == "character" then
         if ch and ch.valid then return ch end
         return nil
+      end
+      -- La GUI del jugador virtual (el personaje no tiene ninguna).
+      if k == "opened_gui_type" then
+        if info and info.gui_type ~= nil then return info.gui_type end
+      end
+      -- La cola de fabricacion virtual (el personaje no puede usar la real:
+      -- no tiene controlador, asi que el juego no le fabrica nada).
+      if k == "crafting_queue_size" then
+        if info and info.crafting_queue_size and info.crafting_queue_size > 0 then
+          return info.crafting_queue_size
+        end
       end
       -- Propiedades vivas del personaje.
       if ch and ch.valid then
@@ -196,6 +219,7 @@ local function _xfv_emulador(ch)
       end
       local fijo = _xfv_fijos[k]
       if fijo ~= nil then return fijo end
+      if k == "get_quick_bar_slot" then return get_quick_bar_slot end
       local m = _xfv_metodos[k]
       if m ~= nil then return m end
       -- El cursor nunca puede ser nil.
@@ -219,9 +243,9 @@ end
 local function jugador()
   local p = game.players[1]
   if p and p.valid then return p end
-  local ch = _xfv_personaje_virtual()
+  local ch, info = _xfv_personaje_virtual()
   if not ch then return nil end
-  return _xfv_emulador(ch)
+  return _xfv_emulador(ch, info)
 end
 
 -- [XFactorVR-MP] El nivel solo avanza cuando le llega un evento del juego, y
@@ -230,19 +254,27 @@ end
 -- tiene controlador de GUI, asi que esos eventos no le llegan NUNCA y la
 -- historia se queda clavada.
 --
--- Solucion: cuando no hay ningun jugador real conectado, se le pasa a la
--- historia un evento sintetico de "accion del jugador" en cada tick. Las
--- condiciones de los nodos son de ESTADO (selected, get_item_count, la
--- distancia...), asi que el tutorial avanza en cuanto el jugador virtual ha
--- hecho lo que el nodo pide. Con un jugador real conectado esto NO se hace:
--- el nivel se comporta exactamente igual que siempre.
-script.on_event(defines.events.on_tick, function(event)
-  if game.players[1] then return end
-  if game.tick_paused then return end
-  local st = storage.story
-  if not st then return end
-  story_update(st, { name = "script_raised_built", tick = event.tick }, "level-02")
-end)
+-- Solucion: se envuelve story_update para que, cuando no hay ningun jugador
+-- real conectado, le pase a la historia un evento sintetico de "accion del
+-- jugador" en cada tick. Las condiciones de los nodos son de ESTADO (selected,
+-- get_item_count, la distancia...), asi que el tutorial avanza en cuanto el
+-- jugador virtual ha hecho lo que el nodo pide. Con un jugador real conectado
+-- esto NO se hace: el nivel se comporta exactamente igual que siempre.
+--
+-- OJO: no se puede registrar otro script.on_event(on_tick): en Factorio solo
+-- hay un manejador por evento y por script, asi que el del nivel (que
+-- incluye on_tick) machacaria el nuestro.
+if story_update then
+  local _xfv_story_update_real = story_update
+  story_update = function(st, event, next_level, onwin)
+    local r = _xfv_story_update_real(st, event, next_level, onwin)
+    if not game.players[1] and event.name == defines.events.on_tick then
+      _xfv_story_update_real(st, { name = "script_raised_built", tick = event.tick },
+                             next_level, onwin)
+    end
+    return r
+  end
+end
 -- [XFactorVR-MP] ==================================================================
 '''
 
@@ -294,15 +326,25 @@ def parche_stub(texto: str):
 
 
 def parche_referencias(texto: str):
-    """game.players[1] y game.get_player(1) -> jugador(). (texto, aplicado)"""
-    n1 = texto.count("game.players[1]")
-    n2 = texto.count("game.get_player(1)")
+    """game.players[1] y game.get_player(1) -> jugador(). (texto, aplicado)
+    OJO: no se toca el stub ya inyectado: el stub usa game.players[1] a
+    proposito para saber si hay un jugador real de verdad."""
+    marca = "-- [XFactorVR-MP] ===="
+    ini = texto.find(marca)
+    fin = texto.find(marca, ini + 1) if ini >= 0 else -1
+    if ini >= 0 and fin > ini:
+        antes, stub, despues = texto[:ini], texto[ini:fin], texto[fin:]
+    else:
+        antes, stub, despues = texto, "", ""
+
+    n1 = antes.count("game.players[1]")
+    n2 = antes.count("game.get_player(1)")
     if n1 == 0 and n2 == 0:
         return texto, False
-    texto = texto.replace("game.players[1]", "jugador()")
-    texto = texto.replace("game.get_player(1)", "jugador()")
+    antes = antes.replace("game.players[1]", "jugador()")
+    antes = antes.replace("game.get_player(1)", "jugador()")
     print(f"    · {n1} referencias a game.players[1] y {n2} a game.get_player(1) -> jugador()")
-    return texto, True
+    return antes + stub + despues, True
 
 
 def parchear(control_lua: str) -> bool:

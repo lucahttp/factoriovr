@@ -185,6 +185,11 @@ end
 local VIRTUAL_TAG = "xfactorvr_player"
 local VIRTUAL_NAME = "VR"
 
+-- Tipos de GUI que usa el jugador virtual. Se leen con reserva porque el
+-- banco de pruebas unitarios no define `defines.gui_type`.
+local GUI_NONE = (defines.gui_type and defines.gui_type.none) or 0
+local GUI_CONTROLLER = (defines.gui_type and defines.gui_type.controller) or 3
+
 --- Entidad del personaje virtual, o nil si todavia no existe.
 local function virtual_character()
     local st = state()
@@ -265,7 +270,22 @@ local function actor()
     return ensure_virtual_character()
 end
 
---- Inventario principal del actor (jugador real o personaje virtual).
+--- Estado virtual de la GUI del jugador virtual.
+---
+--- Un personaje NO tiene GUI: el juego solo se la da a un jugador con raton
+--- (y el nivel de campana mira `opened_gui_type` y `crafting_queue_size`).
+--- El mod lo emula: cuando el jugador virtual fabrica algo, esta "en la GUI
+--- de fabricacion" con el item en la cola, que es justo lo que el tutorial
+--- espera ver.
+local function virtual_gui()
+    local st = state()
+    if not st.xfactorvr_gui then
+        st.xfactorvr_gui = { type = nil, crafts = 0, caduca = 0 }
+    end
+    return st.xfactorvr_gui
+end
+
+--- El inventario principal del actor (jugador real o personaje virtual).
 local function actor_inventory()
     local a = actor()
     if not a then return nil end
@@ -756,6 +776,26 @@ remote.add_interface("xfactorvr", {
             end
         end
 
+        -- Si ya hay una maquina de ese tipo en el sitio, no se coloca otra:
+        -- en el tutorial de la campana el "colocar el horno" se puede pedir
+        -- mas de una vez, y con dos hornos el nivel se queda mirando el que
+        -- no tiene el mineral (el primero que se encontro).
+        for _, alt in ipairs(alternatives) do
+            local ok_hay, hay = pcall(function()
+                return surface.find_entities_filtered({
+                    position = { x, y },
+                    -- 0.8: la maquina se coloca en el centro de la casilla,
+                    -- que puede estar a 0.71 de la posicion pedida.
+                    radius = 0.8,
+                    name = alt,
+                })
+            end)
+            if ok_hay and hay and #hay > 0 then
+                rcon.print("OK")
+                return true
+            end
+        end
+
         local ok, created = pcall(function()
             return surface.create_entity({
                 name = chosen,
@@ -1061,6 +1101,22 @@ remote.add_interface("xfactorvr", {
         -- un personaje sin controlador no puede fabricar en cola.
         local a = actor()
         if a then
+            -- El jugador virtual "abre" la GUI de fabricacion y deja el item
+            -- en la cola: el nivel de campana lo espera asi.
+            local gui = virtual_gui()
+            gui.type = GUI_CONTROLLER
+            gui.crafts = count
+            gui.caduca = game.tick + 120
+        end
+
+        -- Si el actor es un JUGADOR DE VERDAD (tiene controlador), se encola
+        -- la receta: el juego la fabrica sola y el nivel ve la cola.
+        --
+        -- OJO: con un personaje virtual (sin controlador) NO se puede encolar:
+        -- `begin_crafting` se come los ingredientes y la cola no crece, asi
+        -- que los items se perdian. Con un personaje la fabricacion es
+        -- instantanea (la de abajo).
+        if a and real_player() then
             local before = 0
             pcall(function() before = tonumber(a.crafting_queue_size) or 0 end)
             local ok, began = pcall(function()
@@ -1176,6 +1232,7 @@ remote.add_interface("xfactorvr", {
         end
 
         local pos = c.position or { x = 0, y = 0 }
+        local gui = virtual_gui()
         local out = {
             found = true,
             real = false,
@@ -1185,16 +1242,43 @@ remote.add_interface("xfactorvr", {
             surface_index = c.surface and c.surface.index or 1,
             x = pos.x,
             y = pos.y,
-            crafting_queue_size = c.crafting_queue_size or 0,
+            -- La GUI virtual: el personaje no tiene GUI, pero el nivel de
+            -- campana la mira.
+            gui_type = gui.type or GUI_NONE,
+            crafting_queue_size = math.max(tonumber(c.crafting_queue_size) or 0,
+                                           tonumber(gui.crafts) or 0),
+            -- La barra rapida virtual (el personaje no tiene ninguna).
+            quick_bar = state().xfactorvr_bar or {},
         }
         rcon.print("VR|virtual|" .. tostring(out.name))
         return out
     end,
 
+    -- Asigna un item a un hueco de la barra rapida del jugador virtual.
+    -- Un personaje no tiene barra rapida (es cosa del jugador con raton),
+    -- pero el nivel de campana mira si el jugador tiene la perforadora
+    -- asignada a un hueco antes de dejarle colocarla.
+    set_quick_bar = function(page, slot, item_name)
+        page = page or 1
+        slot = slot or 1
+        local st = state()
+        if not st.xfactorvr_bar then st.xfactorvr_bar = {} end
+        local clave = tostring(page) .. "_" .. tostring(slot)
+        if item_name and item_name ~= "" then
+            st.xfactorvr_bar[clave] = item_name
+        else
+            st.xfactorvr_bar[clave] = nil
+        end
+        rcon.print("OK")
+        return true
+    end,
+
     -- Mete items en el inventario de una maquina (al horno, al quemador).
-    -- Es lo que hace falta para jugar la campana sin ratón.
-    insert_item = function(x, y, item_name, count)
+    -- El indice de inventario importa: en un horno el 1 es el combustible y
+    -- el 2 los ingredientes.
+    insert_item = function(x, y, item_name, count, inv_index)
         count = count or 1
+        inv_index = inv_index or 1
         local surface = game.surfaces[1]
         if not surface or not item_name then
             rcon.print("ERR|no_surface")
@@ -1205,17 +1289,18 @@ remote.add_interface("xfactorvr", {
             position = { x, y },
             radius = 1.5,
         })
-        for _, e in ipairs(found) do
-            if e.valid then
-                local ok_inv, inv = pcall(function() return e.get_inventory(1) end)
-                if ok_inv and inv then
-                    local ok, inserted = pcall(function()
-                        return inv.insert({ name = item_name, count = count })
-                    end)
-                    if ok and inserted and inserted > 0 then
-                        rcon.print("OK|" .. tostring(inserted))
-                        return true
-                    end
+        -- Sin contar al propio actor: si el jugador virtual esta junto a la
+        -- maquina, el item se metia en su inventario y no en el de la maquina.
+        local e = entidad_mas_cercana(found, x, y, actor_unit_number(actor()))
+        if e then
+            local ok_inv, inv = pcall(function() return e.get_inventory(inv_index) end)
+            if ok_inv and inv then
+                local ok, inserted = pcall(function()
+                    return inv.insert({ name = item_name, count = count })
+                end)
+                if ok and inserted and inserted > 0 then
+                    rcon.print("OK|" .. tostring(inserted))
+                    return true
                 end
             end
         end
@@ -1248,6 +1333,13 @@ local event_tick = defines.events and defines.events.on_tick
 if event_tick and script.on_event then
     script.on_event(event_tick, function(event)
         local st = state()
+
+        -- La GUI virtual caduca: la cola de fabricacion se vacia sola.
+        local gui = st.xfactorvr_gui
+        if gui and (gui.crafts or 0) > 0 and event.tick >= (gui.caduca or 0) then
+            gui.crafts = 0
+        end
+
         st.xfactorvr_tick = (st.xfactorvr_tick or 0) + 1
         -- Cada 5 segundos se comprueba que el personaje sigue en pie.
         if (st.xfactorvr_tick % 300) ~= 0 then return end

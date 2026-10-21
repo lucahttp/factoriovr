@@ -1,7 +1,7 @@
 # ADR-006 — Dibujar una entidad en 3D desde el inyector
 
 * Estado: **implementado** (el cubo se dibuja y se ve en la captura)
-* Fecha: 2026-10-20
+* Fecha: 2026-10-20 (revisado el 2026-10-21)
 * Módulo: `injector-linux/src/modelo3d.rs`
 * Banco: `scripts/test_modelo3d.sh`
 
@@ -32,7 +32,7 @@ Pero **todo lo demás sí se puede heredar del juego**:
 |---|---|
 | Contexto GL | el del motor: estamos dentro de su llamada de render |
 | Funciones GL | las suyas: `glad_glCreateShader`, `glad_glDrawElements`, … (symtab) |
-| Matriz de proyección | la del juego: bloque `vsConstants` (`{ mat4 projection; }` en std140, ver `data/core/graphics/shaders/sprite.vert`) |
+| Matriz de proyección | **calculada aquí** (sección 4.1): la del motor es ortográfica y se deduce de su propia cuenta |
 | Posición y tamaño | los que el motor calcula para el sprite de la entidad |
 | Dónde se dibuja | el framebuffer del mundo, justo antes de componerlo en la ventana |
 
@@ -60,13 +60,25 @@ FBO sigue enlazado. Lo que se pinte ahí se compone en la ventana.
 |---|---|
 | `AssemblingMachine::draw(DrawQueue&)` | saber qué entidades se están dibujando (posición de mapa y dirección) |
 | `DrawQueue::draw(Sprite const&, MapPosition const&, …)` | saber qué sprite es el de nuestra entidad, y sacar la cámara y la escala |
-| `GraphicsInterfaceOpenGL::bindUniformBuffer(uint, …)` | saber qué buffer y qué punto de binding usa el motor para `vsConstants` (su matriz de proyección) |
+| `GraphicsInterfaceOpenGL::bindUniformBuffer(uint, …)` | **solo diagnóstico**: se apunta qué buffer y qué punto de binding usa el motor, **sin tocar la GL** |
 | `DrawCommandBatch::flushSpritesBatch(bool)` (y los otros flush) | **dibujar el cubo** y **capturar** |
 
-### 4.1 La posición y el tamaño, sin adivinar
+### 4.1 La proyección: se calcula, no se pregunta
 
-La cuenta del motor para pasar de coordenadas del mapa a coordenadas del mundo
-está en `SpriteDrawOrder::setup` (desensamblado):
+El motor dibuja el mundo con una **proyección ortográfica** que vive en el
+bloque de uniforms `vsConstants` (`{ mat4 projection; }` en std140, según
+`data/core/graphics/shaders/sprite.vert`).
+
+**La versión anterior de este módulo la pedía al motor**: enganchaba
+`GraphicsInterfaceOpenGL::bindUniformBuffer` y llamaba a
+`glGetUniformBlockIndex` **sobre el programa del motor** para averiguar qué
+bloque era `vsConstants`, y enlazaba ese buffer en nuestro programa. **Eso
+hacía que el juego se cayera con SIGSEGV**: en cuanto el motor cambiaba de
+programa se repetía la consulta y algo se rompía. Ese hook ya **no hace ninguna
+llamada a la GL**: solo apunta lo que ve (ver la tabla de arriba).
+
+La matriz se calcula con la cuenta del propio motor, desensamblada de
+`SpriteDrawOrder::setup`:
 
 ```
 mundo = (mapa / 256) * (32 * escala) - camara
@@ -78,26 +90,49 @@ mundo = (mapa / 256) * (32 * escala) - camara
 * `camara` = `RenderParameters+0x1b8` (2 doubles).
 
 Los `RenderParameters` están en el primer puntero del `DrawQueue`, así que el
-hook de `DrawQueue::draw` los tiene a mano. El tamaño del sprite está en el
-propio sprite (`+0x38`, dos floats) y se multiplica por la misma escala.
+hook de `DrawQueue::draw` los tiene a mano.
 
-El resultado se comprobó contra el log: la entidad del mapa `(0.5, 45.5)` con
-escala `0.75` y cámara `(-148, 978)` da mundo `(160, 114)` — y el motor la
-pinta exactamente ahí.
+**Ojo con las unidades**: `mundo` **no** es una posición relativa a la cámara,
+son **píxeles del framebuffer del mundo** (la cámara va en la resta de
+arriba). Se comprobó creando una máquina en el juego: su `mundo` era
+`(856, 384)` y en la captura salía en esos mismos píxeles. Por eso la
+proyección es:
 
-### 4.2 La orientación
+```
+ndc_x = mundo_x * 2 / W - 1
+ndc_y = mundo_y * 2 / H - 1
+```
+
+con W y H los del viewport del framebuffer del mundo. La Y crece **hacia
+abajo**: el motor dibuja el mundo con la Y invertida y lo voltea al componerlo
+en la ventana, así que al volcar el framebuffer con `glReadPixels` la imagen
+sale derecha (con la GUI abajo).
+
+### 4.2 El tamaño del sprite
+
+El `Sprite` que el motor pasa a `DrawQueue::draw` guarda su tamaño en **dos
+`u16` en `+0x16` y `+0x18`** (desensamblado de `DrawQueue::draw`:
+`ldrh w8, [x23, #0x16]`). Ese tamaño es el del **atlas**, que va al doble que
+el tamaño pintado, así que el tamaño en pantalla es la mitad de ese valor
+multiplicado por la escala.
+
+> Antes se leía `+0x38` (dos floats): ahí no está el tamaño (era un 0 y un
+> 1.75), y el sprite quedaba con tamaño 0 y no se pintaba nada.
+
+### 4.3 La orientación
 
 `Entity+0x280` (u8, 4 bits) es lo que lee `CraftingMachine::getDirection()`:
 16 pasos de 22,5°. Se aplica como rotación en Z de la matriz del cubo.
 
-### 4.3 Por qué el cubo se calcula en la CPU
+### 4.4 Por qué el cubo se calcula en la CPU
 
 La proyección del motor es ortográfica y solo tiene eje X e Y (sus sprites son
 2D). Si el cubo se construyera en el shader, su componente Z en espacio de
 clip se saldría de `[-1, 1]` y los triángulos se recortarían. Así que la
 transformación 3D (inclinación de 31° para que se vea el volumen, giro por la
-dirección y escala por el tamaño real) se hace en la CPU y al shader solo le
-llega la proyección 2D del motor.
+dirección y escala por el tamaño real) se hace en la CPU **y la proyección
+también**: al vertex shader solo le llega el punto ya proyectado a coordenadas
+de clip (`gl_Position = vec4(position.xy, 0, 1)`), sin bloques de uniforms.
 
 ## 5. Un fallo del detour que costó la mitad del trabajo
 
@@ -115,6 +150,15 @@ bloque apunten a código también reubicado (el bloque se copia entero y en
 orden, así las distancias relativas se conservan). Si el bloque no cabe en la
 función, el inyector **renuncia** en vez de generar código roto.
 
+### 5.1 `SpriteDrawOrder::setup` NO se puede enganchar
+
+La forma más limpia de tener la posición y el tamaño exactos del motor sería
+enganchar `SpriteDrawOrder::setup` (ahí quedan en `+0x10` y `+0x24`). **Pero
+su prólogo no se puede reubicar**: el detour queda instalado sin error y el
+juego se cae con **SIGSEGV dentro de `cfree`** (heap corrupto) al primer
+sprite. Se probó y se descartó: la posición y el tamaño se sacan del hook de
+`DrawQueue::draw`, que sí aguanta.
+
 ## 6. La captura
 
 * Se engancha el **flush**, que es cuando el framebuffer del mundo ya tiene la
@@ -129,17 +173,45 @@ función, el inyector **renuncia** en vez de generar código roto.
 captura sale con basura. El banco usa **Xvfb + x11**, que es lo que funciona
 (también lo usa `scripts/test_autostart.sh`).
 
-## 7. Estado
+### 6.1 El PNG tenía el checksum roto
+
+El Adler-32 se escribía con dos `u32` (8 bytes) en vez de dos `u16` (4 bytes):
+el PNG salía con 4 bytes de más y el checksum no cuadtaba, así que ningún
+lector estándar lo podía abrir. Corregido (`as u16`).
+
+### 6.2 El cubo es magenta (a propósito)
+
+El cubo se pinta de **magenta** (`0.90, 0.10, 0.75`). En la escena del Factorio
+no hay nada de ese color (las llamas son amarillas, la tierra marrón, el jugador
+azul, la GUI gris), así que se pueden **contar los píxeles del cubo** en el PNG
+y comprobar automáticamente que el cubo **se ve**, y no solo que el juego no se
+ha caído. El banco hace exactamente eso.
+
+## 7. El banco
+
+`scripts/test_modelo3d.sh`:
+
+1. compila el inyector para aarch64,
+2. arranca el cliente real dentro del contenedor podman (Xvfb + x11) con la
+   partida guardada,
+3. espera a que el motor esté **en juego** (el inyector lo avisa por el log:
+   `cima_tipo=4`),
+4. **crea una máquina al lado del jugador con la consola del juego** (tecla
+   `` ` ``): es determinista; andar buscando máquinas con el teclado no lo es
+   (la partida no siempre trae fábricas cerca del punto de aparición),
+5. espera a que el motor dibuje el cubo y a que haya captura,
+6. **valida el PNG** (zlib con el Adler-32 bien puesto) y que **tenga píxeles
+   del cubo**,
+7. deja la captura en `build/cubo_3d.png`.
+
+## 8. Estado
 
 * El cubo se dibuja en el framebuffer del mundo, con los datos reales de la
-  entidad.
-* La captura del framebuffer es válida (se ve la escena, no basura ni negro).
-* El banco `scripts/test_modelo3d.sh` compila para aarch64, arranca el cliente
-  real dentro del contenedor podman, carga una partida, camina hasta que una
-  máquina entra en pantalla y comprueba que hay captura con contenido y que el
-  log registra una caja 3D.
+  entidad, y **se ve** en la captura.
+* La captura es un PNG válido y comprobable.
+* El banco `scripts/test_modelo3d.sh` pasa de punta a punta.
 
-## 8. Lo que queda pendiente
+## 9. Lo que queda pendiente
 
 * La **deformación de cámara** (warp) es un paso posterior: aquí no se toca.
 * El cubo tapa el sprite de la máquina pero el motor sigue encolándolo: si se
@@ -148,3 +220,6 @@ captura sale con basura. El banco usa **Xvfb + x11**, que es lo que funciona
   (con la GUI) habría que capturar en otro punto del frame.
 * El tamaño del cubo es el del sprite (la "caja" de la máquina), no el de su
   volumen real: una máquina de 3×3 tiles se ve como un cubo de 3×3×3.
+* El cubo es un magenta liso: el mod 3D de verdad pinta la máquina con su
+  textura. Aquí lo que se demuestra es que la geometría 3D se dibuja en la
+  posición y con el tamaño correctos.

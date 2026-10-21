@@ -17,21 +17,20 @@
 //!
 //! El motor dibuja el mundo asi:
 //!
-//!   1. `SpriteDrawOrder::setup(sprite, renderParameters, mapPosition, shift)`
-//!      calcula la posicion y el tamano del sprite en el espacio del mundo
-//!      (en unidades del motor: pixeles de pantalla con el zoom aplicado).
-//!      El resultado queda en el propio objeto:
-//!
-//!          * `+0x10` -> posicion (2 floats)
-//!          * `+0x24` -> tamano (2 floats)
-//!
+//!   1. `DrawQueue::draw(sprite, position, ...)` encola cada sprite. Para las
+//!      entidades, la `MapPosition` que recibe es la de la entidad, asi que se
+//!      puede saber que sprite es el nuestro (la entidad se identifica
+//!      porque su `MapPosition` coincide con la que leimos en `Entity+0x50`).
 //!   2. Ese sprite se dibuja mas tarde dentro de un framebuffer propio
 //!      (el "framebuffer del mundo"), que despues se compone en la ventana.
 //!
-//! Por eso el modulo engancha `SpriteDrawOrder::setup`: al volver de el
-//! sabemos la posicion y el tamano EXACTOS que el motor usa para esa entidad,
-//! sin adivinar unidades ni camaras. La entidad se identifica porque su
-//! `MapPosition` coincide con la que leimos en `Entity+0x50`.
+//! Del `DrawQueue` tambien salen la camara y la escala (los `RenderParameters`
+//! estan en su primer puntero), con las que el motor pasa de coordenadas del
+//! mapa a coordenadas del mundo (ver la seccion "Camara").
+//!
+//! Ojo: **no** se engancha `SpriteDrawOrder::setup` (que seria lo ideal: ahi
+//! quedan la posicion y el tamano exactos). Su prologo no se puede reubicar y
+//! el detour corrompe el motor: el juego se cae con SIGSEGV dentro de `cfree`.
 //!
 //! # Donde se dibuja el cubo
 //!
@@ -47,13 +46,40 @@
 //!
 //! # Camara
 //!
-//! El motor usa la misma matriz de proyeccion que sus sprites: esta en el
-//! bloque de uniforms `vsConstants` (`{ mat4 projection; }` en std140, segun
-//! `data/core/graphics/shaders/sprite.vert`). El modulo engancha
-//! `GraphicsInterfaceOpenGL::bindUniformBuffer` para saber que buffer GL y
-//! que punto de binding usa el motor para ese bloque, y enlaza ese mismo
-//! buffer en nuestro programa: asi el cubo cae exactamente donde el juego
-//! espera, con su camara.
+//! El motor dibuja el mundo con una proyeccion **ortografica** que vive en
+//! el bloque de uniforms `vsConstants` (`{ mat4 projection; }` en std140, segun
+//! `data/core/graphics/shaders/sprite.vert`). Esa matriz **se calcula aqui**,
+//! sin preguntar al motor:
+//!
+//!   * `SpriteDrawOrder::setup` (desensamblado del motor 2.1.22) deja claro
+//!     como pasa el motor de coordenadas del mapa a coordenadas del mundo:
+//!
+//!         mundo = (mapa / 256) * (32 * escala) - camara
+//!
+//!     (es exactamente la cuenta de `0x179cf6c` y `0x179cf74`). Ojo: `mundo`
+//!     NO es una posicion relativa a la camara, son **pixeles del framebuffer
+//!     del mundo** (la camara va en la resta de arriba). Comprobado creando
+//!     una maquina en el juego: su `mundo` era `(856, 384)` y en la captura
+//!     salia en esos mismos pixeles,
+//!   * el framebuffer del mundo se dibuja con la Y hacia abajo (al componerlo
+//!     en la ventana el motor lo voltea): al volcarlo con `glReadPixels` sale
+//!     derecho, con la GUI abajo. Por eso la Y del clip crece hacia abajo.
+//!
+//! La proyeccion queda entonces:
+//!
+//!     ndc_x = mundo_x * 2 / W - 1
+//!     ndc_y = mundo_y * 2 / H - 1
+//!
+//! donde W y H son los del viewport del framebuffer del mundo.
+//!
+//! **Por que no se le pregunta al motor**: la version anterior enganchaba
+//! `GraphicsInterfaceOpenGL::bindUniformBuffer` y llamaba a
+//! `glGetUniformBlockIndex` sobre el *programa del motor* para averiguar que
+//! bloque era `vsConstants`. Eso hacia que el juego petara con SIGSEGV: en
+//! cuanto el motor cambiaba de programa se repetia la consulta y algo se
+//! rompia. Ese hook ahora **no toca la GL en absoluto**: solo apunta que
+//! buffers y que puntos de binding ve (ver `Enlace`), por si hace falta
+//! diagnosear.
 //!
 //! # Por que se dibuja con GL propio y no con el DrawQueue
 //!
@@ -164,6 +190,14 @@ static ESTADO: Mutex<Estado> = Mutex::new(Estado {
         direccion: 0,
     }; MAX_PENDIENTES],
     n_pend: 0,
+    visibles: [Caja {
+        wx: 0.0,
+        wy: 0.0,
+        sx: 0.0,
+        sy: 0.0,
+        direccion: 0,
+    }; MAX_PENDIENTES],
+    n_visibles: 0,
     entidades: [Entidad {
         pos: PosMapa { x: 0, y: 0 },
         direccion: 0,
@@ -173,10 +207,19 @@ static ESTADO: Mutex<Estado> = Mutex::new(Estado {
 
 /// Estado compartido entre los hooks.
 struct Estado {
-    /// Cajas pendientes de dibujar.
+    /// Cajas pendientes: las ha llenado el hook de `DrawQueue::draw` con las
+    /// entidades que se han dibujado en este frame.
     pendientes: [Caja; MAX_PENDIENTES],
     /// Numero de cajas pendientes.
     n_pend: usize,
+    /// Cajas del frame anterior: las que se dibujan en cada flush.
+    ///
+    /// Se guardan aparte de las pendientes porque el cubo tiene que estar en
+    /// el framebuffer **siempre** (la captura se hace cada N flushes, y solo
+    /// con el cubo ahi se puede comprobar que se ve).
+    visibles: [Caja; MAX_PENDIENTES],
+    /// Numero de cajas visibles.
+    n_visibles: usize,
     /// Entidades vistas en el frame.
     entidades: [Entidad; MAX_ENTIDADES],
     /// Numero de entidades vistas.
@@ -216,16 +259,30 @@ impl Estado {
         self.n_pend = i + 1;
     }
 
-    /// Saca las cajas pendientes y vacia la lista.
-    fn toma_cajas(&mut self) -> Vec<Caja> {
-        let n = self.n_pend.min(MAX_PENDIENTES);
+    /// Publica las cajas de este frame y devuelve las que hay que dibujar.
+    ///
+    /// Las cajas del frame actual pasan a ser las "visibles" (las que se
+    /// dibujan en cada flush, para que el cubo este siempre en el
+    /// framebuffer). Las pendientes se vacian: si no llegara ninguna caja
+    /// nueva, las visibles se quedan como estaban.
+    fn publica_cajas(&mut self) -> Vec<Caja> {
+        if self.n_pend > 0 {
+            let n = self.n_pend.min(MAX_PENDIENTES);
+            let mut i = 0usize;
+            while i < n {
+                self.visibles[i] = self.pendientes[i];
+                i += 1;
+            }
+            self.n_visibles = n;
+            self.n_pend = 0;
+        }
+        let n = self.n_visibles.min(MAX_PENDIENTES);
         let mut out = Vec::with_capacity(n);
         let mut i = 0usize;
         while i < n {
-            out.push(self.pendientes[i]);
+            out.push(self.visibles[i]);
             i += 1;
         }
-        self.n_pend = 0;
         out
     }
 }
@@ -292,9 +349,6 @@ type GlVertexAttribPointer = unsafe extern "C" fn(
 );
 type GlDrawElements =
     unsafe extern "C" fn(mode: u32, count: i32, type_: u32, indices: *const c_void);
-type GlGetUniformBlockIndex = unsafe extern "C" fn(program: u32, name: *const i8) -> u32;
-type GlUniformBlockBinding = unsafe extern "C" fn(program: u32, index: u32, binding: u32);
-type GlBindBufferBase = unsafe extern "C" fn(target: u32, index: u32, buffer: u32);
 type GlDisable = unsafe extern "C" fn(cap: u32);
 type GlEnable = unsafe extern "C" fn(cap: u32);
 type GlBlendFuncSeparate = unsafe extern "C" fn(
@@ -325,7 +379,6 @@ const GL_VERTEX_SHADER: u32 = 0x8B31;
 const GL_FRAGMENT_SHADER: u32 = 0x8B30;
 const GL_ARRAY_BUFFER: u32 = 0x8892;
 const GL_ELEMENT_ARRAY_BUFFER: u32 = 0x8893;
-const GL_UNIFORM_BUFFER: u32 = 0x8A11;
 const GL_STATIC_DRAW: u32 = 0x88E4;
 const GL_TRIANGLES: u32 = 0x0004;
 const GL_FLOAT: u32 = 0x1406;
@@ -341,7 +394,6 @@ const GL_VERSION: u32 = 0x1F02;
 const GL_RENDERER: u32 = 0x1F01;
 const GL_VIEWPORT: u32 = 0x0BA2;
 const GL_UNPACK_ALIGNMENT: u32 = 0x0CF5;
-const GL_INVALID_INDEX: u32 = 0xFFFF_FFFF;
 /// Framebuffer de dibujado actualmente enlazado.
 const GL_DRAW_FRAMEBUFFER_BINDING: u32 = 0x8CA6;
 /// Vertex array actualmente enlazado.
@@ -379,9 +431,6 @@ struct Gl {
     enable_vertex_attrib_array: GlEnableVertexAttribArray,
     vertex_attrib_pointer: GlVertexAttribPointer,
     draw_elements: GlDrawElements,
-    get_uniform_block_index: GlGetUniformBlockIndex,
-    uniform_block_binding: GlUniformBlockBinding,
-    bind_buffer_base: GlBindBufferBase,
     disable: GlDisable,
     enable: GlEnable,
     blend_func_separate: GlBlendFuncSeparate,
@@ -416,9 +465,6 @@ struct GlAddr {
     enable_vertex_attrib_array: usize,
     vertex_attrib_pointer: usize,
     draw_elements: usize,
-    get_uniform_block_index: usize,
-    uniform_block_binding: usize,
-    bind_buffer_base: usize,
     disable: usize,
     enable: usize,
     blend_func_separate: usize,
@@ -434,8 +480,6 @@ struct Cubo {
     vao: u32,
     vbo: u32,
     ebo: u32,
-    /// Indice del bloque `vsConstants` en nuestro programa.
-    idx_vs: u32,
 }
 
 /// Punteros a las funciones GL del motor (se rellenan al instalar).
@@ -449,22 +493,18 @@ static CUBO: OnceLock<Cubo> = OnceLock::new();
 
 /// Shader del cubo.
 ///
-/// Se usa el mismo esqueleto que el motor (`sprite.vert`): un bloque de
-/// uniforms `vsConstants` con la matriz de proyeccion, para que el cubo se
-/// ubique con la misma camara que el resto del mundo.
+/// El cubo se calcula entero en la CPU: la transformacion 3D (giro,
+/// inclinacion y escala) **y** la proyeccion de la camara. Al vertex shader
+/// solo le llega el punto ya proyectado a coordenadas de clip, asi que no
+/// hace falta ni bloque de uniforms ni matriz del motor.
 ///
-/// El cubo se calcula entero en la CPU (la transformacion 3D se hace aqui, no
-/// en el shader): asi el vertex shader solo necesita la proyeccion 2D del
-/// motor y no hay que depender de como trata la componente Z.
+/// La proyeccion se aplica al final: `ndc = mundo * 2 / viewport`.
 const VS: &[u8] = b"#version 330\n\
-layout(std140) uniform vsConstants {\n\
-    mat4 projection;\n\
-} _19;\n\
 layout(location = 0) in vec3 position;\n\
 layout(location = 1) in vec3 normal;\n\
 out vec3 vNormal;\n\
 void main() {\n\
-    gl_Position = _19.projection * vec4(position, 1.0);\n\
+    gl_Position = vec4(position.xy, 0.0, 1.0);\n\
     vNormal = normal;\n\
 }\n";
 
@@ -475,7 +515,7 @@ void main() {\n\
     vec3 n = normalize(vNormal);\n\
     vec3 luz = normalize(vec3(0.4, 0.6, 0.7));\n\
     float d = max(dot(n, luz), 0.0);\n\
-    vec3 color = vec3(0.85, 0.55, 0.2) * (0.35 + 0.75 * d);\n\
+    vec3 color = vec3(0.90, 0.10, 0.75) * (0.35 + 0.75 * d);\n\
     fragColor = vec4(color, 1.0);\n\
 }\n";
 
@@ -565,9 +605,6 @@ fn resolver_gl(simbolos: &resolver::Simbolos) -> Option<GlAddr> {
         enable_vertex_attrib_array: dir!("glad_glEnableVertexAttribArray"),
         vertex_attrib_pointer: dir!("glad_glVertexAttribPointer"),
         draw_elements: dir!("glad_glDrawElements"),
-        get_uniform_block_index: dir!("glad_glGetUniformBlockIndex"),
-        uniform_block_binding: dir!("glad_glUniformBlockBinding"),
-        bind_buffer_base: dir!("glad_glBindBufferBase"),
         disable: dir!("glad_glDisable"),
         enable: dir!("glad_glEnable"),
         blend_func_separate: dir!("glad_glBlendFuncSeparate"),
@@ -621,9 +658,6 @@ fn construir_gl(dir: &GlAddr) -> Option<Gl> {
         enable_vertex_attrib_array: ptr!(enable_vertex_attrib_array),
         vertex_attrib_pointer: ptr!(vertex_attrib_pointer),
         draw_elements: ptr!(draw_elements),
-        get_uniform_block_index: ptr!(get_uniform_block_index),
-        uniform_block_binding: ptr!(uniform_block_binding),
-        bind_buffer_base: ptr!(bind_buffer_base),
         disable: ptr!(disable),
         enable: ptr!(enable),
         blend_func_separate: ptr!(blend_func_separate),
@@ -777,26 +811,28 @@ fn crear_cubo(gl: &Gl) -> Option<Cubo> {
     }
     drenar_errores(gl, "crear los buffers del cubo");
 
-    // Bloque de uniforms `vsConstants`: el mismo que usa el motor, para
-    // tener exactamente su matriz de proyeccion.
-    let nombre_vs = b"vsConstants\0";
-    let idx_vs = unsafe { (gl.get_uniform_block_index)(prog, nombre_vs.as_ptr() as *const i8) };
-    if idx_vs == GL_INVALID_INDEX {
-        log::error("el motor no tiene bloque de uniforms 'vsConstants'");
-    }
-
     Some(Cubo {
         programa: prog,
         vao,
         vbo,
         ebo,
-        idx_vs,
     })
 }
 
 // --------------------------------------------------------------------------
 // Hooks
 // --------------------------------------------------------------------------
+
+/// Tipo del trampolin de `DrawQueue::draw`.
+///
+///     draw(DrawQueue* this, Sprite const& sprite, MapPosition const& position,
+///          DrawingFlags flags, RenderLayer::Enum layer, Vector const& shift,
+///          float size_x, float size_y)
+///
+/// Los dos `float` van en los registros s0 y s1 (AAPCS64: los argumentos
+/// en coma flotante tienen sus propios registros).
+type HookDrawQueue =
+    unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void, u32, u32, *mut c_void, f32, f32);
 
 /// Tipo del trampolin de `AssemblingMachine::draw`.
 ///
@@ -813,17 +849,6 @@ type HookDraw = unsafe extern "C" fn(*mut c_void, *mut c_void);
 ///     bindUniformBuffer(GraphicsInterfaceOpenGL* this, uint index,
 ///                       PipelineStateObject const* pso, UniformBuffer const* ub)
 type HookUniformBuffer = unsafe extern "C" fn(*mut c_void, u32, *mut c_void, *mut c_void);
-
-/// Tipo del trampolin de `DrawQueue::draw`.
-///
-///     draw(DrawQueue* this, Sprite const& sprite, MapPosition const& position,
-///          DrawingFlags flags, RenderLayer::Enum layer, Vector const& shift,
-///          float size_x, float size_y)
-///
-/// Los dos `float` van en los registros s0 y s1 (AAPCS64: los argumentos
-/// en coma flotante tienen sus propios registros).
-type HookDrawQueue =
-    unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void, u32, u32, *mut c_void, f32, f32);
 
 /// Tipo del trampolin de `flushSpritesBatch`.
 ///
@@ -909,6 +934,8 @@ fn leer_direccion(this: *mut c_void) -> u8 {
     (unsafe { std::ptr::read_unaligned((base + 0x280) as *const u8) }) & 0x0F_u8
 }
 
+/// Hook de `DrawQueue::draw`.
+///
 /// Hook de `DrawQueue::draw`.
 ///
 /// El motor pasa aqui cada sprite que va a dibujar. Para las entidades, la
@@ -999,20 +1026,22 @@ extern "C" fn hook_draw_queue(
     let wx = (pos.x as f64 / 256.0) * factor - cam_x;
     let wy = (pos.y as f64 / 256.0) * factor - cam_y;
 
-    // El tamano del sprite. El motor lo guarda en el propio sprite (dos
-    // floats en +0x38) y lo pasa por las coordenadas del mundo
-    // multiplicandolo por la escala (ver `SpriteDrawOrder::setup`).
+    // El tamano del sprite.
+    //
+    // El `Sprite` que el motor pasa a `DrawQueue::draw` guarda su tamano en
+    // dos `u16` en +0x16 y +0x18 (ver el desensamblado de `DrawQueue::draw`:
+    // `ldrh w8, [x23, #0x16]`). Ese tamano es el del atlas, que va al doble
+    // que el tamaño pintado, asi que se divide entre dos.
     let (sx, sy) = if sprite.is_null() {
         (0.0, 0.0)
     } else {
-        // SAFETY: `sprite` es un `Sprite`; +0x38 son sus dos floats de
-        // tamano (verificado en el desensamblado de `setup`).
+        // SAFETY: `sprite` es un `Sprite`; +0x16 y +0x18 son dos `u16` con el
+        // ancho y el alto (verificado en el desensamblado del motor).
         unsafe {
-            let p = sprite as *const f32;
-            (
-                std::ptr::read_unaligned(p.add(14)) as f64 * escala,
-                std::ptr::read_unaligned(p.add(15)) as f64 * escala,
-            )
+            let p = sprite as usize;
+            let w = std::ptr::read_unaligned((p + 0x16) as *const u16) as f64;
+            let h = std::ptr::read_unaligned((p + 0x18) as *const u16) as f64;
+            (w * 0.5 * escala, h * 0.5 * escala)
         }
     };
 
@@ -1028,10 +1057,8 @@ extern "C" fn hook_draw_queue(
         direccion,
     };
     con_estado(|e| e.anade_caja(caja));
-    PENDIENTES.fetch_add(1, Ordering::Relaxed);
-
-    let total = PENDIENTES.load(Ordering::Relaxed);
-    if total <= 5 {
+    let total = PENDIENTES.fetch_add(1, Ordering::Relaxed) + 1;
+    if total <= 20 {
         log::info(&format!(
             "caja: mundo=({:.2}, {:.2}) tamano={:.1}x{:.1} dir={} escala={:.4} cam=({:.1}, {:.1})",
             caja.wx, caja.wy, caja.sx, caja.sy, caja.direccion, escala, cam_x, cam_y
@@ -1174,7 +1201,7 @@ const INCLINACION: f32 = 0.55;
 /// Transformacion (en el espacio del mundo del motor: x derecha, y abajo en
 /// pantalla, z arriba):
 ///
-///     M = T(wx, wy) * Rx(inclinacion) * T(0, 0, sz/2) * Rz(direccion) * S
+///     M = T(base) * Rx(inclinacion) * Rz(direccion) * S * T(0, 0, 1/2)
 ///
 ///   * `Rz(direccion)` es la orientacion real de la entidad (16 pasos de
 ///     22,5 grados),
@@ -1183,6 +1210,10 @@ const INCLINACION: f32 = 0.55;
 ///   * `S` es el tamano real de la maquina (el de su sprite),
 ///   * la traslacion en Z deja la base del cubo en el suelo, en la posicion
 ///     de la entidad.
+///
+/// La `base` es el punto donde se apoya el cubo: el centro en X de la entidad
+/// y el BORDE INFERIOR de su sprite (en el motor la Y crece hacia abajo, asi
+/// que el suelo esta en `wy + alto/2`).
 fn matriz_cubo(c: &Caja) -> [f32; 16] {
     // Rotacion de la entidad: los 16 pasos de direccion son 22,5 grados.
     let ang = (c.direccion as f32) * (core::f32::consts::TAU / 16.0);
@@ -1195,11 +1226,17 @@ fn matriz_cubo(c: &Caja) -> [f32; 16] {
     let ey = c.sy;
     let ez = c.sx;
 
+    // Base del cubo: el centro en X y el borde inferior del sprite.
+    let base_x = c.wx;
+    let base_y = c.wy + c.sy * 0.5;
+
     // R = Rx * Rz, en column-major:
     //   col0 = (cy,  ct*sy, st*sy)
     //   col1 = (-sy, ct*cy, st*cy)
     //   col2 = (0,   -st,   ct  )
     // Con la escala aplicada a cada columna y la traslacion al final.
+    // El `+ 0.5` en Z (la traslacion de `T(0,0,1/2)`) deja la base del cubo
+    // en el suelo: se suma la mitad de la columna Z a la traslacion.
     [
         cy * ex,
         ct * sy * ex,
@@ -1213,19 +1250,24 @@ fn matriz_cubo(c: &Caja) -> [f32; 16] {
         -st * ez,
         ct * ez,
         0.0,
-        // El centro del cubo esta a media altura sobre el suelo; al inclinarlo,
-        // su componente vertical (y) sube en pantalla (y crece hacia abajo).
-        c.wx,
-        c.wy - st * ez * 0.5,
+        base_x,
+        // Al inclinarlo, su componente vertical (y) sube en pantalla (y crece
+        // hacia abajo), de ahi el `- st * ez * 0.5`.
+        base_y - st * ez * 0.5,
         ct * ez * 0.5,
         1.0,
     ]
 }
 
-/// Calcula los vertices del cubo en 2D (la proyeccion 3D se hace aqui, en la
-/// CPU) y devuelve el buffer de vertices (posicion + normal).
-fn vertices_cubo(c: &Caja) -> [f32; 144] {
+/// Calcula los vertices del cubo ya proyectados (la transformacion 3D y la
+/// proyeccion de la camara se hacen aqui, en la CPU) y devuelve el buffer de
+/// vertices (posicion en clip + normal en el mundo).
+///
+/// La posicion sale en coordenadas de clip (`-1..1`), que es lo que espera el
+/// vertex shader: `gl_Position = vec4(position.xy, 0, 1)`.
+fn vertices_cubo(c: &Caja, vp: &[i32; 4]) -> [f32; 144] {
     let m = matriz_cubo(c);
+    let p = proyeccion(vp);
     let mut out = [0f32; 144];
     for v in 0..24 {
         let px = ESQUINAS[v * 6];
@@ -1239,14 +1281,19 @@ fn vertices_cubo(c: &Caja) -> [f32; 144] {
         let x = m[0] * px + m[4] * py + m[8] * pz + m[12];
         let y = m[1] * px + m[5] * py + m[9] * pz + m[13];
 
-        // Normal transformada (sin traslacion).
+        // Proyeccion de la camara (ortografica, con la Y hacia abajo).
+        let ndc_x = x * p[0] + p[12];
+        let ndc_y = y * p[5] + p[13];
+
+        // Normal transformada (sin traslacion): se queda en el mundo, que es
+        // donde esta la luz.
         let ax = m[0] * nx + m[4] * ny + m[8] * nz;
         let ay = m[1] * nx + m[5] * ny + m[9] * nz;
         let az = m[2] * nx + m[6] * ny + m[10] * nz;
         let largo = (ax * ax + ay * ay + az * az).sqrt().max(1e-6);
 
-        out[v * 6] = x;
-        out[v * 6 + 1] = y;
+        out[v * 6] = ndc_x;
+        out[v * 6 + 1] = ndc_y;
         out[v * 6 + 2] = 0.0;
         out[v * 6 + 3] = ax / largo;
         out[v * 6 + 4] = ay / largo;
@@ -1298,7 +1345,7 @@ fn orden_caras(m: &[f32; 16]) -> [u32; 36] {
 
 /// Dibuja las cajas pendientes en el framebuffer que hay enlazado.
 fn dibujar_cajas(gl: &Gl, vp: &[i32; 4]) {
-    let cajas = con_estado(|e| e.toma_cajas());
+    let cajas = con_estado(|e| e.publica_cajas());
     if cajas.is_empty() {
         return;
     }
@@ -1339,21 +1386,23 @@ fn dibujar_cajas(gl: &Gl, vp: &[i32; 4]) {
         if c.sx <= 0.0 || c.sy <= 0.0 {
             continue;
         }
-        let vertices = vertices_cubo(&c);
+        // Las entidades que estan fuera de la pantalla no se pintan: si se
+        // pintaran, el cubo se veria recortado en el borde del framebuffer y
+        // la captura daria pixeles "del cubo" que no son de ninguna entidad
+        // visible.
+        if c.wx + c.sx * 0.5 < 0.0
+            || c.wx - c.sx * 0.5 > vp[2] as f32
+            || c.wy + c.sy * 0.5 < 0.0
+            || c.wy - c.sy * 0.5 > vp[3] as f32
+        {
+            continue;
+        }
+        let vertices = vertices_cubo(&c, vp);
         let m = matriz_cubo(&c);
         let indices = orden_caras(&m);
 
         unsafe {
             (gl.use_program)(cubo.programa);
-
-            // El bloque `vsConstants` del motor (con su matriz de proyeccion)
-            // se enlaza en nuestro programa en el mismo punto de binding.
-            let (buffer_vs, binding_vs) = VS_DEL_JUEGO.load_or_store();
-            if cubo.idx_vs != GL_INVALID_INDEX && buffer_vs != 0 {
-                (gl.uniform_block_binding)(cubo.programa, cubo.idx_vs, binding_vs);
-                (gl.bind_buffer_base)(GL_UNIFORM_BUFFER, binding_vs, buffer_vs);
-            }
-
             (gl.bind_vertex_array)(cubo.vao);
             (gl.bind_buffer)(GL_ARRAY_BUFFER, cubo.vbo);
             (gl.buffer_data)(
@@ -1376,6 +1425,20 @@ fn dibujar_cajas(gl: &Gl, vp: &[i32; 4]) {
         DIBUJADOS.fetch_add(1, Ordering::Relaxed);
         if DIBUJADOS.load(Ordering::Relaxed) <= 3 {
             drenar_errores(gl, "dibujar el cubo");
+            // Donde ha quedado el cubo en el framebuffer (en pixeles), para
+            // comprobarlo a ojo en la captura: `mundo` ya son pixeles del
+            // framebuffer del mundo.
+            log::info(&format!(
+                "cubo 3D en pantalla: ({:.1}, {:.1}) de {}x{}  [mundo=({:.1}, {:.1}) tam={:.1}x{:.1}]",
+                c.wx,
+                c.wy + c.sy * 0.5,
+                vp[2],
+                vp[3],
+                c.wx,
+                c.wy,
+                c.sx,
+                c.sy
+            ));
         }
     }
 
@@ -1397,65 +1460,50 @@ fn dibujar_cajas(gl: &Gl, vp: &[i32; 4]) {
     if drenar_errores(gl, "restaurar el estado") {
         log::aviso("hubo errores de GL al dibujar el cubo");
     }
-    let _ = vp;
 }
 
 // --------------------------------------------------------------------------
-// Camara: el bloque `vsConstants` del motor
+// Camara: la proyeccion la calculamos nosotros
 // --------------------------------------------------------------------------
 
-/// Buffer y punto de binding del bloque `vsConstants` del juego.
+/// La proyeccion de la camara del motor.
 ///
-/// Se rellena enganchando `GraphicsInterfaceOpenGL::bindUniformBuffer`: ahi se
-/// ve que buffer y que punto de binding usa el motor para cada bloque.
-struct VsDelJuego {
-    buffer: AtomicU64,
-    binding: AtomicU64,
-}
-
-impl VsDelJuego {
-    fn load_or_store(&self) -> (u32, u32) {
-        (
-            self.buffer.load(Ordering::Relaxed) as u32,
-            self.binding.load(Ordering::Relaxed) as u32,
-        )
-    }
-}
-
-static VS_DEL_JUEGO: VsDelJuego = VsDelJuego {
-    buffer: AtomicU64::new(0),
-    binding: AtomicU64::new(0),
-};
-
-/// Cache del indice del bloque `vsConstants` por programa GL.
+/// El motor dibuja el mundo con una proyeccion ortografica. Las
+/// coordenadas del mundo (`mundo`) son la posicion del sprite en el
+/// framebuffer del mundo, en pixeles (verificado con una maquina creada en
+/// el juego: su `mundo` era (856, 384) y en la captura salia en esos mismos
+/// pixeles).
 ///
-/// Consultar el indice de un bloque de uniforms en cada llamada es caro
-/// (el motor llama a `bindUniformBuffer` muchas veces por frame), asi que
-/// se cachea: solo se vuelve a preguntar cuando cambia el programa.
-static CACHE_PROGRAMA: AtomicU64 = AtomicU64::new(0);
-static CACHE_INDICE: AtomicU64 = AtomicU64::new(u64::MAX);
-
-/// Indice del bloque `vsConstants` de un programa (o `u64::MAX` si no lo
-/// tiene).
-fn indice_vs_constants(gl: &Gl, programa: u32) -> u32 {
-    if CACHE_PROGRAMA.load(Ordering::Relaxed) == programa as u64 {
-        return CACHE_INDICE.load(Ordering::Relaxed) as u32;
-    }
-    let nombre = b"vsConstants\0";
-    let idx = unsafe { (gl.get_uniform_block_index)(programa, nombre.as_ptr() as *const i8) };
-    CACHE_PROGRAMA.store(programa as u64, Ordering::Relaxed);
-    CACHE_INDICE.store(idx as u64, Ordering::Relaxed);
-    idx
+/// El framebuffer del mundo se dibuja con la Y hacia abajo (al componerlo en
+/// la ventana el motor lo voltea): al volcarlo con `glReadPixels` sale
+/// derecho, con la GUI abajo. Por eso la Y del clip crece hacia abajo.
+///
+/// La cuenta es la de siempre:
+///
+///     ndc_x = mundo_x * 2 / W - 1
+///     ndc_y = mundo_y * 2 / H - 1
+///
+/// con W y H los del viewport del framebuffer del mundo.
+///
+/// Se devuelve encolumnada por columnas (como la espera GL).
+fn proyeccion(vp: &[i32; 4]) -> [f32; 16] {
+    let w = vp[2].max(1) as f32;
+    let h = vp[3].max(1) as f32;
+    [
+        2.0 / w, 0.0, 0.0, 0.0, //
+        0.0, 2.0 / h, 0.0, 0.0, //
+        0.0, 0.0, 0.0, 0.0, //
+        -1.0, -1.0, 0.0, 1.0, //
+    ]
 }
 
 /// Hook de `GraphicsInterfaceOpenGL::bindUniformBuffer`.
 ///
-/// Sirve para descubrir que buffer de uniforms usa el motor para el bloque
-/// `vsConstants` (donde vive la matriz de proyeccion), de forma que el cubo
-/// pueda usar EXACTAMENTE la misma camara.
-///
 /// Firma: `bindUniformBuffer(uint index, PipelineStateObject const*,
 /// UniformBuffer const*)`.
+///
+/// Desensamblado del motor (`0x34ea070`): el bloque enlazado es
+/// `pso->[0x78][index]` y el buffer de GL es `ub->[0x10]`.
 #[no_mangle]
 pub extern "C" fn xfv_hook_bind_uniform_buffer(
     this: *mut c_void,
@@ -1472,50 +1520,29 @@ extern "C" fn hook_bind_uniform_buffer(
     pipeline: *mut c_void,
     uniform_buffer: *mut c_void,
 ) {
-    // El motor hace exactamente esto (desensamblado de
-    // `GraphicsInterfaceOpenGL::bindUniformBuffer`):
-    //
-    //   programa = pipeline->[0x20]
-    //   bloque   = pipeline->[0x78][index]
-    //   buffer   = uniform_buffer->[0x10]
-    //   glUniformBlockBinding(programa, bloque, index)
-    //   glBindBufferBase(GL_UNIFORM_BUFFER, index, buffer)
-    //
-    // Como se sabe el bloque (y no solo el binding), se puede comprobar si el
-    // que se esta enlazando es `vsConstants` (el que lleva la matriz de
-    // proyeccion) comparando con `glGetUniformBlockIndex`.
-    // Cinturon de seguridad: el indice es un puntero dentro del array de
-    // bloques del pipeline state. Si algo no cuadra, no se lee memoria.
+    // Apuntar lo que se ve. **Nada de GL aqui**: preguntar al motor por sus
+    // programas lo hacia petar (ver el aviso de arriba).
     if !uniform_buffer.is_null() && !pipeline.is_null() && index < 256 {
-        // SAFETY: offsets verificados en el desensamblado del motor.
-        let gl_buffer =
-            unsafe { std::ptr::read_unaligned((uniform_buffer as usize + 0x10) as *const u32) };
-        let programa =
-            unsafe { std::ptr::read_unaligned((pipeline as usize + 0x20) as *const u32) };
-        let tabla = unsafe { std::ptr::read_unaligned((pipeline as usize + 0x78) as *const usize) };
+        // SAFETY: offsets verificados en el desensamblado del motor
+        // (`0x34ea070`): el buffer de GL esta en `ub+0x10`, el programa en
+        // `pso+0x20` y la tabla de bloques en `pso+0x78`.
+        let (gl_buffer, programa, tabla) = unsafe {
+            (
+                std::ptr::read_unaligned((uniform_buffer as usize + 0x10) as *const u32),
+                std::ptr::read_unaligned((pipeline as usize + 0x20) as *const u32),
+                std::ptr::read_unaligned((pipeline as usize + 0x78) as *const usize),
+            )
+        };
         if gl_buffer != 0 && programa != 0 && tabla != 0 {
+            // SAFETY: `index` es el indice dentro de la tabla de bloques del
+            // pipeline state (la comprobacion de `index < 256` lo acota).
             let bloque =
                 unsafe { std::ptr::read_unaligned((tabla + index as usize * 4) as *const u32) };
             if DIAG_UB.swap(1, Ordering::Relaxed) == 0 {
                 log::info(&format!(
-                    "bindUniformBuffer: index={index} pso={pipeline:p} ub={uniform_buffer:p} \
-                     buffer={gl_buffer} programa={programa} tabla=0x{tabla:x} bloque={bloque}"
+                    "bindUniformBuffer: index={index} buffer={gl_buffer} programa={programa} \
+                     bloque={bloque} (solo diagnostico: no se toca la GL)"
                 ));
-            }
-            if bloque != GL_INVALID_INDEX && bloque != 0xFFFFFFFF {
-                if let Some(gl) = GL.get() {
-                    let idx = indice_vs_constants(gl, programa);
-                    if idx == bloque {
-                        let antes = VS_DEL_JUEGO.buffer.load(Ordering::Relaxed);
-                        VS_DEL_JUEGO.buffer.store(gl_buffer as u64, Ordering::Relaxed);
-                        VS_DEL_JUEGO.binding.store(index as u64, Ordering::Relaxed);
-                        if antes == 0 {
-                            log::info(&format!(
-                                "vsConstants del motor: buffer={gl_buffer} binding={index}"
-                            ));
-                        }
-                    }
-                }
             }
         }
     }
@@ -1563,6 +1590,25 @@ fn capturar_si_pide(gl: &Gl, vp: &[i32; 4]) {
 /// caro).
 const CADA_CUANTAS_CAPTURAS: u64 = 20;
 
+/// Cuenta los pixeles que son del cubo.
+///
+/// El cubo se pinta de **magenta** (`0.90, 0.10, 0.75` en el shader) y en la
+/// escena del Factorio no hay nada de ese color: las llamas son amarillas,
+/// la tierra marron, el jugador azul y la GUI gris. Asi que un pixel con
+/// mucho rojo y mucho azul, y poco verde, es del cubo.
+///
+/// Sirve para comprobar automaticamente que el cubo esta en la captura.
+fn pixeles_del_cubo(pix: &[u8]) -> u64 {
+    let mut n = 0u64;
+    for p in pix.chunks_exact(4) {
+        let (r, g, b) = (p[0] as i32, p[1] as i32, p[2] as i32);
+        if r >= 60 && b >= 60 && (r - g) >= 40 && (b - g) >= 30 {
+            n += 1;
+        }
+    }
+    n
+}
+
 /// Captura el framebuffer actual y lo guarda como PNG.
 ///
 /// Se lee del framebuffer que hay enlazado (el del mundo), que en el momento
@@ -1603,12 +1649,21 @@ fn capturar_png(gl: &Gl, vp: &[i32; 4], ruta: &str) -> bool {
             opacos += 1;
         }
     }
+    let del_cubo = pixeles_del_cubo(&pix);
     log::info(&format!(
-        "captura {w}x{h}: {} pixeles con color, {} opacos, {} negros",
+        "captura {w}x{h}: {} pixeles con color, {} opacos, {} negros, {} del cubo",
         con_contenido,
         opacos,
-        (w as u64) * (h as u64) - con_contenido
+        (w as u64) * (h as u64) - con_contenido,
+        del_cubo
     ));
+
+    // La captura solo se escribe si se ve el cubo: asi el PNG del banco es
+    // prueba de que el cubo esta de verdad en la imagen (y no solo de que el
+    // juego no se ha caido).
+    if del_cubo == 0 {
+        return false;
+    }
 
     // GL devuelve las filas de abajo arriba. El motor dibuja el mundo con la
     // Y invertida, asi que en su framebuffer la imagen sale ya derecha; si no
@@ -1663,14 +1718,16 @@ fn escribir_png(ruta: &str, w: u32, h: u32, pix: &[u8]) -> bool {
         z.extend_from_slice(&raw[off..off + n]);
         off += n;
     }
-    // Adler-32 del bloque sin comprimir.
+    // Adler-32 del bloque sin comprimir. OJO: son dos `u16` (4 bytes), no dos
+    // `u32`: con `u32` el PNG salia con 4 bytes de mas y el checksum roto (y
+    // python no lo podia leer).
     let (mut a, mut b) = (1u32, 0u32);
     for &byte in &raw {
         a = (a + byte as u32) % 65521;
         b = (b + a) % 65521;
     }
-    z.extend_from_slice(&b.to_be_bytes());
-    z.extend_from_slice(&a.to_be_bytes());
+    z.extend_from_slice(&(b as u16).to_be_bytes());
+    z.extend_from_slice(&(a as u16).to_be_bytes());
     escribir_bloque(&mut out, b"IDAT", &z);
     escribir_bloque(&mut out, b"IEND", &[]);
 

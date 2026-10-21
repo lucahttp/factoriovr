@@ -7,11 +7,15 @@ set -uo pipefail
 # 2.1.22 ARM64 dentro del contenedor podman:
 #
 #   1. El inyector compila para aarch64-unknown-linux-gnu.
-#   2. El motor arranca una partida real (con maquinas) y el hook de
-#      `AssemblingMachine::draw` se dispara.
-#   3. El motor dibuja el cubo 3D en su framebuffer del mundo.
-#   4. Se vuelca ese framebuffer a un PNG en build/ y el PNG tiene contenido
-#      (no es negro, no es basura).
+#   2. El motor arranca una partida real.
+#   3. Con la consola del juego se crea una maquina (assembling-machine-1)
+#      justo al lado del jugador: asi hay una entidad que dibujar SIEMPRE, sin
+#      depender de que la partida traiga maquinas cerca del punto de
+#      aparicion (andar a ciegas no es fiable).
+#   4. El hook de `AssemblingMachine::draw` se dispara y el motor dibuja el
+#      cubo 3D en su framebuffer del mundo.
+#   5. Se vuelca ese framebuffer a un PNG en build/ y el PNG es valido y
+#      tiene pixeles del cubo (es decir: el cubo SE VE).
 #
 # Notas de por que se usa Xvfb y no el driver "offscreen" de SDL:
 # con offscreen el motor se revienta al cambiar de estado (ver
@@ -138,16 +142,59 @@ ok "cliente lanzado (partida: $SAVE)"
 # --------------------------------------------------------------------------
 say ""
 say "=== 5. Esperando la escena con el cubo (hasta ${TIMEOUT}s) ==="
-encontrada=""
-# El jugador se mueve un poco: las maquinas de la partida estan a unos
-# cuantos tiles del punto de aparicion, asi que hay que andar para que
-# entren en pantalla.
-TECLAS="w a s d"
-for i in $(seq 1 "$TIMEOUT"); do
+
+# --- 5a: esperar a que la partida este cargada ---
+#
+# El inyector avisa por el log cuando el motor ya esta en juego
+# ("cima_tipo=4"): hasta entonces la consola del juego no existe y teclear
+# seria mandar teclas al menu de inicio.
+en_juego=0
+for t in $(seq 1 60); do
     "$PODMAN" exec "$CONTAINER" cat "$LOG_CLIENT" > "$LOG_LOCAL" 2>/dev/null
-    # La captura se escribe sola (el frame mas reciente) en cuanto hay un
-    # framebuffer del mundo; y el cubo aparece cuando el motor ha dibujado
-    # alguna entidad.
+    if grep -q "cima_tipo=4" "$LOG_LOCAL" 2>/dev/null; then
+        en_juego=1
+        break
+    fi
+    if grep -qE "SEGV|SIGILL|FATAL|Received 6" "$LOG_LOCAL" 2>/dev/null; then
+        break
+    fi
+    sleep 2
+done
+[ "$en_juego" = "1" ] || fail "el motor no llego a estar en juego"
+ok "partida cargada (el motor esta en juego)"
+
+# --- 5b: crear una maquina al lado del jugador con la consola del juego ---
+#
+# Es determinista: andar buscando maquinas con el teclado no lo es (la
+# partida no siempre trae fabricas cerca del punto de aparicion).
+COMANDO_CONSOLA='/c local p = game.player.position; local e = game.surfaces[1].create_entity{name="assembling-machine-1", position={p.x+4, p.y}}; if e then game.print("MQUINA CREADA") else game.print("NO SE PUDO") end'
+printf '%s' "$COMANDO_CONSOLA" > "$LOG_DIR/consola.txt"
+"$PODMAN" cp "$LOG_DIR/consola.txt" "$CONTAINER:/tmp/consola.txt" >/dev/null 2>&1 || true
+
+for intento in 1 2 3; do
+    "$PODMAN" exec "$CONTAINER" bash -c "DISPLAY=$DISPLAY_NUM xdotool key grave" >/dev/null 2>&1 || true
+    sleep 2
+    "$PODMAN" exec "$CONTAINER" bash -c "DISPLAY=$DISPLAY_NUM xdotool type --delay 25 --file /tmp/consola.txt" >/dev/null 2>&1 || true
+    sleep 1
+    "$PODMAN" exec "$CONTAINER" bash -c "DISPLAY=$DISPLAY_NUM xdotool key Return" >/dev/null 2>&1 || true
+    sleep 8
+    # Cerrar la consola del juego: si se deja abierta, sale en la captura.
+    "$PODMAN" exec "$CONTAINER" bash -c "DISPLAY=$DISPLAY_NUM xdotool key Escape" >/dev/null 2>&1 || true
+    "$PODMAN" exec "$CONTAINER" cat "$LOG_CLIENT" > "$LOG_LOCAL" 2>/dev/null
+    if grep -q "caja: mundo=" "$LOG_LOCAL" 2>/dev/null; then
+        ok "maquina creada con la consola del juego"
+        break
+    fi
+    # Si el comando no ha entrado, la consola no estaba abierta: se prueba otra
+    # vez (cerrando antes cualquier menu que se haya abierto).
+    "$PODMAN" exec "$CONTAINER" bash -c "DISPLAY=$DISPLAY_NUM xdotool key Escape" >/dev/null 2>&1 || true
+    sleep 2
+done
+
+# --- 5c: esperar a la captura con el cubo ---
+encontrada=""
+for t in $(seq 1 30); do
+    "$PODMAN" exec "$CONTAINER" cat "$LOG_CLIENT" > "$LOG_LOCAL" 2>/dev/null
     if grep -q "caja: mundo=" "$LOG_LOCAL" 2>/dev/null \
         && "$PODMAN" exec "$CONTAINER" test -f "$CAPTURA_CONT" 2>/dev/null; then
         encontrada=1
@@ -156,20 +203,10 @@ for i in $(seq 1 "$TIMEOUT"); do
     if grep -qE "SEGV|SIGILL|FATAL|Received 6" "$LOG_LOCAL" 2>/dev/null; then
         break
     fi
-    # Andar un rato en una direccion (el juego corre con Xvfb, asi que se
-    # puede pulsar teclado de verdad).
-    if [ $((i % 4)) -eq 0 ]; then
-        k=$(echo "$TECLAS" | cut -d" " -f$(( (i / 4) % 4 + 1 )))
-        "$PODMAN" exec "$CONTAINER" bash -c \
-            "DISPLAY=$DISPLAY_NUM xdotool keydown $k; sleep 3; DISPLAY=$DISPLAY_NUM xdotool keyup $k" \
-            >/dev/null 2>&1 || true
-    fi
     sleep 2
 done
 "$PODMAN" exec "$CONTAINER" cat "$LOG_CLIENT" > "$LOG_LOCAL" 2>/dev/null
 
-# --------------------------------------------------------------------------
-say ""
 say "=== 6. Resultado ==="
 say "--- log del inyector (lineas del modulo 3D) ---"
 grep -E "xfv-injector" "$LOG_LOCAL" 2>/dev/null | grep -vE "bytes|hook en|simbolos de funcion|funciones del motor" | head -40 || true
@@ -198,6 +235,43 @@ if [ -n "$PIDE" ]; then
     ok "caja 3D colocada: $PIDE"
 else
     fail "no se registro ninguna caja 3D (el hook de la entidad no llego a la caja)"
+fi
+
+# El PNG tiene que ser valido (zlib con el Adler-32 bien puesto) y tener
+# pixeles del cubo: eso es la prueba de que el cubo SE VE en la imagen.
+if [ -f "$LOG_DIR/cubo_3d.png" ]; then
+    if python3 - "$LOG_DIR/cubo_3d.png" <<'PY' >/dev/null 2>&1
+import struct, sys, zlib
+d = open(sys.argv[1], "rb").read()
+assert d[:8] == b"\x89PNG\r\n\x1a\n", "firma PNG"
+pos, idat, w, h = 8, b"", 0, 0
+while pos < len(d) - 8:
+    ln = struct.unpack(">I", d[pos:pos + 4])[0]
+    typ = d[pos + 4:pos + 8]
+    data = d[pos + 8:pos + 8 + ln]
+    if typ == b"IHDR":
+        w, h = struct.unpack(">II", data[:8])
+    elif typ == b"IDAT":
+        idat += data
+    pos += 12 + ln
+raw = zlib.decompress(idat)
+assert len(raw) == (w * 4 + 1) * h, "tamano de la imagen raro"
+n = 0
+for y in range(h):
+    fila = raw[y * (w * 4 + 1) + 1:(y + 1) * (w * 4 + 1)]
+    for x in range(0, len(fila), 4):
+        r, g, b = fila[x], fila[x + 1], fila[x + 2]
+        if r >= 60 and b >= 60 and (r - g) >= 40 and (b - g) >= 30:
+            n += 1
+assert n > 0, "no hay pixeles del cubo en la captura"
+PY
+    then
+        ok "PNG valido con pixeles del cubo"
+    else
+        fail "el PNG de la captura no es valido o no tiene el cubo"
+    fi
+else
+    fail "no se trajo la captura a $LOG_DIR/cubo_3d.png"
 fi
 
 say ""

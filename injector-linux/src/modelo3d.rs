@@ -2,19 +2,58 @@
 //!
 //! # Que hace este modulo
 //!
-//! Engancha `AssemblingMachine::draw(DrawQueue&)` y, en vez de dejar que el
-//! motor dibuje el sprite 2D de la maquina, dibuja un **cubo 3D** en su lugar.
+//! Engancha el dibujado de las entidades y, en vez de dejar que el motor
+//! pinte el sprite 2D de la maquina, dibuja un **cubo 3D** en su lugar.
 //!
 //! La caja se coloca con los datos REALES de la entidad:
 //!
-//!   * posicion  -> `Entity+0x50` (un `MapPosition`: dos i32 en 1/256 de tile)
-//!   * direccion -> `Entity+0x280` (u8, 0..15), que es lo que lee
-//!                  `CraftingMachine::getDirection()`
-//!   * tamano    -> el prototipo de la entidad (`Entity+0x48`): su nombre se
-//!                  lee para saber si es una maquina de 3x3 tiles
+//!   * posicion  -> la que el propio motor calcula para el sprite de la
+//!                  entidad (ver `SpriteDrawOrder::setup`),
+//!   * orientacion -> `Entity+0x280` (u8, 0..15), que es lo que lee
+//!                  `CraftingMachine::getDirection()`,
+//!   * tamano    -> el del sprite real de la entidad (ancho x alto).
 //!
-//! Todos esos offsets estan verificados sobre el symtab del Factorio 2.1.22
-//! ARM64 (ver `docs/ADR-006-modelo-3d-en-el-juego.md`).
+//! # De donde sale cada dato
+//!
+//! El motor dibuja el mundo asi:
+//!
+//!   1. `SpriteDrawOrder::setup(sprite, renderParameters, mapPosition, shift)`
+//!      calcula la posicion y el tamano del sprite en el espacio del mundo
+//!      (en unidades del motor: pixeles de pantalla con el zoom aplicado).
+//!      El resultado queda en el propio objeto:
+//!
+//!          * `+0x10` -> posicion (2 floats)
+//!          * `+0x24` -> tamano (2 floats)
+//!
+//!   2. Ese sprite se dibuja mas tarde dentro de un framebuffer propio
+//!      (el "framebuffer del mundo"), que despues se compone en la ventana.
+//!
+//! Por eso el modulo engancha `SpriteDrawOrder::setup`: al volver de el
+//! sabemos la posicion y el tamano EXACTOS que el motor usa para esa entidad,
+//! sin adivinar unidades ni camaras. La entidad se identifica porque su
+//! `MapPosition` coincide con la que leimos en `Entity+0x50`.
+//!
+//! # Donde se dibuja el cubo
+//!
+//! El motor agrupa las ordenes de dibujo y las emite al final, en un
+//! "flush". `GraphicsInterfaceOpenGL::bindFramebuffer` hace el flush de lo
+//! pendiente ANTES de cambiar de framebuffer, asi que en el flush el mundo
+//! ya esta pintado en su framebuffer y ese framebuffer sigue enlazado.
+//!
+//! Por eso el cubo se dibuja justo despues de `flushSpritesBatch()` (y de
+//! los demas flush): el cubo sale en el framebuffer del mundo, que es lo que
+//! luego se compone en la ventana. Y el mismo momento es el bueno para leer
+//! los pixeles y hacer la captura.
+//!
+//! # Camara
+//!
+//! El motor usa la misma matriz de proyeccion que sus sprites: esta en el
+//! bloque de uniforms `vsConstants` (`{ mat4 projection; }` en std140, segun
+//! `data/core/graphics/shaders/sprite.vert`). El modulo engancha
+//! `GraphicsInterfaceOpenGL::bindUniformBuffer` para saber que buffer GL y
+//! que punto de binding usa el motor para ese bloque, y enlaza ese mismo
+//! buffer en nuestro programa: asi el cubo cae exactamente donde el juego
+//! espera, con su camara.
 //!
 //! # Por que se dibuja con GL propio y no con el DrawQueue
 //!
@@ -30,25 +69,11 @@
 //!   * las **funciones GL** son las del propio motor: se resuelven de su
 //!     symtab (`glad_glCreateShader`, `glad_glDrawElements`, ...) para no
 //!     depender de una libreria externa ni de una version concreta de GL,
-//!   * la **matriz de proyeccion** se copia de la que el juego tiene puesta
-//!     en su bloque de uniforms (`vsConstants.projection`), de forma que el
-//!     cubo cae exactamente donde el juego espera.
-//!
-//! # Dónde se dibuja
-//!
-//! `AssemblingMachine::draw` se llama al **construir** la cola de dibujado
-//! (fase CPU), no al emitir las ordenes GL. Por eso el hook de aqui:
-//!
-//!   1. lee los datos de la entidad y los guarda,
-//!   2. **no** llama al original (asi el sprite 2D no se dibuja),
-//!   3. deja la caja pendiente para que se pinte en el momento del render.
-//!
-//! El pintado real ocurre en el hook de `GameRenderer::render` (el que ya
-//! existia), que es cuando el motor esta con el contexto GL activo.
+//!   * la **matriz de proyeccion** es la del juego (ver "Camara" arriba).
 
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 
 use crate::detour::{self};
 use crate::log;
@@ -57,7 +82,7 @@ use crate::resolver;
 /// Direccion del trampolin de `AssemblingMachine::draw`.
 static TRAMPOLIN: AtomicUsize = AtomicUsize::new(0);
 
-/// Numero de veces que ha entrado el hook de dibujado.
+/// Numero de veces que ha entrado el hook de dibujado de la entidad.
 static LLAMADAS: AtomicU64 = AtomicU64::new(0);
 
 /// Numero de cajas pendientes de dibujar.
@@ -73,42 +98,162 @@ static MODO_2D: AtomicU64 = AtomicU64::new(0);
 /// Si vale 1, se dibujan las cajas.
 static ACTIVO: AtomicU64 = AtomicU64::new(1);
 
-/// Si vale 1, se captura el framebuffer a PNG en cada frame.
+/// Interruptores de bisectado (todo a 1 por defecto).
+///
+///   * `HOOK_SETUP` -> instalar el detour de `SpriteDrawOrder::setup`
+///   * `HOOK_FLUSH` -> instalar los detours de los flush
+///   * `GL`         -> crear el cubo, dibujarlo y capturar
+static HOOK_SETUP: AtomicU64 = AtomicU64::new(1);
+static HOOK_FLUSH: AtomicU64 = AtomicU64::new(1);
+static USAR_GL: AtomicU64 = AtomicU64::new(1);
+
+/// Si vale 1, se captura el framebuffer a PNG en cada flush.
 static CAPTURAR: AtomicU64 = AtomicU64::new(0);
 
-/// Contador de frames capturados.
+/// Contador de capturas.
 static CAPTURAS: AtomicU64 = AtomicU64::new(0);
+
+/// Si vale 1, la captura se voltea verticalmente (util si el motor ya
+/// entrega la imagen del revés).
+static CAPTURAR_VOLTEADA: AtomicU64 = AtomicU64::new(0);
+
+/// Ya se ha hecho el diagnostico del estado de GL (una sola vez).
+static DIAG_GL: AtomicU64 = AtomicU64::new(0);
+
+/// Ya se ha hecho el diagnostico de `bindUniformBuffer` (una sola vez).
+static DIAG_UB: AtomicU64 = AtomicU64::new(0);
 
 /// Cuantas cajas se guardan como maximo.
 const MAX_PENDIENTES: usize = 32;
 
+/// Posicion del mapa de una entidad, en 1/256 de tile (2 x i32).
+///
+/// Es el `MapPosition` del motor (`Entity+0x50`).
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
+struct PosMapa {
+    x: i32,
+    y: i32,
+}
+
 /// Una caja pendiente de dibujar.
 #[derive(Clone, Copy, Default)]
 struct Caja {
-    /// Posicion en el mapa, en tiles (x, y).
-    px: f32,
-    py: f32,
+    /// Posicion en el espacio del mundo del motor (x, y).
+    wx: f32,
+    wy: f32,
+    /// Tamano del sprite de la entidad (ancho y alto) en unidades del motor.
+    sx: f32,
+    sy: f32,
     /// Direccion de la entidad (0..15).
     direccion: u8,
-    /// Ancho y alto en tiles.
-    ancho: f32,
-    alto: f32,
-    /// Altura del cubo en tiles.
-    altura: f32,
 }
 
-/// Las cajas pendientes. Solo se tocan desde el hilo de render.
-static mut PEND: [Caja; MAX_PENDIENTES] = [Caja {
-    px: 0.0,
-    py: 0.0,
-    direccion: 0,
-    ancho: 1.0,
-    alto: 1.0,
-    altura: 0.0,
-}; MAX_PENDIENTES];
+/// Las cajas pendientes y las entidades vistas.
+///
+/// Los hooks corren en varios hilos (el motor dibuja el mundo en hilos
+/// worker), asi que el estado se protege con un mutex. El mutex no se
+/// envenena nunca (no hay panics dentro), pero aun asi se recupera el
+/// error en vez de propagarlo: con `panic = "abort"` un panic mataria el
+/// juego.
+static ESTADO: Mutex<Estado> = Mutex::new(Estado {
+    pendientes: [Caja {
+        wx: 0.0,
+        wy: 0.0,
+        sx: 0.0,
+        sy: 0.0,
+        direccion: 0,
+    }; MAX_PENDIENTES],
+    n_pend: 0,
+    entidades: [Entidad {
+        pos: PosMapa { x: 0, y: 0 },
+        direccion: 0,
+    }; MAX_ENTIDADES],
+    n_entidades: 0,
+});
 
-/// Numero de cajas pendientes ahora mismo.
-static N_PEND: AtomicUsize = AtomicUsize::new(0);
+/// Estado compartido entre los hooks.
+struct Estado {
+    /// Cajas pendientes de dibujar.
+    pendientes: [Caja; MAX_PENDIENTES],
+    /// Numero de cajas pendientes.
+    n_pend: usize,
+    /// Entidades vistas en el frame.
+    entidades: [Entidad; MAX_ENTIDADES],
+    /// Numero de entidades vistas.
+    n_entidades: usize,
+}
+
+impl Estado {
+    /// Anota una entidad (la llama el hook de `AssemblingMachine::draw`).
+    fn anota_entidad(&mut self, pos: PosMapa, direccion: u8) {
+        let mut i = self.n_entidades;
+        if i >= MAX_ENTIDADES {
+            i = 0;
+        }
+        self.entidades[i] = Entidad { pos, direccion };
+        self.n_entidades = i + 1;
+    }
+
+    /// ¿Esta posicion de mapa es la de alguna entidad vista?
+    fn direccion_de(&self, pos: PosMapa) -> Option<u8> {
+        let mut i = 0usize;
+        while i < self.n_entidades && i < MAX_ENTIDADES {
+            if self.entidades[i].pos == pos {
+                return Some(self.entidades[i].direccion);
+            }
+            i += 1;
+        }
+        None
+    }
+
+    /// Anade una caja a la lista de pendientes.
+    fn anade_caja(&mut self, caja: Caja) {
+        let mut i = self.n_pend;
+        if i >= MAX_PENDIENTES {
+            i = 0;
+        }
+        self.pendientes[i] = caja;
+        self.n_pend = i + 1;
+    }
+
+    /// Saca las cajas pendientes y vacia la lista.
+    fn toma_cajas(&mut self) -> Vec<Caja> {
+        let n = self.n_pend.min(MAX_PENDIENTES);
+        let mut out = Vec::with_capacity(n);
+        let mut i = 0usize;
+        while i < n {
+            out.push(self.pendientes[i]);
+            i += 1;
+        }
+        self.n_pend = 0;
+        out
+    }
+}
+
+/// Toma el estado compartido sin propagar un posible envenenamiento.
+fn con_estado<R>(f: impl FnOnce(&mut Estado) -> R) -> R {
+    match ESTADO.lock() {
+        Ok(mut g) => f(&mut g),
+        Err(e) => f(&mut e.into_inner()),
+    }
+}
+
+/// Una entidad que se esta dibujando: su posicion de mapa y su direccion.
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
+struct Entidad {
+    pos: PosMapa,
+    direccion: u8,
+}
+
+/// Cuantas entidades se guardan como maximo.
+const MAX_ENTIDADES: usize = 16;
+
+/// Numero de entidades vistas (copia atomica del estado compartido).
+///
+/// Sirve de comprobacion rapida: el hook de la cola de dibujado se llama
+/// para CADA sprite del mundo (miles por frame), y no merece la pena
+/// tomar el mutex si todavia no hemos visto ninguna entidad.
+static N_ENTIDADES: AtomicUsize = AtomicUsize::new(0);
 
 // --------------------------------------------------------------------------
 // Tipos de las funciones GL del motor
@@ -170,7 +315,6 @@ type GlReadPixels = unsafe extern "C" fn(
 type GlPixelStorei = unsafe extern "C" fn(pname: u32, param: i32);
 type GlFinish = unsafe extern "C" fn();
 type GlGetString = unsafe extern "C" fn(name: u32) -> *const u8;
-type GlViewport = unsafe extern "C" fn(x: i32, y: i32, width: i32, height: i32);
 
 // Codigos de GL usados.
 const GL_NO_ERROR: u32 = 0;
@@ -200,8 +344,10 @@ const GL_UNPACK_ALIGNMENT: u32 = 0x0CF5;
 const GL_INVALID_INDEX: u32 = 0xFFFF_FFFF;
 /// Framebuffer de dibujado actualmente enlazado.
 const GL_DRAW_FRAMEBUFFER_BINDING: u32 = 0x8CA6;
-/// Framebuffer de lectura actualmente enlazado.
-const GL_READ_FRAMEBUFFER_BINDING: u32 = 0x8CAA;
+/// Vertex array actualmente enlazado.
+const GL_VERTEX_ARRAY_BINDING: u32 = 0x85B5;
+/// Buffer de vertices actualmente enlazado.
+const GL_ARRAY_BUFFER_BINDING: u32 = 0x8894;
 /// Numero de muestras del framebuffer (multisampling).
 const GL_SAMPLES: u32 = 0x80A9;
 
@@ -243,7 +389,6 @@ struct Gl {
     pixel_storei: GlPixelStorei,
     finish: GlFinish,
     get_string: GlGetString,
-    viewport: GlViewport,
 }
 
 /// Direcciones de las variables globales del motor que guardan los punteros a
@@ -281,29 +426,16 @@ struct GlAddr {
     pixel_storei: usize,
     finish: usize,
     get_string: usize,
-    viewport: usize,
 }
 
 /// Estado del cubo: programa, VAO y buffers.
 struct Cubo {
     programa: u32,
     vao: u32,
-    #[allow(dead_code)]
     vbo: u32,
-    #[allow(dead_code)]
     ebo: u32,
     /// Indice del bloque `vsConstants` en nuestro programa.
     idx_vs: u32,
-    /// Indice del bloque `uModelo` en nuestro programa.
-    idx_modelo: u32,
-    /// Buffer con la matriz de proyeccion (la del juego).
-    #[allow(dead_code)]
-    ubo_vs: u32,
-    /// Buffer con la matriz modelo.
-    ubo_modelo: u32,
-    /// Punto de binding del bloque `vsConstants`.
-    #[allow(dead_code)]
-    binding_vs: u32,
 }
 
 /// Punteros a las funciones GL del motor (se rellenan al instalar).
@@ -321,20 +453,18 @@ static CUBO: OnceLock<Cubo> = OnceLock::new();
 /// uniforms `vsConstants` con la matriz de proyeccion, para que el cubo se
 /// ubique con la misma camara que el resto del mundo.
 ///
-/// La matriz del modelo va en un uniform block propio (`uModelo`), porque el
-/// motor no expone `glUniformMatrix4fv` entre sus simbolos `glad_gl*`.
+/// El cubo se calcula entero en la CPU (la transformacion 3D se hace aqui, no
+/// en el shader): asi el vertex shader solo necesita la proyeccion 2D del
+/// motor y no hay que depender de como trata la componente Z.
 const VS: &[u8] = b"#version 330\n\
 layout(std140) uniform vsConstants {\n\
     mat4 projection;\n\
 } _19;\n\
-layout(std140) uniform uModelo {\n\
-    mat4 modelo;\n\
-} _20;\n\
 layout(location = 0) in vec3 position;\n\
 layout(location = 1) in vec3 normal;\n\
 out vec3 vNormal;\n\
 void main() {\n\
-    gl_Position = _19.projection * (_20.modelo * vec4(position, 1.0));\n\
+    gl_Position = _19.projection * vec4(position, 1.0);\n\
     vNormal = normal;\n\
 }\n";
 
@@ -396,27 +526,7 @@ const INDICES: [u32; 36] = [
 /// Bytes por vertice (posicion + normal).
 const ESTRIDE: usize = 24;
 
-/// Lee una variable global del ejecutable y devuelve su valor.
-///
-/// Los punteros a funciones GL del motor son variables globales: su *valor*
-/// es el puntero a la funcion. Ya no se usa: los punteros se leen en
-/// `construir_gl`, cuando GLAD ya los ha cargado.
-#[allow(dead_code)]
-fn valor_global(simbolos: &resolver::Simbolos, mangled: &str) -> Option<usize> {
-    let r = simbolos.resolver_exacto(mangled)?;
-    // `direccion` es la direccion de la variable; su contenido es el puntero.
-    let p = r.direccion as *const usize;
-    // SAFETY: la variable es un objeto del ejecutable con una direccion valida
-    // (vive en .bss del binario cargado).
-    let v = unsafe { std::ptr::read_unaligned(p) };
-    if v == 0 {
-        None
-    } else {
-        Some(v)
-    }
-}
-
-/// Resuelve la *direccion* de las variables globales del motor que guardan
+/// Resuelve las *direcciones* de las variables globales del motor que guardan
 /// los punteros a las funciones GL.
 ///
 /// Solo se resuelven las direcciones: GLAD carga los punteros mas tarde (al
@@ -465,7 +575,6 @@ fn resolver_gl(simbolos: &resolver::Simbolos) -> Option<GlAddr> {
         pixel_storei: dir!("glad_glPixelStorei"),
         finish: dir!("glad_glFinish"),
         get_string: dir!("glad_glGetString"),
-        viewport: dir!("glad_glViewport"),
     })
 }
 
@@ -522,7 +631,6 @@ fn construir_gl(dir: &GlAddr) -> Option<Gl> {
         pixel_storei: ptr!(pixel_storei),
         finish: ptr!(finish),
         get_string: ptr!(get_string),
-        viewport: ptr!(viewport),
     })
 }
 
@@ -545,10 +653,6 @@ fn cadena_gl(p: *const u8) -> String {
 }
 
 /// Lee un entero de GL.
-///
-/// Tambien sirve para consultar el estado de una capacidad: `glGetIntegerv`
-/// con `GL_DEPTH_TEST`, `GL_BLEND` o `GL_CULL_FACE` devuelve si estan
-/// habilitadas (no hace falta `glIsEnabled`, que el motor no expone).
 fn gl_int(gl: &Gl, pname: u32) -> i32 {
     let mut v: i32 = 0;
     // SAFETY: el contexto GL esta activo cuando se llama.
@@ -574,63 +678,9 @@ fn drenar_errores(gl: &Gl, etapa: &str) -> bool {
     hubo
 }
 
-/// Viewport del area de juego.
-///
-/// El motor dibuja el mundo (960x704) dentro de una ventana mayor (1024x768):
-/// el area de juego es un viewport propio. Se guarda cuando el motor dibuja
-/// para poder restaurar exactamente ese viewport al pintar el cubo, que si no
-/// se dibujaria desplazado.
-struct Viewport {
-    x: std::sync::atomic::AtomicI32,
-    y: std::sync::atomic::AtomicI32,
-    w: std::sync::atomic::AtomicI32,
-    h: std::sync::atomic::AtomicI32,
-    /// 1 si se ha guardado un viewport valido.
-    valido: AtomicU64,
-}
-
-static VIEWPORT_JUEGO: Viewport = Viewport {
-    x: std::sync::atomic::AtomicI32::new(0),
-    y: std::sync::atomic::AtomicI32::new(0),
-    w: std::sync::atomic::AtomicI32::new(0),
-    h: std::sync::atomic::AtomicI32::new(0),
-    valido: AtomicU64::new(0),
-};
-
-/// Guarda el viewport actual como el viewport del area de juego.
-pub fn nota_viewport() {
-    let gl = match GL.get() {
-        Some(g) => g,
-        None => return,
-    };
-    let mut vp = [0i32; 4];
-    // SAFETY: el contexto GL esta activo.
-    unsafe { (gl.get_integerv)(GL_VIEWPORT, vp.as_mut_ptr()) };
-    if vp[2] <= 0 || vp[3] <= 0 {
-        return;
-    }
-    VIEWPORT_JUEGO.x.store(vp[0], Ordering::Relaxed);
-    VIEWPORT_JUEGO.y.store(vp[1], Ordering::Relaxed);
-    VIEWPORT_JUEGO.w.store(vp[2], Ordering::Relaxed);
-    VIEWPORT_JUEGO.h.store(vp[3], Ordering::Relaxed);
-    VIEWPORT_JUEGO.valido.store(1, Ordering::Relaxed);
-}
-
-/// Pone el viewport del area de juego (si se ha guardado).
-fn poner_viewport_juego(gl: &Gl) {
-    if VIEWPORT_JUEGO.valido.load(Ordering::Relaxed) == 0 {
-        return;
-    }
-    let x = VIEWPORT_JUEGO.x.load(Ordering::Relaxed);
-    let y = VIEWPORT_JUEGO.y.load(Ordering::Relaxed);
-    let w = VIEWPORT_JUEGO.w.load(Ordering::Relaxed);
-    let h = VIEWPORT_JUEGO.h.load(Ordering::Relaxed);
-    // SAFETY: el contexto GL esta activo.
-    unsafe { (gl.viewport)(x, y, w, h) };
-}
-
 /// Compila un shader y devuelve su id (0 si falla).
-fn compilar(gl: &Gl, tipo: u32, fuente: &[u8]) -> u32 {    let id = unsafe { (gl.create_shader)(tipo) };
+fn compilar(gl: &Gl, tipo: u32, fuente: &[u8]) -> u32 {
+    let id = unsafe { (gl.create_shader)(tipo) };
     if id == 0 {
         return 0;
     }
@@ -725,19 +775,14 @@ fn crear_cubo(gl: &Gl) -> Option<Cubo> {
         );
         (gl.bind_vertex_array)(0);
     }
+    drenar_errores(gl, "crear los buffers del cubo");
 
-    // Bloques de uniforms: `vsConstants` (proyeccion) y `uModelo` (modelo).
+    // Bloque de uniforms `vsConstants`: el mismo que usa el motor, para
+    // tener exactamente su matriz de proyeccion.
     let nombre_vs = b"vsConstants\0";
     let idx_vs = unsafe { (gl.get_uniform_block_index)(prog, nombre_vs.as_ptr() as *const i8) };
-    let nombre_mod = b"uModelo\0";
-    let idx_mod = unsafe { (gl.get_uniform_block_index)(prog, nombre_mod.as_ptr() as *const i8) };
-
-    // Dos buffers: uno para la proyeccion y otro para el modelo.
-    let mut ubo_vs: u32 = 0;
-    let mut ubo_modelo: u32 = 0;
-    unsafe {
-        (gl.gen_buffers)(1, &mut ubo_vs);
-        (gl.gen_buffers)(1, &mut ubo_modelo);
+    if idx_vs == GL_INVALID_INDEX {
+        log::error("el motor no tiene bloque de uniforms 'vsConstants'");
     }
 
     Some(Cubo {
@@ -746,12 +791,12 @@ fn crear_cubo(gl: &Gl) -> Option<Cubo> {
         vbo,
         ebo,
         idx_vs,
-        idx_modelo: idx_mod,
-        ubo_vs,
-        ubo_modelo,
-        binding_vs: 0,
     })
 }
+
+// --------------------------------------------------------------------------
+// Hooks
+// --------------------------------------------------------------------------
 
 /// Tipo del trampolin de `AssemblingMachine::draw`.
 ///
@@ -762,61 +807,243 @@ type HookDraw = unsafe extern "C" fn(*mut c_void, *mut c_void);
 
 /// Tipo del trampolin de `bindUniformBuffer`.
 ///
-/// `bindUniformBuffer(uint index, PipelineStateObject const*, UniformBuffer const*)`.
-type HookUniformBuffer = unsafe extern "C" fn(u32, *mut c_void, *mut c_void);
-
-/// Tipo del trampolin de `SDL_OFFSCREEN_UpdateWindowFramebuffer`.
+/// Es un metodo de `GraphicsInterfaceOpenGL`, asi que lleva el `this`
+/// implicito delante:
 ///
-/// `int SDL_OFFSCREEN_UpdateWindowFramebuffer(SDL_Window*)`.
-type HookPresent = unsafe extern "C" fn(*mut c_void) -> i32;
+///     bindUniformBuffer(GraphicsInterfaceOpenGL* this, uint index,
+///                       PipelineStateObject const* pso, UniformBuffer const* ub)
+type HookUniformBuffer = unsafe extern "C" fn(*mut c_void, u32, *mut c_void, *mut c_void);
 
-/// Tipo del trampolin de `DrawCommandBatch::flushSpritesBatch`.
+/// Tipo del trampolin de `DrawQueue::draw`.
+///
+///     draw(DrawQueue* this, Sprite const& sprite, MapPosition const& position,
+///          DrawingFlags flags, RenderLayer::Enum layer, Vector const& shift,
+///          float size_x, float size_y)
+///
+/// Los dos `float` van en los registros s0 y s1 (AAPCS64: los argumentos
+/// en coma flotante tienen sus propios registros).
+type HookDrawQueue =
+    unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void, u32, u32, *mut c_void, f32, f32);
+
+/// Tipo del trampolin de `flushSpritesBatch`.
 ///
 /// `void flushSpritesBatch(bool)`.
 type HookFlush = unsafe extern "C" fn(*mut c_void, u8);
 
-/// Trampolin de la presentacion de SDL.
-static TRAMPOLIN_PRESENT: AtomicUsize = AtomicUsize::new(0);
+/// Tipo del trampolin de `flushPrimitiveBatch` / `flushTextBatch` (sin args).
+type HookFlushSimple = unsafe extern "C" fn(*mut c_void);
 
-/// Trampolin del flush de sprites.
+/// Trampolin de `bindUniformBuffer`.
+static TRAMPOLIN_UB: AtomicUsize = AtomicUsize::new(0);
+
+/// Trampolin de `DrawQueue::draw`.
+static TRAMPOLIN_DQ: AtomicUsize = AtomicUsize::new(0);
+
+/// Trampolin de `flushSpritesBatch`.
 static TRAMPOLIN_FLUSH: AtomicUsize = AtomicUsize::new(0);
 
-/// Si vale 1, el cubo se pinta en el hook de presentacion (el sitio preferible,
-/// porque ahi el framebuffer por defecto ya tiene la imagen final).
-static PINTAR_EN_PRESENTACION: AtomicU64 = AtomicU64::new(0);
+/// Trampolin de `flushSpritesInstancedBatch`.
+static TRAMPOLIN_FLUSH_INST: AtomicUsize = AtomicUsize::new(0);
 
-/// Hook de `SDL_OFFSCREEN_UpdateWindowFramebuffer`.
+/// Trampolin de `flushPrimitiveBatch`.
+static TRAMPOLIN_FLUSH_PRIM: AtomicUsize = AtomicUsize::new(0);
+
+/// Trampolin de `flushTextBatch`.
+static TRAMPOLIN_FLUSH_TEXT: AtomicUsize = AtomicUsize::new(0);
+
+/// Hook de `AssemblingMachine::draw(DrawQueue&)`.
 ///
-/// Es el ultimo paso del frame: SDL copia ahi el framebuffer de la ventana.
-/// En ese momento el framebuffer por defecto ya tiene la imagen final, asi que
-/// es donde se pinta el cubo 3D y donde se captura la pantalla.
+/// Recibe `this` (la entidad) en x0 y la cola de dibujado en x1.
 #[no_mangle]
-pub extern "C" fn xfv_hook_present(window: *mut c_void) -> i32 {
-    hook_present(window)
+pub extern "C" fn xfv_hook_draw_asm(this: *mut c_void, queue: *mut c_void) {
+    hook_draw_asm(this, queue)
 }
 
-extern "C" fn hook_present(window: *mut c_void) -> i32 {
-    // Pinta el cubo encima de la imagen final y lo captura.
-    preparar_gl();
-    dibujar_cajas();
-    capturar_si_pide();
+extern "C" fn hook_draw_asm(this: *mut c_void, queue: *mut c_void) {
+    let n = LLAMADAS.fetch_add(1, Ordering::Relaxed) + 1;
 
-    let tramp = TRAMPOLIN_PRESENT.load(Ordering::Relaxed);
-    if tramp == 0 {
-        return 0;
+    // Guardar la posicion de mapa de la entidad: con ella se identifica su
+    // sprite en el hook de `SpriteDrawOrder::setup`.
+    if ACTIVO.load(Ordering::Relaxed) == 1 && !this.is_null() {
+        let pos = leer_posicion(this);
+        let direccion = leer_direccion(this);
+        con_estado(|e| e.anota_entidad(pos, direccion));
+        N_ENTIDADES.fetch_add(1, Ordering::Relaxed);
+        if n <= 3 {
+            log::info(&format!(
+                "entidad en ({:.4}, {:.4}) dir={}",
+                pos.x as f64 / 256.0,
+                pos.y as f64 / 256.0,
+                direccion
+            ));
+        }
     }
-    // SAFETY: el trampolin repone los argumentos intactos.
-    unsafe {
-        let f: HookPresent = std::mem::transmute(tramp);
-        f(window)
+
+    // El original SIEMPRE: el motor necesita que su `draw` termine bien
+    // (encola el sprite de la entidad). En modo 2D no se dibuja el cubo, y
+    // en modo 3D el cubo se dibuja encima, pero el sprite sigue encolado.
+    let tramp = TRAMPOLIN.load(Ordering::Relaxed);
+    if tramp != 0 {
+        // SAFETY: el trampolin repone los argumentos intactos.
+        unsafe {
+            let f: HookDraw = std::mem::transmute(tramp);
+            f(this, queue);
+        }
+    }
+}
+
+/// Lee la posicion de mapa de la entidad (`Entity+0x50`, dos i32 en 1/256 de
+/// tile).
+fn leer_posicion(this: *mut c_void) -> PosMapa {
+    let base = this as usize;
+    // SAFETY: `base+0x50` es la posicion de la entidad (verificado sobre el
+    // symtab y el codigo del motor: `scvtf` con desplazamiento 8 = /256).
+    let pos = unsafe { std::ptr::read_unaligned((base + 0x50) as *const [i32; 2]) };
+    PosMapa { x: pos[0], y: pos[1] }
+}
+
+/// Lee la direccion de la entidad (`Entity+0x280`, u8 con 4 bits utiles).
+fn leer_direccion(this: *mut c_void) -> u8 {
+    let base = this as usize;
+    // SAFETY: `base+0x280` es el byte de direccion.
+    (unsafe { std::ptr::read_unaligned((base + 0x280) as *const u8) }) & 0x0F_u8
+}
+
+/// Hook de `DrawQueue::draw`.
+///
+/// El motor pasa aqui cada sprite que va a dibujar. Para las entidades, la
+/// `MapPosition` es la de la entidad, asi que comparandola con las que
+/// hemos visto en `AssemblingMachine::draw` sabemos que sprite es el
+/// nuestro.
+///
+/// Ademas, el `DrawQueue` guarda los `RenderParameters` en su primer
+/// puntero, y ahi estan la camara y la escala con las que el motor
+/// convierte las coordenadas del mapa en coordenadas del mundo (la misma
+/// cuenta que hace `SpriteDrawOrder::setup`, desensamblada):
+///
+///     mundo = (mapa / 256) * (32 * escala) - camara
+#[no_mangle]
+pub extern "C" fn xfv_hook_draw_queue(
+    this: *mut c_void,
+    sprite: *mut c_void,
+    position: *mut c_void,
+    flags: u32,
+    layer: u32,
+    shift: *mut c_void,
+    _size_x: f32,
+    _size_y: f32,
+) {
+    hook_draw_queue(this, sprite, position, flags, layer, shift, _size_x, _size_y)
+}
+
+extern "C" fn hook_draw_queue(
+    this: *mut c_void,
+    sprite: *mut c_void,
+    position: *mut c_void,
+    flags: u32,
+    layer: u32,
+    shift: *mut c_void,
+    _size_x: f32,
+    _size_y: f32,
+) {
+    // El original primero: el sprite tiene que existir.
+    let tramp = TRAMPOLIN_DQ.load(Ordering::Relaxed);
+    if tramp != 0 {
+        // SAFETY: el trampolin repone los argumentos intactos.
+        unsafe {
+            let f: HookDrawQueue = std::mem::transmute(tramp);
+            f(this, sprite, position, flags, layer, shift, _size_x, _size_y);
+        }
+    }
+
+    if ACTIVO.load(Ordering::Relaxed) == 0 || position.is_null() || this.is_null() {
+        return;
+    }
+    // Comprobacion rapida antes de tocar el estado compartido: este hook se
+    // llama para cada sprite del mundo.
+    if N_ENTIDADES.load(Ordering::Relaxed) == 0 {
+        return;
+    }
+
+    // La posicion de mapa del sprite.
+    // SAFETY: `position` apunta a un `MapPosition` (2 x i32).
+    let mp = unsafe { std::ptr::read_unaligned(position as *const [i32; 2]) };
+    let pos = PosMapa { x: mp[0], y: mp[1] };
+
+    // ¿Es el sprite de una de nuestras entidades?
+    let direccion = match con_estado(|e| e.direccion_de(pos)) {
+        Some(d) => d,
+        None => return,
+    };
+
+    // Los `RenderParameters` (el motor los guarda en el primer puntero del
+    // `DrawQueue`).
+    // SAFETY: `this` es el `DrawQueue`.
+    let rp = unsafe { std::ptr::read_unaligned(this as *const *mut c_void) };
+    if rp.is_null() {
+        return;
+    }
+    // SAFETY: offsets verificados en el desensamblado de
+    // `SpriteDrawOrder::setup`: la escala en +0x190 y la camara en +0x1b8.
+    let (escala, cam_x, cam_y) = unsafe {
+        let p = rp as usize;
+        (
+            std::ptr::read_unaligned((p + 0x190) as *const f64),
+            std::ptr::read_unaligned((p + 0x1b8) as *const f64),
+            std::ptr::read_unaligned((p + 0x1c0) as *const f64),
+        )
+    };
+
+    // La posicion en el mundo del motor, con su misma cuenta.
+    let factor = 32.0 * escala;
+    let wx = (pos.x as f64 / 256.0) * factor - cam_x;
+    let wy = (pos.y as f64 / 256.0) * factor - cam_y;
+
+    // El tamano del sprite. El motor lo guarda en el propio sprite (dos
+    // floats en +0x38) y lo pasa por las coordenadas del mundo
+    // multiplicandolo por la escala (ver `SpriteDrawOrder::setup`).
+    let (sx, sy) = if sprite.is_null() {
+        (0.0, 0.0)
+    } else {
+        // SAFETY: `sprite` es un `Sprite`; +0x38 son sus dos floats de
+        // tamano (verificado en el desensamblado de `setup`).
+        unsafe {
+            let p = sprite as *const f32;
+            (
+                std::ptr::read_unaligned(p.add(14)) as f64 * escala,
+                std::ptr::read_unaligned(p.add(15)) as f64 * escala,
+            )
+        }
+    };
+
+    if sx <= 0.0 || sy <= 0.0 {
+        return;
+    }
+
+    let caja = Caja {
+        wx: wx as f32,
+        wy: wy as f32,
+        sx: sx as f32,
+        sy: sy as f32,
+        direccion,
+    };
+    con_estado(|e| e.anade_caja(caja));
+    PENDIENTES.fetch_add(1, Ordering::Relaxed);
+
+    let total = PENDIENTES.load(Ordering::Relaxed);
+    if total <= 5 {
+        log::info(&format!(
+            "caja: mundo=({:.2}, {:.2}) tamano={:.1}x{:.1} dir={} escala={:.4} cam=({:.1}, {:.1})",
+            caja.wx, caja.wy, caja.sx, caja.sy, caja.direccion, escala, cam_x, cam_y
+        ));
     }
 }
 
 /// Hook de `DrawCommandBatch::flushSpritesBatch(bool)`.
 ///
-/// Es el punto donde el motor emite sus ordenes GL de verdad. Se usa solo si
-/// no se pudo enganchar la presentacion de SDL: el cubo se pinta justo
-/// despues del flush, encima de la escena.
+/// Es el punto donde el motor emite sus ordenes GL de verdad. Justo despues
+/// del flush, el mundo ya esta pintado en el framebuffer del mundo (que sigue
+/// enlazado): ahi se pinta el cubo y se captura la imagen.
 #[no_mangle]
 pub extern "C" fn xfv_hook_flush_sprites(this: *mut c_void, flag: u8) {
     hook_flush_sprites(this, flag)
@@ -831,110 +1058,109 @@ extern "C" fn hook_flush_sprites(this: *mut c_void, flag: u8) {
             f(this, flag);
         }
     }
-    // Tras el flush, la escena ya esta en el framebuffer: se pinta el cubo.
-    if PINTAR_EN_PRESENTACION.load(Ordering::Relaxed) == 0 {
-        preparar_gl();
-        dibujar_cajas();
-        capturar_si_pide();
-    }
+    pintar_si_toca();
 }
 
-/// Hook de `AssemblingMachine::draw(DrawQueue&)`.
-///
-/// Recibe `this` (la entidad) en x0 y la cola de dibujado en x1.
+/// Hook de `DrawCommandBatch::flushSpritesInstancedBatch(bool)`.
 #[no_mangle]
-pub extern "C" fn xfv_hook_draw_asm(this: *mut c_void, queue: *mut c_void) {
-    hook_draw_asm(this, queue)
+pub extern "C" fn xfv_hook_flush_sprites_instanced(this: *mut c_void, flag: u8) {
+    hook_flush_sprites_instanced(this, flag)
 }
 
-extern "C" fn hook_draw_asm(this: *mut c_void, queue: *mut c_void) {
-    let n = LLAMADAS.fetch_add(1, Ordering::Relaxed) + 1;
-
-    // Recoger los datos de la entidad (posicion, direccion y tamano).
-    if ACTIVO.load(Ordering::Relaxed) == 1 && !this.is_null() {
-        let caja = leer_entidad(this, queue);
-        let mut i = N_PEND.load(Ordering::Relaxed);
-        if i >= MAX_PENDIENTES {
-            i = 0;
-        }
-        // SAFETY: `PEND` solo se toca desde el hilo de render.
+extern "C" fn hook_flush_sprites_instanced(this: *mut c_void, flag: u8) {
+    let tramp = TRAMPOLIN_FLUSH_INST.load(Ordering::Relaxed);
+    if tramp != 0 {
+        // SAFETY: el trampolin repone los argumentos intactos.
         unsafe {
-            let p = &raw mut PEND;
-            (*p)[i] = caja;
-        }
-        N_PEND.store(i + 1, Ordering::Relaxed);
-        PENDIENTES.fetch_add(1, Ordering::Relaxed);
-        if n <= 3 {
-            log::info(&format!(
-                "cubo: entidad en ({:.3}, {:.3}) dir={} tamano={:.1}x{:.1}",
-                caja.px, caja.py, caja.direccion, caja.ancho, caja.alto
-            ));
+            let f: HookFlush = std::mem::transmute(tramp);
+            f(this, flag);
         }
     }
+    pintar_si_toca();
+}
 
-    // En modo 2D se llama al original (la maquina se ve como sprite normal).
-    if MODO_2D.load(Ordering::Relaxed) == 1 {
-        let tramp = TRAMPOLIN.load(Ordering::Relaxed);
-        if tramp != 0 {
-            // SAFETY: el trampolin repone los argumentos intactos.
-            unsafe {
-                let f: HookDraw = std::mem::transmute(tramp);
-                f(this, queue);
-            }
+/// Hook de `DrawCommandBatch::flushPrimitiveBatch()`.
+#[no_mangle]
+pub extern "C" fn xfv_hook_flush_primitives(this: *mut c_void) {
+    hook_flush_primitives(this)
+}
+
+extern "C" fn hook_flush_primitives(this: *mut c_void) {
+    let tramp = TRAMPOLIN_FLUSH_PRIM.load(Ordering::Relaxed);
+    if tramp != 0 {
+        // SAFETY: el trampolin repone los argumentos intactos.
+        unsafe {
+            let f: HookFlushSimple = std::mem::transmute(tramp);
+            f(this);
         }
     }
+    pintar_si_toca();
 }
 
-/// Lee posicion, direccion y tamano de la entidad.
-///
-/// Offsets verificados sobre el symtab del Factorio 2.1.22 ARM64:
-///   * `Entity+0x48` -> `EntityPrototype*`
-///   * `Entity+0x50` -> `MapPosition` (2 x i32, 1/256 de tile)
-///   * `Entity+0x280` -> direccion (u8) (lo lee `CraftingMachine::getDirection`)
-fn leer_entidad(this: *mut c_void, queue: *mut c_void) -> Caja {
-    let base = this as usize;
+/// Hook de `DrawCommandBatch::flushTextBatch()`.
+#[no_mangle]
+pub extern "C" fn xfv_hook_flush_text(this: *mut c_void) {
+    hook_flush_text(this)
+}
 
-    // Posicion: dos i32 en 1/256 de tile.
-    // SAFETY: `base+0x50` es la posicion de la entidad (verificado).
-    let pos = unsafe { std::ptr::read_unaligned((base + 0x50) as *const [i32; 2]) };
-
-    // Direccion.
-    // SAFETY: `base+0x280` es el byte de direccion.
-    let direccion = unsafe { std::ptr::read_unaligned((base + 0x280) as *const u8) } & 0x0F;
-
-    // Tamano: se deduce del sprite que la maquina dibuja. El motor mide las
-    // entidades en tiles de 32 px, asi que el ancho/alto del sprite en tiles
-    // da el tamano en tiles de la maquina.
-    let (ancho, alto) = leer_tamano(base, queue);
-
-    Caja {
-        px: pos[0] as f32 / 256.0,
-        py: pos[1] as f32 / 256.0,
-        direccion,
-        ancho,
-        alto,
-        altura: 1.0,
+extern "C" fn hook_flush_text(this: *mut c_void) {
+    let tramp = TRAMPOLIN_FLUSH_TEXT.load(Ordering::Relaxed);
+    if tramp != 0 {
+        // SAFETY: el trampolin repone los argumentos intactos.
+        unsafe {
+            let f: HookFlushSimple = std::mem::transmute(tramp);
+            f(this);
+        }
     }
+    pintar_si_toca();
 }
 
-/// Lee el tamano en tiles de la maquina.
+/// Pinta el cubo y hace la captura, si toca.
 ///
-/// Se usa el `EntityPrototype` de la entidad (`Entity+0x48`). El prototipo
-/// guarda el `BoundingBox` de la maquina; su tamano en tiles es el de la
-/// entidad. Para no depender de la disposicion interna del prototipo (que
-/// cambia entre versiones), se usa el tamano estandar de las maquinas de
-/// 3x3 tiles y se deja anotado en el ADR.
-fn leer_tamano(_base: usize, _queue: *mut c_void) -> (f32, f32) {
-    (3.0, 3.0)
+/// Solo se pinta en el framebuffer del mundo (el que no es el de la ventana):
+/// ahi es donde el motor ha dibujado la escena y donde luego la compone.
+fn pintar_si_toca() {
+    if ACTIVO.load(Ordering::Relaxed) == 0 || USAR_GL.load(Ordering::Relaxed) == 0 {
+        return;
+    }
+    // La primera vez se crea el programa y los buffers (ya hay contexto GL).
+    preparar_gl();
+    let gl = match GL.get() {
+        Some(g) => g,
+        None => return,
+    };
+
+    // El framebuffer de dibujado: el del mundo tiene id distinto de 0.
+    let fb = gl_int(gl, GL_DRAW_FRAMEBUFFER_BINDING);
+    if fb == 0 {
+        // Es la ventana (la interfaz): aqui no se pinta el cubo.
+        return;
+    }
+
+    // Solo si el framebuffer es grande (el del mundo); los pequeños son
+    // minimapas y similares.
+    let mut vp = [0i32; 4];
+    // SAFETY: el contexto GL esta activo.
+    unsafe { (gl.get_integerv)(GL_VIEWPORT, vp.as_mut_ptr()) };
+    if vp[2] < 320 || vp[3] < 240 {
+        return;
+    }
+
+    if DIAG_GL.swap(1, Ordering::Relaxed) == 0 {
+        let muestras = gl_int(gl, GL_SAMPLES);
+        log::info(&format!(
+            "diagnostico GL: framebuffer={fb} viewport={}x{} muestras={muestras}",
+            vp[2], vp[3]
+        ));
+    }
+
+    dibujar_cajas(gl, &vp);
+    capturar_si_pide(gl, &vp);
 }
 
-/// Direccion de vista de la camara del mundo (en el espacio del juego).
-///
-/// El mundo se ve en perspectiva isometrica: la camara esta por encima y al
-/// norte, mirando hacia el sur y hacia abajo. Sirve para ordenar las caras del
-/// cubo de mas lejos a mas cerca (el depth test se dibuja desactivado, asi que
-/// en la pantalla gana la ultima cara que se dibuja).
-const VISTA: [f32; 3] = [0.0, 0.70711, -0.70711];
+// --------------------------------------------------------------------------
+// Dibujo del cubo
+// --------------------------------------------------------------------------
 
 /// Inclinacion del cubo respecto al suelo, en radianes (~31 grados).
 ///
@@ -943,35 +1169,31 @@ const VISTA: [f32; 3] = [0.0, 0.70711, -0.70711];
 /// el volumen, como en la vista isometrica del juego.
 const INCLINACION: f32 = 0.55;
 
-/// Convierte la caja a la matriz modelo (4x4 en column-major, como espera GL).
+/// Calcula la matriz del cubo (4x4 en column-major, como espera GL).
 ///
-/// Coloca el cubo unitario (de -0.5 a 0.5) sobre el suelo, en la posicion de
-/// la entidad, con la rotacion que da su direccion.
+/// Transformacion (en el espacio del mundo del motor: x derecha, y abajo en
+/// pantalla, z arriba):
 ///
-/// Transformacion (en el espacio del juego: x derecha, y abajo en pantalla,
-/// z altura):
-///
-///     M = T(px, py) * Rx(inclinacion) * Rz(direccion) * S(ancho, alto, altura)
+///     M = T(wx, wy) * Rx(inclinacion) * T(0, 0, sz/2) * Rz(direccion) * S
 ///
 ///   * `Rz(direccion)` es la orientacion real de la entidad (16 pasos de
-///     22,5 grados), leida de `Entity+0x280`.
+///     22,5 grados),
 ///   * `Rx(inclinacion)` inclina el cubo para que se vea su volumen con la
-///     proyeccion ortografica del motor.
-///   * `S` es el tamano real de la maquina en tiles, que es lo que mide su
-///     prototipo (3x3 para la assembling-machine).
-///
-/// La base del cubo queda exactamente en `(px, py)`: el suelo de la maquina.
-fn matriz_modelo(c: &Caja) -> [f32; 16] {
+///     proyeccion ortografica del motor,
+///   * `S` es el tamano real de la maquina (el de su sprite),
+///   * la traslacion en Z deja la base del cubo en el suelo, en la posicion
+///     de la entidad.
+fn matriz_cubo(c: &Caja) -> [f32; 16] {
     // Rotacion de la entidad: los 16 pasos de direccion son 22,5 grados.
     let ang = (c.direccion as f32) * (core::f32::consts::TAU / 16.0);
     let (sy, cy) = (ang.sin(), ang.cos());
     // Inclinacion respecto al suelo.
     let (st, ct) = (INCLINACION.sin(), INCLINACION.cos());
 
-    // Escala real de la maquina, en tiles.
-    let ex = c.ancho;
-    let ey = c.alto;
-    let ez = c.altura;
+    // Escala real de la maquina, en unidades del motor.
+    let ex = c.sx;
+    let ey = c.sy;
+    let ez = c.sx;
 
     // R = Rx * Rz, en column-major:
     //   col0 = (cy,  ct*sy, st*sy)
@@ -993,19 +1215,51 @@ fn matriz_modelo(c: &Caja) -> [f32; 16] {
         0.0,
         // El centro del cubo esta a media altura sobre el suelo; al inclinarlo,
         // su componente vertical (y) sube en pantalla (y crece hacia abajo).
-        c.px,
-        c.py - st * ez * 0.5,
+        c.wx,
+        c.wy - st * ez * 0.5,
         ct * ez * 0.5,
         1.0,
     ]
+}
+
+/// Calcula los vertices del cubo en 2D (la proyeccion 3D se hace aqui, en la
+/// CPU) y devuelve el buffer de vertices (posicion + normal).
+fn vertices_cubo(c: &Caja) -> [f32; 144] {
+    let m = matriz_cubo(c);
+    let mut out = [0f32; 144];
+    for v in 0..24 {
+        let px = ESQUINAS[v * 6];
+        let py = ESQUINAS[v * 6 + 1];
+        let pz = ESQUINAS[v * 6 + 2];
+        let nx = ESQUINAS[v * 6 + 3];
+        let ny = ESQUINAS[v * 6 + 4];
+        let nz = ESQUINAS[v * 6 + 5];
+
+        // Posicion transformada (column-major: x' = m0*x + m4*y + m8*z + m12).
+        let x = m[0] * px + m[4] * py + m[8] * pz + m[12];
+        let y = m[1] * px + m[5] * py + m[9] * pz + m[13];
+
+        // Normal transformada (sin traslacion).
+        let ax = m[0] * nx + m[4] * ny + m[8] * nz;
+        let ay = m[1] * nx + m[5] * ny + m[9] * nz;
+        let az = m[2] * nx + m[6] * ny + m[10] * nz;
+        let largo = (ax * ax + ay * ay + az * az).sqrt().max(1e-6);
+
+        out[v * 6] = x;
+        out[v * 6 + 1] = y;
+        out[v * 6 + 2] = 0.0;
+        out[v * 6 + 3] = ax / largo;
+        out[v * 6 + 4] = ay / largo;
+        out[v * 6 + 5] = az / largo;
+    }
+    out
 }
 
 /// Ordena las caras del cubo de mas lejos a mas cerca de la camara.
 ///
 /// El depth test se dibuja desactivado (para que el cubo se vea siempre por
 /// encima de la escena), asi que el orden de dibujo es el que decide que cara
-/// tapa a cual. Con las 6 caras pintadas de mas lejos a mas cerca, la mas
-/// cercana queda encima y el cubo se ve con su volumen.
+/// tapa a cual.
 fn orden_caras(m: &[f32; 16]) -> [u32; 36] {
     // Centro de cada cara (en coordenadas del cubo unitario).
     const CENTROS: [[f32; 3]; 6] = [
@@ -1017,8 +1271,10 @@ fn orden_caras(m: &[f32; 16]) -> [u32; 36] {
         [0.0, 0.0, 0.5],
     ];
 
-    // Profundidad de cada cara: se proyecta su centro sobre la direccion de
-    // la camara (cuanto mas alta la profundidad, mas lejos esta la cara).
+    // Direccion de la camara (en el espacio del juego: x derecha, y abajo,
+    // z arriba). La camara esta por encima y al norte.
+    const VISTA: [f32; 3] = [0.0, 0.70711, -0.70711];
+
     let mut prof = [0f32; 6];
     for (i, c) in CENTROS.iter().enumerate() {
         let x = m[0] * c[0] + m[4] * c[1] + m[8] * c[2];
@@ -1031,7 +1287,6 @@ fn orden_caras(m: &[f32; 16]) -> [u32; 36] {
     // Orden descendente: la cara mas lejos primero.
     caras.sort_by(|a, b| prof[*b].partial_cmp(&prof[*a]).unwrap_or(std::cmp::Ordering::Equal));
 
-    // Cada cara ocupa 6 indices en `INDICES`.
     let mut out = [0u32; 36];
     for (k, &cara) in caras.iter().enumerate() {
         for j in 0..6 {
@@ -1041,82 +1296,25 @@ fn orden_caras(m: &[f32; 16]) -> [u32; 36] {
     out
 }
 
-/// Dibuja las cajas si no hay un hook de presentacion donde dibujarlas.
-///
-/// La presentacion de SDL es el sitio preferible (alli el framebuffer por
-/// defecto ya tiene la imagen final). Si no se pudo enganchar, se dibuja en el
-/// hook de render, que es el ultimo sitio conocido del frame.
-pub fn dibujar_cajas_si_no_hay_presentacion() {
-    if PINTAR_EN_PRESENTACION.load(Ordering::Relaxed) == 1 {
+/// Dibuja las cajas pendientes en el framebuffer que hay enlazado.
+fn dibujar_cajas(gl: &Gl, vp: &[i32; 4]) {
+    let cajas = con_estado(|e| e.toma_cajas());
+    if cajas.is_empty() {
         return;
     }
-    dibujar_cajas();
-}
-
-/// Dibuja las cajas pendientes.
-///
-/// Se llama desde el hook de presentacion (`SDL_OFFSCREEN_UpdateWindowFramebuffer`),
-/// que es cuando el framebuffer por defecto de la ventana ya tiene la imagen
-/// final del frame: ahi es donde se pinta el cubo y donde se puede capturar.
-pub fn dibujar_cajas() {
-    if ACTIVO.load(Ordering::Relaxed) == 0 {
-        return;
-    }
-    let n = N_PEND.swap(0, Ordering::Relaxed);
-    if n == 0 {
-        return;
-    }
-    let (gl, cubo) = match (GL.get(), CUBO.get()) {
-        (Some(g), Some(c)) => (g, c),
-        _ => return,
+    let cubo = match CUBO.get() {
+        Some(c) => c,
+        None => return,
     };
 
     // Se guarda todo el estado que se va a tocar, para devolverlo al motor
     // tal y como estaba: el juego sigue despues de nuestro dibujo.
     let prog_previo = gl_int(gl, GL_CURRENT_PROGRAM);
-    let mut vp_previo = [0i32; 4];
-    // SAFETY: el contexto GL esta activo.
-    unsafe { (gl.get_integerv)(GL_VIEWPORT, vp_previo.as_mut_ptr()) };
+    let vao_previo = gl_int(gl, GL_VERTEX_ARRAY_BINDING);
+    let vbo_previo = gl_int(gl, GL_ARRAY_BUFFER_BINDING);
     let depth_previo = gl_int(gl, GL_DEPTH_TEST);
     let blend_previo = gl_int(gl, GL_BLEND);
     let cull_previo = gl_int(gl, GL_CULL_FACE);
-
-    // Diagnostico (una sola vez): donde estamos dibujando y con que tamano.
-    if DIAG_GL.swap(1, Ordering::Relaxed) == 0 {
-        let dfb = gl_int(gl, GL_DRAW_FRAMEBUFFER_BINDING);
-        let rfb = gl_int(gl, GL_READ_FRAMEBUFFER_BINDING);
-        let muestras = gl_int(gl, GL_SAMPLES);
-        log::info(&format!(
-            "diagnostico GL: draw_fb={dfb} read_fb={rfb} viewport={}x{} muestras={muestras} depth={depth_previo} blend={blend_previo}",
-            vp_previo[2], vp_previo[3]
-        ));
-    }
-
-    // El motor dibuja el mundo en su propio rectangulo de la ventana: hay que
-    // usar ese mismo viewport, o el cubo saldria desplazado.
-    poner_viewport_juego(gl);
-
-    // Enlazar nuestro bloque `vsConstants` al MISMO punto de binding que usa
-    // el motor para el suyo. Asi los dos leen la misma matriz de proyeccion:
-    // el cubo cae exactamente donde el juego espera, con su camara.
-    //
-    // El motor usa `glUniformBlockBinding(program, idx, binding)` y luego
-    // `glBindBufferBase(GL_UNIFORM_BUFFER, binding, buffer)`. El binding del
-    // bloque `vsConstants` se averigua enganchando
-    // `GraphicsInterfaceOpenGL::bindUniformBuffer` (ver `hook_bind_uniform_buffer`).
-    let (buffer_vs, binding_vs) = VS_DEL_JUEGO.load_or_store();
-    unsafe {
-        (gl.use_program)(cubo.programa);
-        if cubo.idx_vs != GL_INVALID_INDEX && cubo.idx_vs != 0xFFFFFFFF && buffer_vs != 0 {
-            (gl.uniform_block_binding)(cubo.programa, cubo.idx_vs, binding_vs);
-            (gl.bind_buffer_base)(GL_UNIFORM_BUFFER, binding_vs, buffer_vs);
-        }
-        if cubo.idx_modelo != GL_INVALID_INDEX && cubo.idx_modelo != 0xFFFFFFFF {
-            // Punto de binding propio (3), para no pisar el del motor.
-            (gl.uniform_block_binding)(cubo.programa, cubo.idx_modelo, BINDING_MODELO);
-        }
-    }
-    drenar_errores(&gl, "enlazar el programa del cubo");
 
     // Estado de dibujo.
     //
@@ -1134,27 +1332,34 @@ pub fn dibujar_cajas() {
             GL_SRC_ALPHA,
             GL_ONE_MINUS_SRC_ALPHA,
         );
-        (gl.bind_vertex_array)(cubo.vao);
     }
-    drenar_errores(&gl, "preparar el estado de dibujo");
+    drenar_errores(gl, "preparar el estado de dibujo");
 
-    for i in 0..n {
-        let c = unsafe {
-            let p = &raw const PEND;
-            (*p)[i % MAX_PENDIENTES]
-        };
-        let m = matriz_modelo(&c);
-        // Las caras se pintan de mas lejos a mas cerca (el depth test esta
-        // desactivado, asi que el orden es el que da el volumen).
+    for c in cajas.iter() {
+        if c.sx <= 0.0 || c.sy <= 0.0 {
+            continue;
+        }
+        let vertices = vertices_cubo(&c);
+        let m = matriz_cubo(&c);
         let indices = orden_caras(&m);
+
         unsafe {
             (gl.use_program)(cubo.programa);
-            // Matriz modelo en su uniform block (punto de binding propio).
-            (gl.bind_buffer)(GL_UNIFORM_BUFFER, cubo.ubo_modelo);
+
+            // El bloque `vsConstants` del motor (con su matriz de proyeccion)
+            // se enlaza en nuestro programa en el mismo punto de binding.
+            let (buffer_vs, binding_vs) = VS_DEL_JUEGO.load_or_store();
+            if cubo.idx_vs != GL_INVALID_INDEX && buffer_vs != 0 {
+                (gl.uniform_block_binding)(cubo.programa, cubo.idx_vs, binding_vs);
+                (gl.bind_buffer_base)(GL_UNIFORM_BUFFER, binding_vs, buffer_vs);
+            }
+
+            (gl.bind_vertex_array)(cubo.vao);
+            (gl.bind_buffer)(GL_ARRAY_BUFFER, cubo.vbo);
             (gl.buffer_data)(
-                GL_UNIFORM_BUFFER,
-                64,
-                m.as_ptr() as *const c_void,
+                GL_ARRAY_BUFFER,
+                (vertices.len() * 4) as isize,
+                vertices.as_ptr() as *const c_void,
                 GL_STATIC_DRAW,
             );
             // Indices reordenados: se reescriben porque el motor no expone
@@ -1170,13 +1375,14 @@ pub fn dibujar_cajas() {
         }
         DIBUJADOS.fetch_add(1, Ordering::Relaxed);
         if DIBUJADOS.load(Ordering::Relaxed) <= 3 {
-            drenar_errores(&gl, "dibujar el cubo");
+            drenar_errores(gl, "dibujar el cubo");
         }
     }
 
     // Se devuelve el estado al motor.
     unsafe {
-        (gl.bind_vertex_array)(0);
+        (gl.bind_vertex_array)(vao_previo as u32);
+        (gl.bind_buffer)(GL_ARRAY_BUFFER, vbo_previo as u32);
         if depth_previo != 0 {
             (gl.enable)(GL_DEPTH_TEST);
         }
@@ -1187,23 +1393,16 @@ pub fn dibujar_cajas() {
             (gl.enable)(GL_CULL_FACE);
         }
         (gl.use_program)(prog_previo as u32);
-        (gl.viewport)(vp_previo[0], vp_previo[1], vp_previo[2], vp_previo[3]);
     }
-    // Si el GL ha reportado un error, se avisa una vez (asi se ve en el log
-    // si el shader o los buffers no han quedado bien).
-    if drenar_errores(&gl, "restaurar el estado") {
+    if drenar_errores(gl, "restaurar el estado") {
         log::aviso("hubo errores de GL al dibujar el cubo");
     }
+    let _ = vp;
 }
 
-/// Ya se ha hecho el diagnostico del estado de GL (una sola vez).
-static DIAG_GL: AtomicU64 = AtomicU64::new(0);
-
-/// Punto de binding del uniform block propio con la matriz modelo.
-///
-/// Se usa un binding alto (3) para no pisar el que usa el motor para sus
-/// propios bloques de uniforms.
-const BINDING_MODELO: u32 = 3;
+// --------------------------------------------------------------------------
+// Camara: el bloque `vsConstants` del motor
+// --------------------------------------------------------------------------
 
 /// Buffer y punto de binding del bloque `vsConstants` del juego.
 ///
@@ -1228,6 +1427,27 @@ static VS_DEL_JUEGO: VsDelJuego = VsDelJuego {
     binding: AtomicU64::new(0),
 };
 
+/// Cache del indice del bloque `vsConstants` por programa GL.
+///
+/// Consultar el indice de un bloque de uniforms en cada llamada es caro
+/// (el motor llama a `bindUniformBuffer` muchas veces por frame), asi que
+/// se cachea: solo se vuelve a preguntar cuando cambia el programa.
+static CACHE_PROGRAMA: AtomicU64 = AtomicU64::new(0);
+static CACHE_INDICE: AtomicU64 = AtomicU64::new(u64::MAX);
+
+/// Indice del bloque `vsConstants` de un programa (o `u64::MAX` si no lo
+/// tiene).
+fn indice_vs_constants(gl: &Gl, programa: u32) -> u32 {
+    if CACHE_PROGRAMA.load(Ordering::Relaxed) == programa as u64 {
+        return CACHE_INDICE.load(Ordering::Relaxed) as u32;
+    }
+    let nombre = b"vsConstants\0";
+    let idx = unsafe { (gl.get_uniform_block_index)(programa, nombre.as_ptr() as *const i8) };
+    CACHE_PROGRAMA.store(programa as u64, Ordering::Relaxed);
+    CACHE_INDICE.store(idx as u64, Ordering::Relaxed);
+    idx
+}
+
 /// Hook de `GraphicsInterfaceOpenGL::bindUniformBuffer`.
 ///
 /// Sirve para descubrir que buffer de uniforms usa el motor para el bloque
@@ -1238,14 +1458,16 @@ static VS_DEL_JUEGO: VsDelJuego = VsDelJuego {
 /// UniformBuffer const*)`.
 #[no_mangle]
 pub extern "C" fn xfv_hook_bind_uniform_buffer(
+    this: *mut c_void,
     index: u32,
     pipeline: *mut c_void,
     uniform_buffer: *mut c_void,
 ) {
-    hook_bind_uniform_buffer(index, pipeline, uniform_buffer)
+    hook_bind_uniform_buffer(this, index, pipeline, uniform_buffer)
 }
 
 extern "C" fn hook_bind_uniform_buffer(
+    this: *mut c_void,
     index: u32,
     pipeline: *mut c_void,
     uniform_buffer: *mut c_void,
@@ -1262,7 +1484,9 @@ extern "C" fn hook_bind_uniform_buffer(
     // Como se sabe el bloque (y no solo el binding), se puede comprobar si el
     // que se esta enlazando es `vsConstants` (el que lleva la matriz de
     // proyeccion) comparando con `glGetUniformBlockIndex`.
-    if !uniform_buffer.is_null() && !pipeline.is_null() {
+    // Cinturon de seguridad: el indice es un puntero dentro del array de
+    // bloques del pipeline state. Si algo no cuadra, no se lee memoria.
+    if !uniform_buffer.is_null() && !pipeline.is_null() && index < 256 {
         // SAFETY: offsets verificados en el desensamblado del motor.
         let gl_buffer =
             unsafe { std::ptr::read_unaligned((uniform_buffer as usize + 0x10) as *const u32) };
@@ -1272,14 +1496,24 @@ extern "C" fn hook_bind_uniform_buffer(
         if gl_buffer != 0 && programa != 0 && tabla != 0 {
             let bloque =
                 unsafe { std::ptr::read_unaligned((tabla + index as usize * 4) as *const u32) };
+            if DIAG_UB.swap(1, Ordering::Relaxed) == 0 {
+                log::info(&format!(
+                    "bindUniformBuffer: index={index} pso={pipeline:p} ub={uniform_buffer:p} \
+                     buffer={gl_buffer} programa={programa} tabla=0x{tabla:x} bloque={bloque}"
+                ));
+            }
             if bloque != GL_INVALID_INDEX && bloque != 0xFFFFFFFF {
                 if let Some(gl) = GL.get() {
-                    let nombre = b"vsConstants\0";
-                    let idx =
-                        unsafe { (gl.get_uniform_block_index)(programa, nombre.as_ptr() as *const i8) };
+                    let idx = indice_vs_constants(gl, programa);
                     if idx == bloque {
+                        let antes = VS_DEL_JUEGO.buffer.load(Ordering::Relaxed);
                         VS_DEL_JUEGO.buffer.store(gl_buffer as u64, Ordering::Relaxed);
                         VS_DEL_JUEGO.binding.store(index as u64, Ordering::Relaxed);
+                        if antes == 0 {
+                            log::info(&format!(
+                                "vsConstants del motor: buffer={gl_buffer} binding={index}"
+                            ));
+                        }
                     }
                 }
             }
@@ -1290,69 +1524,52 @@ extern "C" fn hook_bind_uniform_buffer(
         // SAFETY: el trampolin repone los argumentos intactos.
         unsafe {
             let f: HookUniformBuffer = std::mem::transmute(tramp);
-            f(index, pipeline, uniform_buffer);
+            f(this, index, pipeline, uniform_buffer);
         }
     }
 }
 
-/// Trampolin de `bindUniformBuffer`.
-static TRAMPOLIN_UB: AtomicUsize = AtomicUsize::new(0);
+// --------------------------------------------------------------------------
+// Captura
+// --------------------------------------------------------------------------
 
-/// Captura el framebuffer si la variable de entorno lo pide.
+/// Captura el framebuffer actual si la variable de entorno lo pide.
 ///
 /// Se escribe en `XFACTORVR_3D_CAPTURA` (una ruta). Se capturan como mucho
 /// unos pocos frames: la captura cuesta y el objetivo es tener UNA imagen
 /// para mirar.
-pub fn capturar_si_pide() {
+fn capturar_si_pide(gl: &Gl, vp: &[i32; 4]) {
     if CAPTURAR.load(Ordering::Relaxed) == 0 {
         return;
     }
+    // Se captura de tarde en tarde: leer el framebuffer es caro y el
+    // objetivo es tener UNA imagen para mirar.
     let n = CAPTURAS.fetch_add(1, Ordering::Relaxed);
-    if n >= MAX_CAPTURAS {
+    if n % CADA_CUANTAS_CAPTURAS != 0 {
         return;
     }
     let ruta = match std::env::var("XFACTORVR_3D_CAPTURA") {
         Ok(v) if !v.is_empty() => v,
         _ => return,
     };
-    // El nombre incluye el numero de frame para no sobrescribir.
-    let ruta = if ruta.contains('{') {
-        ruta.replace("{n}", &n.to_string())
-    } else {
-        format!("{}.{:03}.png", ruta.trim_end_matches(".png"), n)
-    };
-    if capturar_png(&ruta) {
+    // Se escribe siempre en el mismo fichero: asi contiene siempre el frame
+    // mas reciente (no hace falta saber en que momento se capturo).
+    if capturar_png(gl, vp, &ruta) {
         log::info(&format!("captura escrita en {}", ruta));
     }
 }
 
-/// Maximo de capturas por proceso.
-const MAX_CAPTURAS: u64 = 3;
+/// Cada cuantas capturas se escribe una (el framebuffer se lee entero, es
+/// caro).
+const CADA_CUANTAS_CAPTURAS: u64 = 20;
 
 /// Captura el framebuffer actual y lo guarda como PNG.
 ///
-/// `ruta` es el fichero de salida. Devuelve true si se ha escrito.
-///
-/// Se lee del framebuffer por defecto (el de la ventana), que en el momento de
-/// la presentacion ya tiene la imagen final del frame.
-pub fn capturar_png(ruta: &str) -> bool {
-    let gl = match GL.get() {
-        Some(g) => g,
-        None => return false,
-    };
-    // Tamano del area de juego (el motor dibuja ahi); si no se ha guardado,
-    // se usa el viewport actual.
-    let (w, h) = if VIEWPORT_JUEGO.valido.load(Ordering::Relaxed) == 1 {
-        (
-            VIEWPORT_JUEGO.w.load(Ordering::Relaxed),
-            VIEWPORT_JUEGO.h.load(Ordering::Relaxed),
-        )
-    } else {
-        let mut vp = [0i32; 4];
-        // SAFETY: el contexto GL esta activo.
-        unsafe { (gl.get_integerv)(GL_VIEWPORT, vp.as_mut_ptr()) };
-        (vp[2], vp[3])
-    };
+/// Se lee del framebuffer que hay enlazado (el del mundo), que en el momento
+/// del flush ya tiene la imagen final del frame.
+fn capturar_png(gl: &Gl, vp: &[i32; 4], ruta: &str) -> bool {
+    let w = vp[2];
+    let h = vp[3];
     if w <= 0 || h <= 0 {
         return false;
     }
@@ -1370,7 +1587,7 @@ pub fn capturar_png(ruta: &str) -> bool {
         );
         (gl.finish)();
     }
-    if drenar_errores(&gl, "leer el framebuffer") {
+    if drenar_errores(gl, "leer el framebuffer") {
         log::aviso("no se pudo leer el framebuffer: la captura saldra vacia");
     }
 
@@ -1393,15 +1610,20 @@ pub fn capturar_png(ruta: &str) -> bool {
         (w as u64) * (h as u64) - con_contenido
     ));
 
-    // GL devuelve las filas de abajo arriba: se voltea al escribir el PNG.
-    let mut flipped = vec![0u8; pix.len()];
-    let stride = (w * 4) as usize;
-    for y in 0..h as usize {
-        let src = (h as usize - 1 - y) * stride;
-        let dst = y * stride;
-        flipped[dst..dst + stride].copy_from_slice(&pix[src..src + stride]);
+    // GL devuelve las filas de abajo arriba. El motor dibuja el mundo con la
+    // Y invertida, asi que en su framebuffer la imagen sale ya derecha; si no
+    // es el caso, se puede voltear con `XFACTORVR_3D_VOLTEAR=1`.
+    if CAPTURAR_VOLTEADA.load(Ordering::Relaxed) == 1 {
+        let mut flipped = vec![0u8; pix.len()];
+        let stride = (w * 4) as usize;
+        for y in 0..h as usize {
+            let src = (h as usize - 1 - y) * stride;
+            let dst = y * stride;
+            flipped[dst..dst + stride].copy_from_slice(&pix[src..src + stride]);
+        }
+        pix = flipped;
     }
-    escribir_png(ruta, w as u32, h as u32, &flipped)
+    escribir_png(ruta, w as u32, h as u32, &pix)
 }
 
 /// Escribe un PNG RGBA (sin dependencias: zlib "stored" + CRC propio).
@@ -1483,17 +1705,28 @@ fn crc32(datos: &[u8]) -> u32 {
     c ^ 0xFFFF_FFFF
 }
 
-/// Instala el hook de `AssemblingMachine::draw`.
-///
-/// El simbolo se busca por su nombre MANGLED exacto, que es como esta en el
-/// symtab del Factorio 2.1.22 ARM64 (verificado):
-///
-///     _ZNK17AssemblingMachine4drawER9DrawQueue
-///
-/// Es el metodo virtual `draw` de la clase (const, con `DrawQueue&`).
-pub fn instalar(simbolos: &resolver::Simbolos) {
-    const MANGLE: &str = "_ZNK17AssemblingMachine4drawER9DrawQueue";
+// --------------------------------------------------------------------------
+// Instalacion
+// --------------------------------------------------------------------------
 
+/// Instala los hooks del modulo 3D.
+///
+/// Los simbolos se buscan por su nombre MANGLED exacto, que es como esta en el
+/// symtab del Factorio 2.1.22 ARM64 (verificado).
+pub fn instalar(simbolos: &resolver::Simbolos) {
+    // Con `XFACTORVR_3D=0` el modulo entero se apaga: no se instala ningun
+    // detour (sirve para bisecar problemas del motor).
+    if ACTIVO.load(Ordering::Relaxed) == 0 {
+        log::info("modulo 3D apagado (XFACTORVR_3D=0): no se instala ningun hook");
+        return;
+    }
+
+    // La direccion de carga de esta libreria: sirve para traducir las
+    // direcciones que salen en las trazas de crash del motor.
+    log::info(&format!("base de la .so: 0x{:x}", base_de_la_so()));
+
+    // --- hook de la entidad ---
+    const MANGLE: &str = "_ZNK17AssemblingMachine4drawER9DrawQueue";
     let encontrado = match simbolos.resolver_exacto(MANGLE) {
         Some(r) => r,
         None => {
@@ -1527,26 +1760,50 @@ pub fn instalar(simbolos: &resolver::Simbolos) {
         }
     };
 
-    match detour::instalar(encontrado.direccion, hook_addr, None) {
+    match detour::instalar(encontrado.direccion, hook_addr, None, encontrado.tamano) {
         Ok(d) => {
             TRAMPOLIN.store(d.trampolin as usize, Ordering::SeqCst);
             log::info(&format!(
                 "detour instalado sobre AssemblingMachine::draw(): trampolin en 0x{:x}",
                 d.trampolin
             ));
-            log::info("las entidades se dibujaran como cubos 3D en vez de sprites 2D");
         }
         Err(e) => {
             log::error(&format!("no se pudo instalar el detour de draw: {e}"));
         }
     }
 
-    // Hook del enlace de uniform buffers: sirve para saber que buffer usa el
-    // motor para la matriz de proyeccion.
-    const MANGLE_UB: &str = "_ZN23GraphicsInterfaceOpenGL17bindUniformBufferEjRK19PipelineStateObjectPK13UniformBuffer";
+    // --- hook de la cola de dibujado (posicion y tamano reales) ---
+    //
+    // `DrawQueue::draw` es la funcion que el motor usa para encolar cada
+    // sprite. Para las entidades, la `MapPosition` que recibe es la de la
+    // entidad, asi que se puede saber que sprite es el nuestro. Ademas, en
+    // ella estan la camara y la escala con las que el motor pasa de
+    // coordenadas del mapa a coordenadas del mundo.
+    const MANGLE_DQ: &str =
+        "_ZN9DrawQueue4drawERK6SpriteRK11MapPosition12DrawingFlagsN11RenderLayer4EnumERK6Vectoraf";
+    if HOOK_SETUP.load(Ordering::Relaxed) == 0 {
+        log::aviso("detour de DrawQueue::draw NO instalado (bisectado)");
+    } else if let Some(dq) = simbolos.resolver_exacto(MANGLE_DQ) {
+        if let Some(a) = direccion_de_ejecucion_de("xfv_hook_draw_queue") {
+            match detour::instalar(dq.direccion, a, None, dq.tamano) {
+                Ok(d) => {
+                    TRAMPOLIN_DQ.store(d.trampolin as usize, Ordering::SeqCst);
+                    log::info("detour instalado sobre DrawQueue::draw()");
+                }
+                Err(e) => log::error(&format!("no se pudo instalar el detour de draw: {e}")),
+            }
+        }
+    } else {
+        log::aviso("no se encontro DrawQueue::draw()");
+    }
+
+    // --- hook del enlace de uniform buffers (la camara del motor) ---
+    const MANGLE_UB: &str =
+        "_ZN23GraphicsInterfaceOpenGL17bindUniformBufferEjRK19PipelineStateObjectPK13UniformBuffer";
     if let Some(ub) = simbolos.resolver_exacto(MANGLE_UB) {
         if let Some(a) = direccion_de_ejecucion_de("xfv_hook_bind_uniform_buffer") {
-            match detour::instalar(ub.direccion, a, None) {
+            match detour::instalar(ub.direccion, a, None, ub.tamano) {
                 Ok(d) => {
                     TRAMPOLIN_UB.store(d.trampolin as usize, Ordering::SeqCst);
                     log::info("detour instalado sobre bindUniformBuffer()");
@@ -1554,44 +1811,68 @@ pub fn instalar(simbolos: &resolver::Simbolos) {
                 Err(e) => log::error(&format!("no se pudo instalar el detour de bindUniformBuffer: {e}")),
             }
         }
+    } else {
+        log::aviso("no se encontro bindUniformBuffer()");
     }
 
-    // Hook de la presentacion: es donde el framebuffer por defecto de la
-    // ventana ya tiene la imagen final del frame. Ahi se pinta el cubo y se
-    // captura la pantalla.
-    const MANGLE_PRESENT: &str = "SDL_OFFSCREEN_UpdateWindowFramebuffer";
-    match simbolos.resolver_exacto(MANGLE_PRESENT) {
-        Some(p) => {
-            if let Some(a) = direccion_de_ejecucion_de("xfv_hook_present") {
-                match detour::instalar(p.direccion, a, None) {
-                    Ok(d) => {
-                        TRAMPOLIN_PRESENT.store(d.trampolin as usize, Ordering::SeqCst);
-                        PINTAR_EN_PRESENTACION.store(1, Ordering::Relaxed);
-                        log::info("detour instalado sobre la presentacion (SDL_OFFSCREEN_UpdateWindowFramebuffer)");
-                    }
-                    Err(e) => log::error(&format!("no se pudo instalar el detour de presentacion: {e}")),
-                }
-            }
-        }
-        None => log::aviso("no se encontro la presentacion de SDL: se pintara en el flush de sprites"),
+    // --- hooks de los flush (el punto de dibujado) ---
+    if HOOK_FLUSH.load(Ordering::Relaxed) == 0 {
+        log::aviso("detours de los flush NO instalados (bisectado)");
+        return;
     }
+    instalar_flush(
+        simbolos,
+        "_ZN16DrawCommandBatch17flushSpritesBatchEb",
+        "xfv_hook_flush_sprites",
+        &TRAMPOLIN_FLUSH,
+    );
+    instalar_flush(
+        simbolos,
+        "_ZN16DrawCommandBatch26flushSpritesInstancedBatchEb",
+        "xfv_hook_flush_sprites_instanced",
+        &TRAMPOLIN_FLUSH_INST,
+    );
+    instalar_flush(
+        simbolos,
+        "_ZN16DrawCommandBatch19flushPrimitiveBatchEv",
+        "xfv_hook_flush_primitives",
+        &TRAMPOLIN_FLUSH_PRIM,
+    );
+    instalar_flush(
+        simbolos,
+        "_ZN16DrawCommandBatch14flushTextBatchEv",
+        "xfv_hook_flush_text",
+        &TRAMPOLIN_FLUSH_TEXT,
+    );
+}
 
-    // Hook del flush de sprites: donde el motor emite de verdad sus ordenes
-    // GL. Solo se usa si no hay hook de presentacion.
-    const MANGLE_FLUSH: &str = "_ZN16DrawCommandBatch17flushSpritesBatchEb";
-    match simbolos.resolver_exacto(MANGLE_FLUSH) {
-        Some(p) => {
-            if let Some(a) = direccion_de_ejecucion_de("xfv_hook_flush_sprites") {
-                match detour::instalar(p.direccion, a, None) {
-                    Ok(d) => {
-                        TRAMPOLIN_FLUSH.store(d.trampolin as usize, Ordering::SeqCst);
-                        log::info("detour instalado sobre flushSpritesBatch()");
-                    }
-                    Err(e) => log::error(&format!("no se pudo instalar el detour de flushSpritesBatch: {e}")),
-                }
-            }
+/// Instala un detour sobre una funcion de flush.
+fn instalar_flush(
+    simbolos: &resolver::Simbolos,
+    mangled: &str,
+    nombre_hook: &str,
+    trampolin: &AtomicUsize,
+) {
+    let f = match simbolos.resolver_exacto(mangled) {
+        Some(f) => f,
+        None => {
+            log::aviso(&format!("no se encontro {}", mangled));
+            return;
         }
-        None => log::aviso("no se encontro flushSpritesBatch()"),
+    };
+    let a = match direccion_de_ejecucion_de(nombre_hook) {
+        Some(a) => a,
+        None => {
+            log::aviso(&format!("dlsym no devolvio {}", nombre_hook));
+            return;
+        }
+    };
+    match detour::instalar(f.direccion, a, None, f.tamano) {
+        Ok(d) => {
+            trampolin.store(d.trampolin as usize, Ordering::SeqCst);
+            log::info(&format!("detour instalado sobre {}", mangled));
+        }
+        Err(e) => log::error(&format!("no se pudo instalar el detour de {mangled}: {e}")),
     }
 }
 
@@ -1617,9 +1898,38 @@ fn direccion_de_ejecucion_de(nombre: &str) -> Option<u64> {
     }
 }
 
+/// Direccion de carga de esta libreria (para traducir direcciones del crash).
+pub fn base_de_la_so() -> u64 {
+    extern "C" {
+        fn dladdr(addr: *const core::ffi::c_void, info: *mut core::ffi::c_void) -> i32;
+    }
+    // Estructura `Dl_info` de glibc: los dos primeros campos son los que
+    // nos interesan (base y nombre).
+    #[repr(C)]
+    struct DlInfo {
+        dli_fname: *const core::ffi::c_char,
+        dli_fbase: *mut core::ffi::c_void,
+        dli_sname: *const core::ffi::c_char,
+        dli_saddr: *mut core::ffi::c_void,
+    }
+    let mut info = DlInfo {
+        dli_fname: core::ptr::null(),
+        dli_fbase: core::ptr::null_mut(),
+        dli_sname: core::ptr::null(),
+        dli_saddr: core::ptr::null_mut(),
+    };
+    let f = xfv_hook_bind_uniform_buffer as *const () as *const core::ffi::c_void;
+    unsafe {
+        if dladdr(f, &mut info as *mut DlInfo as *mut core::ffi::c_void) != 0 {
+            return info.dli_fbase as u64;
+        }
+    }
+    0
+}
+
 /// Prepara el estado de GL (crea el programa y los buffers del cubo).
 ///
-/// Se llama una vez, desde el hook de render, cuando ya hay contexto GL.
+/// Se llama una vez, desde el hook de flush, cuando ya hay contexto GL.
 pub fn preparar_gl() {
     if CUBO.get().is_some() {
         return;
@@ -1673,5 +1983,17 @@ pub fn configurar() {
     }
     if let Ok(v) = std::env::var("XFACTORVR_3D_CAPTURA") {
         CAPTURAR.store(if v != "0" { 1 } else { 0 }, Ordering::Relaxed);
+    }
+    if let Ok(v) = std::env::var("XFACTORVR_3D_VOLTEAR") {
+        CAPTURAR_VOLTEADA.store(if v != "0" { 1 } else { 0 }, Ordering::Relaxed);
+    }
+    for (var, destino) in [
+        ("XFACTORVR_3D_HOOK_SETUP", &HOOK_SETUP),
+        ("XFACTORVR_3D_HOOK_FLUSH", &HOOK_FLUSH),
+        ("XFACTORVR_3D_GL", &USAR_GL),
+    ] {
+        if let Ok(v) = std::env::var(var) {
+            destino.store(if v != "0" { 1 } else { 0 }, Ordering::Relaxed);
+        }
     }
 }

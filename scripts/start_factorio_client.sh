@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/bin/sh
 # start_factorio_client.sh — Arranca el cliente GRAFICO de Factorio ARM64 en el
 # visor Pico 4 Ultra usando Mesa con Zink (OpenGL 3.3 de escritorio sobre el
 # driver Vulkan de Adreno).
@@ -15,9 +15,10 @@
 # Requiere: el payload de Mesa (scripts/prepare_mesa.py) y el cliente grafico
 # (factorio_linux-arm64_2.1.22.tar.xz) en /data/local/tmp.
 
-set -uo pipefail
+# Android no tiene bash: el script va con sh (dash).
+set -u
 
-FACTORIO_DIR="${FACTORIO_DIR:-/data/local/tmp/factorio_client}"
+FACTORIO_DIR="${FACTORIO_DIR:-/data/local/tmp/factorio}"
 MESA_DIR="${MESA_DIR:-/data/local/tmp/mesa}"
 LOG_DIR="${LOG_DIR:-$FACTORIO_DIR/logs}"
 RCON_PORT="${RCON_PORT:-27015}"
@@ -28,7 +29,15 @@ HEIGHT="${HEIGHT:-720}"
 log() { echo "[factorio-client] $*"; }
 
 # --- 1. Comprobar el payload ------------------------------------------------
-if [ ! -f "$MESA_DIR/lib/ld-linux-aarch64.so.1" ]; then
+MESA_LIB="$MESA_DIR/usr/lib/aarch64-linux-gnu"
+# El loader y la libc son los del runtime de glibc del visor (Termux 2.44).
+# El payload de Mesa NO lleva glibc: si se usara la de Debian (2.36), el
+# cliente grafico pediria GLIBC_2.38 y no la encontraria.
+GLIBC_DIR="${GLIBC_DIR:-/data/local/tmp/glibc}"
+LOADER="$GLIBC_DIR/lib/ld-linux-aarch64.so.1"
+GLIBC_LIB="$GLIBC_DIR/lib"
+
+if [ ! -f "$MESA_LIB/dri/zink_dri.so" ]; then
     log "ERROR: no esta el payload de Mesa en $MESA_DIR"
     log "       genera con: python3 scripts/prepare_mesa.py"
     exit 1
@@ -37,9 +46,10 @@ if [ ! -f "$FACTORIO_DIR/bin/arm64/factorio" ]; then
     log "ERROR: no esta el cliente grafico en $FACTORIO_DIR/bin/arm64/factorio"
     exit 1
 fi
-
-MESA_LIB="$MESA_DIR/usr/lib/aarch64-linux-gnu"
-LOADER="$MESA_DIR/lib/ld-linux-aarch64.so.1"
+if [ ! -f "$LOADER" ]; then
+    log "ERROR: no esta el runtime de glibc en $GLIBC_DIR"
+    exit 1
+fi
 
 # --- 2. Localizar el ICD de Vulkan de Android (el driver de Adreno) ---------
 # Android guarda el ICD del fabricante en /vendor/lib64/hw (no en un
@@ -93,15 +103,31 @@ export MESA_LOADER_DRIVER_OVERRIDE=zink
 export ZINK_DESCRIPTORS=auto
 export GALLIUM_DRIVER=zink
 export LIBGL_ALWAYS_SOFTWARE=0
-export LD_LIBRARY_PATH="$MESA_LIB:$MESA_DIR/lib:$MESA_DIR/lib/aarch64-linux-gnu:$LD_LIBRARY_PATH"
+export LD_LIBRARY_PATH="$MESA_LIB:${LD_LIBRARY_PATH:-}"
 
 if [ -f "$ICD_JSON" ]; then
     export VK_ICD_FILENAMES="$ICD_JSON"
     export VK_DRIVER_FILES="$ICD_JSON"
 else
     # Sin ICD de Adreno: lavapipe (Vulkan por software) para que al menos arranque.
-    if [ -f "$MESA_DIR/usr/share/vulkan/icd.d/lvp_icd.aarch64.json" ]; then
-        export VK_ICD_FILENAMES="$MESA_DIR/usr/share/vulkan/icd.d/lvp_icd.aarch64.json"
+    # El JSON que trae el payload apunta a la ruta del host (/usr/lib/...), que
+    # en el visor no existe: hay que rehacerlo con la ruta de aqui, o Mesa se
+    # queda sin Vulkan y el cliente no puede crear el contexto OpenGL.
+    LVP_SO="$MESA_LIB/libvulkan_lvp.so"
+    if [ -f "$MESA_DIR/usr/share/vulkan/icd.d/lvp_icd.aarch64.json" ] && [ -f "$LVP_SO" ]; then
+        LVP_JSON="$MESA_DIR/lvp_icd.json"
+        cat > "$LVP_JSON" <<JSON
+{
+    "file_format_version": "1.0.0",
+    "ICD": {
+        "library_path": "$LVP_SO",
+        "api_version": "1.3.239"
+    }
+}
+JSON
+        export VK_ICD_FILENAMES="$LVP_JSON"
+        export VK_DRIVER_FILES="$LVP_JSON"
+        log "lavapipe: $LVP_SO"
     fi
 fi
 
@@ -137,6 +163,7 @@ mkdir -p "$XDG_RUNTIME_DIR" 2>/dev/null || true
 # (no encuentra /etc/resolv.conf y usa 127.0.0.1, donde no hay nada).  El
 # shim trae un proxy CONNECT y un resolutor DNS propios: con el proxy, el
 # padlock del auth server sale de verdad y el cliente se puede emparejar.
+PRELOAD=""
 RESOLVER="${XFACTORVR_RESOLVER:-/data/local/tmp/libxfactorvr_resolver.so}"
 PROXY_PUERTO="${XFACTORVR_PROXY_PUERTO:-8899}"
 if [ -f "$RESOLVER" ]; then
@@ -144,13 +171,13 @@ if [ -f "$RESOLVER" ]; then
     export http_proxy="http://127.0.0.1:$PROXY_PUERTO"
     export XFACTORVR_RESOLVER_LOG="${XFACTORVR_RESOLVER_LOG:-$FACTORIO_DIR/logs/resolver.log}"
     mkdir -p "$(dirname "$XFACTORVR_RESOLVER_LOG")" 2>/dev/null || true
-    export LD_PRELOAD="$RESOLVER${LD_PRELOAD:+:$LD_PRELOAD}"
+    PRELOAD="$RESOLVER${PRELOAD:+:$PRELOAD}"
     log "resolutor: $RESOLVER (proxy en 127.0.0.1:$PROXY_PUERTO)"
 fi
 
 INJECTOR="${INJECTOR:-/data/local/tmp/libxfactorvr_injector.so}"
 if [ -f "$INJECTOR" ] && [ "${XFACTORVR_USE_INJECTOR:-1}" = "1" ]; then
-    export LD_PRELOAD="$INJECTOR${LD_PRELOAD:+:$LD_PRELOAD}"
+    PRELOAD="$INJECTOR${PRELOAD:+:$PRELOAD}"
     log "inyector: $INJECTOR"
     # Destino de los hooks: por defecto el render del juego.
     export XFACTORVR_HOOK_TARGET="${XFACTORVR_HOOK_TARGET:-GameRenderer::render}"
@@ -190,7 +217,7 @@ fi
 #   write-data=<directorio del cliente>
 # Es la unica forma de que el motor lo acepte: si el ejecutable esta en otro
 # sitio, deduce el write-data por si mismo y choca con el del servidor.
-GAME_DIR="${GAME_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
+GAME_DIR="${GAME_DIR:-$(cd "$(dirname "$0")" && pwd)}"
 GAME_DIR="${GAME_DIR_OVERRIDE:-/data/local/tmp/factorio}"
 CLIENT_DIR="${CLIENT_DIR:-/data/local/tmp/factorio_cliente}"
 SERVER_PORT="${SERVER_PORT:-34197}"
@@ -218,7 +245,7 @@ if [ -n "${SERVER_ADDR:-}" ]; then
     # CLIENTE se conecta para aportar el jugador que el nivel de campana
     # exige (usa game.players[1]) y para pintar el mundo en 3D.
     log "Conectando al servidor $SERVER_ADDR:$SERVER_PORT..."
-    exec "$LOADER" "$GAME_BIN" \
+    exec env LD_PRELOAD="$PRELOAD" "$LOADER" --library-path "$GLIBC_LIB" "$GAME_BIN" \
         --config "$CLIENT_CONFIG" \
         --window-size "${WIDTH}x${HEIGHT}" \
         --mp-connect "$SERVER_ADDR:$SERVER_PORT"
@@ -229,7 +256,7 @@ fi
 SAVE="${SAVE:-$FACTORIO_DIR/saves/xfactorvr.zip}"
 if [ ! -f "$SAVE" ]; then
     log "Creando la partida inicial..."
-    "$LOADER" "$GAME_BIN" --create "$SAVE" --config "$FACTORIO_DIR/config/config-path.cfg" \
+    env LD_PRELOAD="$PRELOAD" "$LOADER" --library-path "$GLIBC_LIB" "$GAME_BIN" --create "$SAVE" --config "$CLIENT_CONFIG" \
         2>&1 | tail -20
 fi
 
@@ -237,8 +264,8 @@ log "Arrancando el cliente grafico (Zink -> Vulkan) en $WIDTH x $HEIGHT..."
 log "  ICD: ${VK_ICD_FILENAMES:-ninguno}"
 log "  SDL: $SDL_VIDEODRIVER"
 
-exec "$LOADER" "$GAME_BIN" \
-    --config "$FACTORIO_DIR/config/config-path.cfg" \
+exec env LD_PRELOAD="$PRELOAD" "$LOADER" --library-path "$GLIBC_LIB" "$GAME_BIN" \
+    --config "$CLIENT_CONFIG" \
     --window-size "${WIDTH}x${HEIGHT}" \
     --fullscreen \
     "$SAVE"

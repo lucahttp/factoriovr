@@ -53,10 +53,13 @@ Estas cuatro cosas no se ven en el banco y son las que más tiempo han costado:
 
 | Hallazgo | Por qué importa | Qué se hizo |
 |---|---|---|
+| **La app no puede ejecutar un ELF desde su sandbox** (`execv` → `Permission denied`) | El motor no se puede lanzar desde el directorio privado de la app | El motor se lanza desde `/data/local/tmp` (contexto del shell). El sandbox de la app solo sirve para lo que la app carga con `dlopen` (su propio `libxfactorvr.so`) |
+| **Un proceso del shell no puede hacer `dlopen`** de una `.so` en `/data/local/tmp` (`shell_data_file`) | El cliente gráfico hace `dlopen` de Mesa para crear el contexto GL → `Could not initialize OpenGL / GLES library` | Sin root no hay arreglo: el cliente gráfico necesita un contexto con `execute_no_trans` (el de Termux o root). El **servidor headless** no lo necesita (no usa GL) y sí funciona |
 | **El driver Vulkan del Adreno es bionic** (`/vendor/lib64/hw/vulkan.adreno.so`, depende de `libc.so`, `liblog.so`, `libllvm-glnext.so` y librerías HIDL) | El cliente de Factorio es **glibc**: cargar un driver bionic dentro de un proceso glibc mete dos libc en el mismo proceso y revienta | El cliente va con **lavapipe** (Vulkan por software, dentro del payload de Mesa). Se puede forzar el ICD del fabricante con `XFACTORVR_USE_ADRENO_ICD=1`, pero es Weekly unsafe: no lo hagas |
 | **No hay `/etc/resolv.conf`** (Android resuelve por netd/binder) | El motor es glibc y busca ese fichero: dentro del motor **no se resuelve ningún nombre** | `resolver-linux/`: shim LD_PRELOAD con un mini-resolver DNS por UDP, redirección de `/etc/resolv.conf` y un **proxy CONNECT local** |
 | **El motor lleva curl enlazado estáticamente** (con su propia copia de la resolución) | Ni siquiera un `getaddrinfo` interponer le afecta: su NSS usa `127.0.0.1` por defecto y la petición del padlock se queda 60 s | El shim levanta un proxy CONNECT en `127.0.0.1:8899` y el motor arranca con `https_proxy` apuntando ahí. El padlock que sale es el de verdad |
 | **El motor deduce sus rutas de `/proc/self/exe`** | Al lanzarlo por el linker de glibc, `/proc/self/exe` apunta al linker y el motor busca el juego en `/usr/share/factorio` | El servidor y el cliente llevan un `config.ini` propio con `read-data`/`write-data` en absoluto |
+| **El glibc de Termux no es portable** | Lleva dentro rutas absolutas a `/data/data/com.termux/...`, así que al copiarlo a otro sitio deja de encontrar sus librerías | `scripts/prepare_glibc_debian.py`: glibc **2.41 de Debian trixie**, portable y ≥ 2.38 (el cliente gráfico pide `GLIBC_2.38`) |
 
 Comprobaciones rápidas en el visor:
 

@@ -39,6 +39,10 @@ PAQUETES = [
     # Mesa
     "libgl1", "libglx-mesa0", "libgl1-mesa-dri", "libgl1-mesa-glx",
     "libglapi-mesa", "libegl1", "libegl-mesa0", "libgbm1", "libdrm2", "libdrm-common",
+    # glvnd: el runtime que despacha las llamadas de GL.  Sin el,
+    # libGL.so.1 no se puede cargar (le falta libGLdispatch.so.0) y el
+    # cliente grafico se queda sin contexto: "Could not initialize OpenGL".
+    "libglvnd0", "libeglvnd0",
     "libvulkan1", "mesa-vulkan-drivers", "mesa-zink", "libllvm15", "libsensors5",
     "libxcb1", "libx11-6", "libxau6", "libxdmcp6", "libxext6", "libbsd0",
     "libmd0",
@@ -61,8 +65,9 @@ ESPERADOS = [
     "usr/lib/aarch64-linux-gnu/libvulkan_lvp.so",
     "usr/share/vulkan/icd.d/lvp_icd.aarch64.json",
     # El linker de glibc (Debian lo deja en /lib).
-    "lib/ld-linux-aarch64.so.1",
-    "lib/aarch64-linux-gnu/libc.so.6",
+    # La glibc no va en este payload: la aporta el runtime del visor
+    # (prepare_glibc.sh), que es mas nueva y no choca con el motor grafico.
+    "usr/lib/aarch64-linux-gnu/libgcc_s.so.1",
 ]
 
 
@@ -253,6 +258,38 @@ def empaquetar_tar(out, ruta_tar):
     log(f"Empaquetado {ruta_tar} ({tam/1e6:.1f} MB, sin enlaces duros)")
 
 
+def podar_glibc_debian(out):
+    """Quita la glibc de Debian del payload de Mesa.
+
+    El payload trae libc6, libgcc-s1 y libstdc++6 de Debian (bookworm, glibc
+    2.36).  Esa libc PISA la del runtime de glibc del visor (Termux, 2.44) y
+    entonces el cliente grafico de Factorio, que pide GLIBC_2.38, falla con
+    "version `GLIBC_2.38' not found".
+
+    La glibc que se usa es la del runtime del visor, asi que aqui solo se
+    deja lo que ese runtime no trae: libgcc_s.so.1."""
+    libgcc = None
+    for base in ("usr/lib/aarch64-linux-gnu", "lib/aarch64-linux-gnu"):
+        p = os.path.join(out, base, "libgcc_s.so.1")
+        if os.path.exists(p):
+            libgcc = p
+            break
+    # Se copia antes de borrar: libgcc_s.so.1 vive dentro de lib/.
+    guardado = None
+    if libgcc:
+        guardado = os.path.join(out, ".libgcc_s.so.1.guardado")
+        shutil.copy2(libgcc, guardado)
+    shutil.rmtree(os.path.join(out, "lib"), ignore_errors=True)
+    shutil.rmtree(os.path.join(out, "lib64"), ignore_errors=True)
+    if guardado:
+        dest_dir = os.path.join(out, "usr/lib/aarch64-linux-gnu")
+        os.makedirs(dest_dir, exist_ok=True)
+        shutil.copy2(guardado, os.path.join(dest_dir, "libgcc_s.so.1"))
+        os.remove(guardado)
+        log("  libgcc_s.so.1 conservado (la glibc la aporta el runtime del visor)")
+    log("  glibc de Debian quitada del payload de Mesa")
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", default="build/mesa")
@@ -304,6 +341,8 @@ def main():
 
     log("Podando los alias del megadriver de DRI...")
     podar_alias_dri(out)
+    log("Quitando la glibc de Debian (la del visor es mas nueva)...")
+    podar_glibc_debian(out)
 
     log("")
     log("Comprobando los ficheros clave:")

@@ -200,7 +200,12 @@ pub type Hook = unsafe extern "C" fn(*mut c_void);
 ///
 /// `hook` recibe el puntero `this` (x0) tal cual, para poder pasarlo al
 /// original a traves del trampolin.
-pub fn instalar(destino: u64, hook: u64, forzar: Option<Estilo>) -> Result<Detour, Error> {
+pub fn instalar(
+    destino: u64,
+    hook: u64,
+    forzar: Option<Estilo>,
+    tamano_funcion: u64,
+) -> Result<Detour, Error> {
     // 1. El destino tiene que estar en una region legible (si no, leerlo
     //    seria un SIGSEGV dentro del juego).
     let region = match maps::region_de(destino) {
@@ -228,11 +233,43 @@ pub fn instalar(destino: u64, hook: u64, forzar: Option<Estilo>) -> Result<Detou
         }
     }
 
-    let bytes = estilo.bytes();
+    let mut bytes = estilo.bytes();
 
     // 3. Leer los bytes originales (con cuidado de no leer fuera de la
     //    region mapeada).
-    let original = leer_memoria(destino, bytes)?.to_vec();
+    let mut original = leer_memoria(destino, bytes)?.to_vec();
+
+    // 3b. Con el parche largo, el bloque reubicado tiene que ser mas grande
+    //     que el parche: si dentro hay un salto condicional (B.cond,
+    //     CBZ/CBNZ, TBZ/TBNZ) que apunte fuera del bloque, su destino
+    //     relativo quedaria corrupto al copiar el bloque (el salto se
+    //     saltaria a un sitio cualquiera y el juego moriria con SIGILL).
+    //     Se crece el bloque hasta que todos esos saltos apunten dentro.
+    if estilo == Estilo::Largo {
+        loop {
+            let t = tamanho_del_bloque(destino, &original, MAXIMO_BLOQUE);
+            if t <= bytes {
+                break;
+            }
+            // El bloque no puede pasar de la funcion: si se reubicaran bytes
+            // de la funcion siguiente, al escribir el parche se corromperia.
+            if (tamano_funcion != 0) && (t as u64) > tamano_funcion {
+                return Err(Error::FuncionCorta {
+                    direccion: destino,
+                    necesita: t,
+                    hay: tamano_funcion as usize,
+                });
+            }
+            if t > MAXIMO_BLOQUE {
+                return Err(Error::InstruccionNoRelocalizable {
+                    direccion: destino,
+                    instruccion: 0,
+                });
+            }
+            bytes = t;
+            original = leer_memoria(destino, bytes)?.to_vec();
+        }
+    }
 
     // 4. Montar el trampolin (reubica el bloque y reescribe las
     //    instrucciones PC-relativas; si no se puede, renuncia).
@@ -249,10 +286,17 @@ pub fn instalar(destino: u64, hook: u64, forzar: Option<Estilo>) -> Result<Detou
             p
         }
         Estilo::Largo => {
-            let mut p = Vec::with_capacity(16);
+            let mut p = Vec::with_capacity(bytes);
             p.extend_from_slice(&OP_LDR_X16_LIT.wrapping_add(2u32 << 5).to_le_bytes());
             p.extend_from_slice(&OP_BR_X16.to_le_bytes());
             p.extend_from_slice(&hook.to_le_bytes());
+            // Si el bloque reubicado es mas grande que el parche minimo, los
+            // bytes sobrantes se copian del original: son codigo muerto (el
+            // salto al hook no vuelve aqui), pero hay que sobrescribirlos
+            // para que no se ejecuten dos veces.
+            if bytes > 16 {
+                p.extend_from_slice(&original[16..bytes]);
+            }
             p
         }
     };
@@ -656,7 +700,110 @@ pub fn reescribir_pc_relativa(
         return Reescritura::Corregida((insn & 0xFF00_001F) | (nuevo << 5));
     }
 
+    // --- Saltos condicionales de 19 bits (B.cond, CBZ/CBNZ, TBZ/TBNZ) ---
+    //
+    // Estos saltos tienen un alcance pequeño (+-1 MB, o +-32 KB los TBZ) y
+    // el trampolin puede estar a cientos de MB del destino, asi que NO se
+    // pueden rebasar a la direccion original. La solucion es que el bloque
+    // reubicado incluya tambien su destino (ver `tamanho_del_bloque`): al
+    // copiarse el bloque entero y en orden, la distancia relativa se
+    // conserva y el salto sigue apuntando al codigo correcto.
+    if let Some((bits, escala, inmediato)) = inmediato_salto_condicional(insn) {
+        let inm = extender_signo(inmediato, bits);
+        let destino = viejo_pc.wrapping_add(((inm as i64) * escala) as u64);
+        // Destino dentro del bloque reubicado: se conserva tal cual.
+        if destino >= base_bloque && destino < base_bloque + largo_bloque {
+            return Reescritura::Igual;
+        }
+        // Fuera del bloque: solo se puede corregir si el trampolin esta
+        // dentro del alcance del salto.
+        let delta = (destino as i64).wrapping_sub(nuevo_pc as i64);
+        let alcance = 1i64 << (bits + 1);
+        if delta % escala != 0 || delta < -alcance || delta > alcance {
+            return Reescritura::Imposible;
+        }
+        let nuevo = ((delta / escala) as u32) & ((1u32 << bits) - 1);
+        let conservar = if bits >= 19 {
+            0xFF00_001F
+        } else {
+            0xFFF8_001F
+        };
+        return Reescritura::Corregida((insn & conservar) | (nuevo << 5));
+    }
+
     Reescritura::Igual
+}
+
+/// Tamano maximo del bloque reubicado (bytes).
+pub const MAXIMO_BLOQUE: usize = 256;
+
+/// Inmediato y escala de un salto condicional de 19 bits.
+///
+/// Devuelve `None` si la instruccion no es de ese tipo. Los tres tipos
+/// comparten el immediato en los bits 23:5, pero `TBZ/TBNZ` usa 14 bits y
+/// escala 2 (el destino tiene que estar alineado a dos bytes).
+fn inmediato_salto_condicional(insn: u32) -> Option<(u32, i64, u32)> {
+    // B.cond: 01010100 imm19 0 cond
+    if insn & 0xFF00_0010 == 0x5400_0000 {
+        return Some((19, 4, (insn >> 5) & 0x7_FFFF));
+    }
+    // CBZ / CBNZ: sf 1 0 1 0 1 op 0 imm19 Rt
+    if insn & 0x7E00_0000 == 0x3400_0000 {
+        return Some((19, 4, (insn >> 5) & 0x7_FFFF));
+    }
+    // TBZ / TBNZ: b5 1 1 0 1 1 0 0 op b40 imm14 Rn
+    if insn & 0x7E00_0000 == 0x3600_0000 {
+        return Some((14, 2, (insn >> 5) & 0x3_FFF));
+    }
+    None
+}
+
+/// Extiende el signo de un inmediato de `bits` bits.
+fn extender_signo(valor: u32, bits: u32) -> i64 {
+    let signo = 1u32 << (bits - 1);
+    if valor & signo != 0 {
+        (valor as i64) - (1i64 << bits)
+    } else {
+        valor as i64
+    }
+}
+
+/// Calcula cuantos bytes hay que reubicar para que todos los saltos
+/// condicionales que haya dentro del bloque apunten a codigo tambien
+/// reubicado.
+///
+/// Un salto condicional de 19 bits no se puede rebasar a su destino
+/// original (el trampolin esta lejos), asi que el destino tiene que formar
+/// parte del bloque reubicado: al copiar el bloque entero y en orden, las
+/// distancias relativas se conservan y los saltos siguen funcionando.
+///
+/// Por ejemplo, el prologo de `SpriteDrawOrder::setup` empieza con
+///
+///     ldrb w8, [x1, #0x40]
+///     ldr  d1, [x3]
+///     tbz  w8, #7, +0x18      <- salta a destino+0x18
+///
+/// asi que el bloque tiene que crecer hasta incluir `destino + 0x18 + 4`.
+fn tamanho_del_bloque(destino: u64, bytes: &[u8], maximo: usize) -> usize {
+    let mut tam = bytes.len().max(16);
+    let limite = bytes.len() / 4 * 4;
+    let mut i = 0usize;
+    while i < limite {
+        let insn = u32::from_le_bytes([bytes[i], bytes[i + 1], bytes[i + 2], bytes[i + 3]]);
+        if let Some((bits, escala, inmediato)) = inmediato_salto_condicional(insn) {
+            let inm = extender_signo(inmediato, bits);
+            let pc = destino as i64 + i as i64;
+            let objetivo = pc + inm * escala;
+            if objetivo < destino as i64 || objetivo >= destino as i64 + tam as i64 {
+                let nuevo_tam = (objetivo - destino as i64 + 4) as usize;
+                if nuevo_tam > tam {
+                    tam = nuevo_tam;
+                }
+            }
+        }
+        i += 4;
+    }
+    tam.min(maximo)
 }
 
 /// Indica si una instruccion se puede reubicar sin mas.

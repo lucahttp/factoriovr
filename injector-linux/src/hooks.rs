@@ -137,15 +137,9 @@ extern "C" fn hook_render(this: *mut c_void) {
             f(this);
         }
 
-        // El mundo ya esta dibujado: se anota el viewport del area de juego
-        // (el modulo 3D lo necesita para pintar el cubo en el mismo sitio) y
-        // se dibujan los cubos 3D de las entidades capturadas en su hook de
-        // dibujado. Solo se dibuja aqui si no hay un hook de presentacion
-        // (que es el sitio preferible).
-        crate::modelo3d::nota_viewport();
+        // El cubo 3D se dibuja en el flush del motor (modulo `modelo3d`),
+        // que es cuando el mundo ya esta pintado en su framebuffer.
         crate::modelo3d::preparar_gl();
-        crate::modelo3d::dibujar_cajas_si_no_hay_presentacion();
-        crate::modelo3d::capturar_si_pide();
     }
 }
 
@@ -283,7 +277,7 @@ pub fn instalar() {
             hook_render as *const () as u64
         }
     };
-    match detour::instalar(encontrado.direccion, hook_addr, estilo) {
+    match detour::instalar(encontrado.direccion, hook_addr, estilo, encontrado.tamano) {
         Ok(d) => {
             TRAMPOLIN.store(d.trampolin as usize, Ordering::SeqCst);
             log::info(&format!(
@@ -391,7 +385,7 @@ fn instalar_hook_process_events(simbolos: &resolver::Simbolos) {
             return;
         }
     };
-    match detour::instalar(encontrado.direccion, hook_addr, None) {
+    match detour::instalar(encontrado.direccion, hook_addr, None, encontrado.tamano) {
         Ok(d) => {
             TRAMPOLIN_EVENTS.store(d.trampolin as usize, Ordering::SeqCst);
             log::info(&format!(
@@ -433,7 +427,7 @@ fn instalar_hook_app_manager(simbolos: &resolver::Simbolos) {
         }
     };
 
-    match detour::instalar(encontrado.direccion, hook_addr, None) {
+    match detour::instalar(encontrado.direccion, hook_addr, None, encontrado.tamano) {
         Ok(d) => {
             TRAMPOLIN_APP.store(d.trampolin as usize, Ordering::SeqCst);
             log::info(&format!(

@@ -161,7 +161,7 @@ echo "[3/6] Copiando el motor a $REMOTE_FACTORIO ..."
 # 4. Runtime de glibc
 echo "[4/6] Preparando el runtime de glibc..."
 if [ ! -f "$PROJECT_ROOT/build/glibc.tar.gz" ]; then
-    bash "$PROJECT_ROOT/scripts/prepare_glibc.sh"
+    python3 "$PROJECT_ROOT/scripts/prepare_glibc_debian.py"
 fi
 
 if [ -f "$PROJECT_ROOT/build/glibc.tar.gz" ]; then

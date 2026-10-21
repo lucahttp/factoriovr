@@ -631,6 +631,11 @@ typedef bool (*pfn_xfactorvr_get_carried_item)(float tile_x, float tile_y, uint3
 // o el ABI queda desalineado entre la libreria y el engine.
 typedef bool (*pfn_xfactorvr_pan_view)(float delta_x, float delta_y);
 typedef bool (*pfn_xfactorvr_get_view_center)(float* out_x, float* out_y);
+// Accion de las manos en VR: decide y ejecuta (coger del suelo, sacar de la
+// caja, meter en el horno o en la caja).  `hand`: 0 = gatillo, 1 = gripo.
+// Devuelve false si no habia nada que hacer (entonces el motor sigue con su
+// comportamiento normal de raton).
+typedef bool (*pfn_xfactorvr_vr_hand_action)(float tile_x, float tile_y, uint32_t hand);
 
 static pfn_xfactorvr_load_glb s_load_glb = nullptr;
 static pfn_xfactorvr_free_glb s_free_glb = nullptr;
@@ -650,6 +655,7 @@ static pfn_xfactorvr_get_machine_info s_get_machine_info = nullptr;
 static pfn_xfactorvr_get_carried_item s_get_carried_item = nullptr;
 static pfn_xfactorvr_pan_view s_pan_view = nullptr;
 static pfn_xfactorvr_get_view_center s_get_view_center = nullptr;
+static pfn_xfactorvr_vr_hand_action s_vr_hand_action = nullptr;
 
 // Estado de Minado Manual con Pico (mantener Trigger en vetas de mineral)
 static float s_manual_mining_timer = 0.0f;
@@ -1281,6 +1287,7 @@ static void init_glb_loader() {
     s_get_carried_item = (pfn_xfactorvr_get_carried_item)dlsym(handle, "xfactorvr_get_carried_item");
     s_pan_view = (pfn_xfactorvr_pan_view)dlsym(handle, "xfactorvr_pan_view");
     s_get_view_center = (pfn_xfactorvr_get_view_center)dlsym(handle, "xfactorvr_get_view_center");
+    s_vr_hand_action = (pfn_xfactorvr_vr_hand_action)dlsym(handle, "xfactorvr_vr_hand_action");
     s_get_atlas_page_count = (pfn_xfactorvr_get_atlas_page_count)dlsym(handle, "xfactorvr_get_atlas_page_count");
     s_get_atlas_page_size = (pfn_xfactorvr_get_atlas_page_size)dlsym(handle, "xfactorvr_get_atlas_page_size");
     s_get_atlas_page_pixels = (pfn_xfactorvr_get_atlas_page_pixels)dlsym(handle, "xfactorvr_get_atlas_page_pixels");
@@ -1314,6 +1321,7 @@ static void init_glb_loader() {
             s_get_carried_item = (pfn_xfactorvr_get_carried_item)dlsym(mod_handle, "xfactorvr_get_carried_item");
             s_pan_view = (pfn_xfactorvr_pan_view)dlsym(mod_handle, "xfactorvr_pan_view");
             s_get_view_center = (pfn_xfactorvr_get_view_center)dlsym(mod_handle, "xfactorvr_get_view_center");
+            s_vr_hand_action = (pfn_xfactorvr_vr_hand_action)dlsym(mod_handle, "xfactorvr_vr_hand_action");
         }
     }
     LOGI("openxr_engine: Cargador GLB y FFI Factorio enlazados (load=%p, get=%p, inv=%p, patches=%p, mine=%p, interact=%p)",
@@ -2374,8 +2382,29 @@ static void draw_tabletop_scene(const float* vp_mat,
                     s_last_drag_tile_y = 9999;
                 }
 
+                // 0. MANOS: coger del suelo, sacar de la caja, meter en el
+                //    horno o en la caja.  El decide (Rust) y ejecuta contra
+                //    el juego real.  Si no hay nada que hacer devuelve false y
+                //    el resto del gatillo sigue siendo el raton de siempre.
+                bool mano_hecha = false;
+                if ((trigger_clicked || grip_clicked) && s_vr_hand_action) {
+                    mano_hecha = s_vr_hand_action(hover_tile_x, hover_tile_y,
+                                                   trigger_clicked ? 0u : 1u);
+                    if (mano_hecha) {
+                        LOGI("Mano VR: accion de inventario en (%.1f, %.1f) [%s]",
+                             hover_tile_x, hover_tile_y, trigger_clicked ? "gatillo" : "gripo");
+                        trigger_controller_haptics(session, haptic_action, 0.70f, 40.0f);
+                        play_spatial_sound(SFX_CLICK, s_table_pos.x + snap_mx, s_table_pos.y, s_table_pos.z + snap_mz, 0.9f);
+                        for (int k = 0; k < 14; ++k) {
+                            spawn_particle(snap_mx, 0.04f, snap_mz,
+                                           ((rand() % 100) - 50) * 0.0012f, 0.05f + (rand() % 40) * 0.0008f, ((rand() % 100) - 50) * 0.0012f,
+                                           0.35f, 0.80f, 1.00f, 0.95f, 0.010f, 0.8f);
+                        }
+                    }
+                }
+
                 // 1. Colocar edificio con gatillo sobre casilla vacía
-                if (trigger_clicked && s_selected_build_tool != ENTITY_NONE && !is_occupied) {
+                if (!mano_hecha && trigger_clicked && s_selected_build_tool != ENTITY_NONE && !is_occupied) {
                     if (s_place_or_update_entity) {
                         s_place_or_update_entity(s_selected_build_tool, hover_tile_x, hover_tile_y, s_placement_yaw);
                         LOGI("Construido tipo=%d en tile (%.1f, %.1f) yaw=%.2f",
@@ -2395,7 +2424,7 @@ static void draw_tabletop_scene(const float* vp_mat,
                 // 1.b Arrastre continuo: mantener el gatillo y mover el puntero
                 //     tiende lineas de cintas transportadoras (o postes) de una
                 //     sola vez, como se hace en Factorio con el raton.
-                else if (trigger_held && s_selected_build_tool != ENTITY_NONE && !is_occupied &&
+                else if (!mano_hecha && trigger_held && s_selected_build_tool != ENTITY_NONE && !is_occupied &&
                          is_drag_build_tool(s_selected_build_tool)) {
                     int drag_tx = (int)hover_tile_x;
                     int drag_ty = (int)hover_tile_y;
@@ -2412,7 +2441,7 @@ static void draw_tabletop_scene(const float* vp_mat,
                     }
                 }
                 // 2. Interactuar / Lootear productos terminados o abastecer máquina ocupada
-                else if (is_occupied && trigger_clicked && (s_selected_build_tool == ENTITY_NONE || (has_machine_info && m_out > 0))) {
+                else if (!mano_hecha && is_occupied && trigger_clicked && (s_selected_build_tool == ENTITY_NONE || (has_machine_info && m_out > 0))) {
                     if (s_interact_machine) {
                         uint32_t looted = s_interact_machine(hover_tile_x, hover_tile_y);
                         if (looted > 0) {
@@ -2432,7 +2461,7 @@ static void draw_tabletop_scene(const float* vp_mat,
                     }
                 }
                 // 3. Minar / Deconstruir máquina con botón Grip o modo demoler si no hay productos
-                else if (is_occupied && (grip_clicked || (trigger_clicked && s_selected_build_tool == ENTITY_NONE && (!has_machine_info || m_out == 0)))) {
+                else if (!mano_hecha && is_occupied && (grip_clicked || (trigger_clicked && s_selected_build_tool == ENTITY_NONE && (!has_machine_info || m_out == 0)))) {
                     if (s_mine_entity) {
                         s_mine_entity(hover_tile_x, hover_tile_y);
                         LOGI("Minado/Deconstruido en tile (%.1f, %.1f)", hover_tile_x, hover_tile_y);

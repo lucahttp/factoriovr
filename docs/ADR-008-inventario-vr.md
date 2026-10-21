@@ -134,16 +134,17 @@ meter).
 
 ## Consecuencias
 
-- **Lo que falta**: el enganche en el motor de VR
-  (`android/src/openxr_engine.cpp`) tiene que llamar a
-  `xfactorvr_vr_hand_action` con la casilla que apunta el rayo y el botón que
-  se ha pulsado. Ese fichero estaba siendo editado en paralelo y queda fuera
-  del alcance de este ADR, así que el enganche **está pendiente**. Todo lo
-  demás (decisión, ejecución, red, mod) ya está y funciona contra el Factorio
-  real.
+- **El enganche en el motor de VR está hecho** (`android/src/openxr_engine.cpp`).
+  El motor llama a `xfactorvr_vr_hand_action(casilla_x, casilla_y, 0|1)` con la
+  casilla que apunta el rayo y el botón que se ha pulsado (0 = gatillo,
+  1 = gripo), **antes** de su propia lógica de ratón. Si la mano ha hecho
+  algo (devuelve true), el resto del gatillo de ese pulso no se ejecuta: son
+  acciones distintas sobre el mismo objetivo. Si no hay nada que hacer
+  (devuelve false), el gatillo sigue siendo el ratón de siempre (colocar,
+  minar, lootear) y el joystick y la pinza no se tocan.
 - **El HUD de inventario** (el "plus" de la barra rápida) queda **fuera**: es
-  opcional y vive en el renderizador, que tampoco se toca aquí. Con este ADR
-  el inventario ya se puede *usar*; solo falta poder *verlo* con detalle.
+  opcional y vive en el renderizador. Con este ADR el inventario ya se puede
+  *usar*; solo falta poder *verlo* con detalle.
 - **La tabla de tipos de entidad sigue igual**: ni el mod ni Rust ni el C++
   cambian un solo valor de `ENTITY_TYPES_MAP`. El canal de los items sueltos
   es paralelo.

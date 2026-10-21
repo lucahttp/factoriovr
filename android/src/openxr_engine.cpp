@@ -2684,12 +2684,19 @@ static void construir_panel_juego() {
         verts.push_back(d);
     };
     // Cara que mira a +Z.
-    push(-w, -h, 0.0f, 0.0f);
-    push( w, -h, 1.0f, 0.0f);
-    push( w,  h, 1.0f, 1.0f);
-    push(-w, -h, 0.0f, 0.0f);
-    push( w,  h, 1.0f, 1.0f);
-    push(-w,  h, 0.0f, 1.0f);
+    //
+    // La V va INVERTIDA a proposito: el motor dibuja el mundo con la Y
+    // invertida, asi que en el framebuffer la fila 0 es la de ARRIBA de la
+    // imagen (comprobado comparando el frame que viaja por el socket con una
+    // captura de la pantalla real del juego).  Al subir el buffer tal cual a
+    // la textura, la t=0 queda en la fila 0, asi que la t=0 tiene que pintar
+    // la parte de ARRIBA del panel.
+    push(-w, -h, 0.0f, 1.0f);
+    push( w, -h, 1.0f, 1.0f);
+    push( w,  h, 1.0f, 0.0f);
+    push(-w, -h, 0.0f, 1.0f);
+    push( w,  h, 1.0f, 0.0f);
+    push(-w,  h, 0.0f, 0.0f);
     s_juego_vertices = (int)verts.size();
     s_vao_juego = create_mesh_vao(verts, s_vbo_juego);
 }

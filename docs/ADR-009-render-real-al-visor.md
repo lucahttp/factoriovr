@@ -42,6 +42,14 @@ de UV por ojo.**
   caja, en el hilo del juego: mandar 1280×720 por el socket es mucho.
 - El límite de FPS se consulta **antes** de leer el framebuffer (leer es lo
   caro: 3,6 MB por frame).
+- **Los frames en negro no se mandan.** El motor dibuja en negro al cargar y
+  en los menús; en el visor eso son parpadeos. Si menos del 1 % de los píxeles
+  tienen color, el frame se descarta y el visor se queda con la última imagen
+  buena.
+- **El cubo se vuelve a pintar justo antes de leer.** El motor redibuja el
+  terreno por encima de lo que hemos pintado, así que el cubo 3D puede haber
+  desaparecido del framebuffer entre una pasada y otra: sin esto, solo 1 de
+  cada 30 frames que se mandaban llevaba el 3D dentro.
 
 Variables de entorno:
 
@@ -51,6 +59,7 @@ Variables de entorno:
 | `XFACTORVR_STREAM_ANCHO` | 640 | ancho del frame |
 | `XFACTORVR_STREAM_ALTO` | 360 | alto del frame |
 | `XFACTORVR_STREAM_FPS` | 15 | frames por segundo objetivo |
+| `XFACTORVR_STREAM_DEBUG_PNG` | (vacío) | escribe un PNG de lo que se manda (diagnóstico) |
 
 ### El protocolo XFV1
 
@@ -81,6 +90,14 @@ textura se sube tal cual y el shader invierte la V.
   el GL**: el hilo de OpenXR es el único que sube la textura.
 - El panel es un quad vertical (1 m × 16:9) al fondo de la mesa, con la
   textura del juego.
+- **La V del panel va invertida**: el motor dibuja el mundo con la Y
+  invertida, así que la fila 0 del framebuffer es la de **arriba** de la
+  imagen. Se comprobó capturando la pantalla real del juego en el contenedor
+  (`import -window root` sobre el Xvfb) y comparándola con el frame que viaja
+  por el socket: las dos imágenes tienen la misma orientación (la maquinaria
+  grande arriba a la izquierda, el terreno abajo, el cubo 3D a la derecha). Al
+  subir el buffer tal cual a la textura, la `t=0` queda en la fila 0, así que
+  la `t=0` tiene que pintar la parte de **arriba** del panel.
 - **El paralaje**: cada ojo desplaza la UV un 1,8 % en horizontal
   (`u_uv_offset`). Es el efecto "TV 3D": la imagen se ve como una ventana al
   mundo y el cubo 3D que pinta el inyector gana volumen. El shader ya tenía
@@ -132,5 +149,6 @@ textura se sube tal cual y el shader invierte la V.
 Verde = llegaron frames **con el cubo 3D dentro**, o sea: la imagen que compone
 el motor (con el 3D) viaja al visor.
 
-Resultado de la última corrida: 1059 frames recibidos, 125 con el cubo 3D
-dentro (máximo 7227 pixeles magenta).
+La evidencia visual es el PNG de diagnóstico (`build/stream_debug_small.png`):
+es literalmente el frame que viaja por el socket, con el terreno real del
+juego, las máquinas y el cubo magenta del módulo 3D.

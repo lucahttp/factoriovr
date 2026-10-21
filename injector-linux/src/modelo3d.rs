@@ -343,6 +343,8 @@ static N_ENTIDADES: AtomicUsize = AtomicUsize::new(0);
 
 type GlGetIntegerv = unsafe extern "C" fn(pname: u32, params: *mut i32);
 type GlGetError = unsafe extern "C" fn() -> u32;
+/// `glBindFramebuffer(target, framebuffer)`.
+type GlBindFramebuffer = unsafe extern "C" fn(target: u32, framebuffer: u32);
 type GlCreateShader = unsafe extern "C" fn(shader_type: u32) -> u32;
 type GlShaderSource =
     unsafe extern "C" fn(shader: u32, count: i32, string: *const *const i8, length: *const i32);
@@ -422,6 +424,8 @@ const GL_UNPACK_ALIGNMENT: u32 = 0x0CF5;
 /// Framebuffer de dibujado actualmente enlazado.
 const GL_DRAW_FRAMEBUFFER_BINDING: u32 = 0x8CA6;
 const GL_READ_FRAMEBUFFER_BINDING: u32 = 0x8CAA;
+/// Objetivo de `glBindFramebuffer` para elegir solo el framebuffer de lectura.
+const GL_READ_FRAMEBUFFER: u32 = 0x8CAA;
 /// Vertex array actualmente enlazado.
 const GL_VERTEX_ARRAY_BINDING: u32 = 0x85B5;
 /// Buffer de vertices actualmente enlazado.
@@ -438,6 +442,7 @@ const GL_SAMPLES: u32 = 0x80A9;
 struct Gl {
     get_integerv: GlGetIntegerv,
     get_error: GlGetError,
+    bind_framebuffer: GlBindFramebuffer,
     create_shader: GlCreateShader,
     shader_source: GlShaderSource,
     compile_shader: GlCompileShader,
@@ -472,6 +477,7 @@ struct Gl {
 struct GlAddr {
     get_integerv: usize,
     get_error: usize,
+    bind_framebuffer: usize,
     create_shader: usize,
     shader_source: usize,
     compile_shader: usize,
@@ -612,6 +618,7 @@ fn resolver_gl(simbolos: &resolver::Simbolos) -> Option<GlAddr> {
     Some(GlAddr {
         get_integerv: dir!("glad_glGetIntegerv"),
         get_error: dir!("glad_glGetError"),
+        bind_framebuffer: dir!("glad_glBindFramebuffer"),
         create_shader: dir!("glad_glCreateShader"),
         shader_source: dir!("glad_glShaderSource"),
         compile_shader: dir!("glad_glCompileShader"),
@@ -665,6 +672,7 @@ fn construir_gl(dir: &GlAddr) -> Option<Gl> {
     Some(Gl {
         get_integerv: ptr!(get_integerv),
         get_error: ptr!(get_error),
+        bind_framebuffer: ptr!(bind_framebuffer),
         create_shader: ptr!(create_shader),
         shader_source: ptr!(shader_source),
         compile_shader: ptr!(compile_shader),
@@ -1232,6 +1240,13 @@ fn transmitir_si_toca(gl: &Gl, vp: &[i32; 4], origen: &str) {
     if w <= 0 || h <= 0 {
         return;
     }
+    // El motor vuelve a dibujar el terreno por encima de lo que hemos
+    // pintado, asi que el cubo puede haber desaparecido del framebuffer
+    // entre una pasada y otra.  Para el frame que se manda se vuelve a
+    // pintar: asi el visor recibe SIEMPRE la imagen con el 3D dentro.
+    if ACTIVO.load(Ordering::Relaxed) != 0 {
+        dibujar_cajas(gl, vp);
+    }
     match leer_framebuffer(gl, vp, origen) {
         Some(()) => {
             // El frame ya esta dentro del buffer del hilo: se manda.
@@ -1248,6 +1263,37 @@ fn transmitir_si_toca(gl: &Gl, vp: &[i32; 4], origen: &str) {
 ///
 /// El buffer se reutiliza entre llamadas: leer 4 MB de pixeles en cada frame
 /// generaria mucha basura y el motor lo notaria.
+/// Lee los pixeles del framebuffer de DIBUJO.
+///
+/// El motor puede dejar el framebuffer de LECTURA apuntando a otro sitio (el
+/// de la ventana, por ejemplo) que el de DIBUJO: entonces lo que se lee no es
+/// lo que se ha pintado y el cubo 3D no sale nunca.  Aqui se enlaza el de
+/// lectura al de dibujo, se lee, y se devuelve el estado como estaba.
+fn leer_pixeles(gl: &Gl, w: i32, h: i32, buf: &mut [u8]) {
+    let fb_dibujo = gl_int(gl, GL_DRAW_FRAMEBUFFER_BINDING);
+    let fb_lectura = gl_int(gl, GL_READ_FRAMEBUFFER_BINDING);
+    let reenlazar = fb_dibujo != 0 && fb_dibujo != fb_lectura;
+    if reenlazar {
+        unsafe { (gl.bind_framebuffer)(GL_READ_FRAMEBUFFER, fb_dibujo as u32) };
+    }
+    unsafe {
+        (gl.pixel_storei)(GL_UNPACK_ALIGNMENT, 1);
+        (gl.read_pixels)(
+            0,
+            0,
+            w,
+            h,
+            GL_RGBA,
+            GL_UNSIGNED_BYTE,
+            buf.as_mut_ptr() as *mut c_void,
+        );
+        (gl.finish)();
+    }
+    if reenlazar {
+        unsafe { (gl.bind_framebuffer)(GL_READ_FRAMEBUFFER, fb_lectura as u32) };
+    }
+}
+
 fn leer_framebuffer(gl: &Gl, vp: &[i32; 4], origen: &str) -> Option<()> {
     let w = vp[2];
     let h = vp[3];
@@ -1264,19 +1310,7 @@ fn leer_framebuffer(gl: &Gl, vp: &[i32; 4], origen: &str) -> Option<()> {
             buf.clear();
             buf.resize(bytes, 0);
         }
-        unsafe {
-            (gl.pixel_storei)(GL_UNPACK_ALIGNMENT, 1);
-            (gl.read_pixels)(
-                0,
-                0,
-                w,
-                h,
-                GL_RGBA,
-                GL_UNSIGNED_BYTE,
-                buf.as_mut_ptr() as *mut c_void,
-            );
-            (gl.finish)();
-        }
+        leer_pixeles(gl, w, h, &mut buf);
         if drenar_errores(gl, "leer el framebuffer") {
             log::aviso("no se pudo leer el framebuffer");
             return None;
@@ -1299,6 +1333,8 @@ fn leer_framebuffer(gl: &Gl, vp: &[i32; 4], origen: &str) -> Option<()> {
         }
         // Diagnostico: que se ve EXACTAMENTE en lo que se manda.  Es la
         // unica forma de saber si el cubo esta en la imagen o no.
+        // Solo se guardan frames con contenido: al principio el motor dibuja
+        // en negro (carga) y no dicen nada.
         {
             static RUTA_PNG: OnceLock<String> = OnceLock::new();
             let ruta = RUTA_PNG.get_or_init(|| {
@@ -1308,10 +1344,13 @@ fn leer_framebuffer(gl: &Gl, vp: &[i32; 4], origen: &str) -> Option<()> {
                 }
             });
             if !ruta.is_empty() {
+                let contenido = crate::stream::fraccion_con_contenido(&buf);
                 let n = crate::stream::enviados();
-                if n % 20 == 1 {
+                if contenido > 0.05 && n % 20 == 1 {
                     escribir_png(ruta, w as u32, h as u32, &buf);
-                    log::info(&format!("PNG de diagnostico escrito en {ruta}"));
+                    log::info(&format!(
+                        "PNG de diagnostico escrito en {ruta} (contenido {contenido:.2})"
+                    ));
                 }
             }
         }
@@ -1772,19 +1811,7 @@ fn capturar_png(gl: &Gl, vp: &[i32; 4], ruta: &str) -> bool {
         return false;
     }
     let mut pix = vec![0u8; (w * h * 4) as usize];
-    unsafe {
-        (gl.pixel_storei)(GL_UNPACK_ALIGNMENT, 1);
-        (gl.read_pixels)(
-            0,
-            0,
-            w,
-            h,
-            GL_RGBA,
-            GL_UNSIGNED_BYTE,
-            pix.as_mut_ptr() as *mut c_void,
-        );
-        (gl.finish)();
-    }
+    leer_pixeles(gl, w, h, &mut pix);
     if drenar_errores(gl, "leer el framebuffer") {
         log::aviso("no se pudo leer el framebuffer: la captura saldra vacia");
     }

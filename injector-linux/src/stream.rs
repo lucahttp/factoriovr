@@ -40,6 +40,7 @@
 
 use std::io::Write;
 use std::net::TcpStream;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TrySendError};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -108,6 +109,8 @@ struct Estado {
     enviados: Mutex<u64>,
     /// Veces que no se pudo enviar porque el canal estaba lleno.
     perdidos: Mutex<u64>,
+    /// Frames descartados por ir vacios (pantalla en negro).
+    vacias: AtomicU64,
 }
 
 /// Estado global (se inicializa la primera vez).
@@ -121,6 +124,7 @@ fn estado() -> &'static Estado {
         contador: Mutex::new(0),
         enviados: Mutex::new(0),
         perdidos: Mutex::new(0),
+        vacias: AtomicU64::new(0),
     })
 }
 
@@ -260,6 +264,15 @@ pub fn enviar(pix: &[u8], w: u32, h: u32) -> bool {
         *c
     };
 
+    // Si la imagen esta practicamente vacia no se manda: el motor dibuja en
+    // negro en certains momentos (carga, menus, transiciones) y en el visor
+    // eso son parpadeos. Es mejor que se quede la ultima imagen buena.
+    let con_contenido = fraccion_con_contenido(&datos);
+    if con_contenido < UMBRAL_CONTENIDO {
+        estado().vacias.fetch_add(1, Ordering::Relaxed);
+        return false;
+    }
+
     // El paquete es cabecera + carga: va entero al canal, el hilo emisor lo
     // escribe tal cual en el socket.
     let paquete = empaquetar(numero, w2, h2, 0, &datos);
@@ -364,9 +377,39 @@ pub fn reducir(pix: &[u8], w: u32, h: u32, ancho_objetivo: u32, alto_objetivo: u
     Some((ow, oh, salida))
 }
 
+/// Fraccion de pixeles con contenido (no totalmente negros) de una imagen.
+///
+/// Se usa para no mandar frames en negro: en el visor eso son parpadeos.
+pub fn fraccion_con_contenido(pix: &[u8]) -> f32 {
+    if pix.is_empty() {
+        return 0.0;
+    }
+    let mut con = 0u64;
+    let mut total = 0u64;
+    for p in pix.chunks_exact(4) {
+        total += 1;
+        if p[0] != 0 || p[1] != 0 || p[2] != 0 {
+            con += 1;
+        }
+    }
+    if total == 0 {
+        0.0
+    } else {
+        con as f32 / total as f32
+    }
+}
+
+/// Por debajo de esta fraccion de contenido el frame se considera vacio.
+pub const UMBRAL_CONTENIDO: f32 = 0.01;
+
 /// Numero de frames enviados de verdad.
 pub fn enviados() -> u64 {
     *estado().enviados.lock().unwrap_or_else(|p| p.into_inner())
+}
+
+/// Frames que se descartaron por ir vacios.
+pub fn vacias() -> u64 {
+    estado().vacias.load(Ordering::Relaxed)
 }
 
 /// Frames que se descartaron porque el visor iba lento.

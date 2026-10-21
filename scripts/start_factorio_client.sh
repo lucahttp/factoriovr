@@ -182,6 +182,12 @@ if [ -f "$INJECTOR" ] && [ "${XFACTORVR_USE_INJECTOR:-1}" = "1" ]; then
     # Destino de los hooks: por defecto el render del juego.
     export XFACTORVR_HOOK_TARGET="${XFACTORVR_HOOK_TARGET:-GameRenderer::render}"
     export XFACTORVR_HOOK_EVERY="${XFACTORVR_HOOK_EVERY:-60}"
+    # ESTEREO REAL: el motor dibuja el mundo desplazado a la izquierda en un
+    # frame y a la derecha en el siguiente, y el visor muestra cada vista en
+    # su ojo.  El desplazamiento va en pixeles del framebuffer (24 px es el
+    # paralaje de una IPD de 64 mm a un metro de distancia).  Con 0 se
+    # desactiva (el visor entonces desplaza la UV: efecto "TV 3D").
+    export XFACTORVR_3D_CAMARA="${XFACTORVR_3D_CAMARA:-24}"
     # Envio del render real al visor VR: el APK escucha en 127.0.0.1:27020
     # y el juego le manda el framebuffer del mundo (protocolo XFV1).
     # Se puede desactivar con XFACTORVR_STREAM=0.

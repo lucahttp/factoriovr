@@ -248,7 +248,7 @@ pub fn toca_enviar() -> bool {
 ///
 /// Reduce la imagen al tamano objetivo y la manda. Devuelve `true` si se
 /// puso en manos del hilo emisor.
-pub fn enviar(pix: &[u8], w: u32, h: u32) -> bool {
+pub fn enviar(pix: &[u8], w: u32, h: u32, ojo: u8) -> bool {
     let cfg = match config() {
         Some(c) => c,
         None => return false,
@@ -275,7 +275,11 @@ pub fn enviar(pix: &[u8], w: u32, h: u32) -> bool {
 
     // El paquete es cabecera + carga: va entero al canal, el hilo emisor lo
     // escribe tal cual en el socket.
-    let paquete = empaquetar(numero, w2, h2, 0, &datos);
+    //
+    // flags bit 0: el ojo al que pertenece el frame (0 = izquierdo,
+    // 1 = derecho).  Con la camara desplazada por ojo, el visor muestra cada
+    // vista en el ojo que le toca (estereo real).
+    let paquete = empaquetar(numero, w2, h2, ojo & 1, &datos);
 
     let canal = {
         let c = estado().canal.lock().unwrap_or_else(|p| p.into_inner());
@@ -468,7 +472,7 @@ mod tests {
         configurar_para_test(format!("127.0.0.1:{puerto}"), 2, 2, 30);
 
         let pix = vec![9u8; 2 * 2 * 4];
-        assert!(enviar(&pix, 2, 2), "el frame deberia haberse enviado");
+        assert!(enviar(&pix, 2, 2, 0), "el frame deberia haberse enviado");
 
         let buf = lector.join().expect("hilo muerto");
         assert_eq!(&buf[0..4], &MAGIC.to_le_bytes());

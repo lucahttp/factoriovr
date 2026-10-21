@@ -36,13 +36,21 @@ SAVE="/factorio/saves/freeplay.zip"
 VENTANA_ANCHO=1280
 VENTANA_ALTO=720
 PUERTO=27020
+# El RCON del CLIENTE grafico: por el se manda la orden de crear la maquina
+# (no depende del foco de la ventana, que en un Xvfb sin gestor de ventanas
+# es un problema).
+RCON_CLIENTE=27022
+RCON_PASSWORD=xfactorvr
 STREAM_ANCHO=640
 STREAM_ALTO=360
 STREAM_FPS=10
+# Desplazamiento de la camara del motor, en pixeles (0 = desactivado).
+CAMARA_DESPLAZAMIENTO=0
 
 for arg in "$@"; do
     case "$arg" in
         --timeout) TIMEOUT="${2:-300}"; shift ;;
+        --camara) CAMARA_DESPLAZAMIENTO="${2:-0}"; shift ;;
     esac
 done
 
@@ -86,6 +94,9 @@ fi
 "$PODMAN" cp "$PROJECT_ROOT/scripts/receptor_stream.py" "$CONTAINER:/tmp/receptor_stream.py" >/dev/null 2>&1 \
     || "$PODMAN" exec -i "$CONTAINER" sh -c 'cat > /tmp/receptor_stream.py' < "$PROJECT_ROOT/scripts/receptor_stream.py" \
     || fail "no se pudo copiar el receptor al contenedor"
+"$PODMAN" cp "$PROJECT_ROOT/scripts/rcon_probe.py" "$CONTAINER:/tmp/rcon_probe.py" >/dev/null 2>&1 \
+    || "$PODMAN" exec -i "$CONTAINER" sh -c 'cat > /tmp/rcon_probe.py' < "$PROJECT_ROOT/scripts/rcon_probe.py" \
+    || fail "no se pudo copiar el cliente RCON al contenedor"
 ok ".so y receptor copiados"
 
 # --------------------------------------------------------------------------
@@ -123,7 +134,7 @@ say "=== 4. Arrancando el receptor de frames (puerto $PUERTO) ==="
 "$PODMAN" exec "$CONTAINER" bash -c "pkill -9 -f receptor_stream.py" >/dev/null 2>&1 || true
 "$PODMAN" exec "$CONTAINER" rm -f "$RESUMEN_CONT" >/dev/null 2>&1 || true
 "$PODMAN" exec -d "$CONTAINER" bash -c "
-python3 /tmp/receptor_stream.py --host 127.0.0.1 --puerto $PUERTO --salida $RESUMEN_CONT --timeout $((TIMEOUT + 60)) > /factorio/receptor.log 2>&1
+python3 /tmp/receptor_stream.py --host 127.0.0.1 --puerto $PUERTO --salida $RESUMEN_CONT --png /factorio/frame_cubo.png --timeout $((TIMEOUT + 60)) > /factorio/receptor.log 2>&1
 "
 sleep 2
 if ! "$PODMAN" exec "$CONTAINER" test -f "$RESUMEN_CONT" 2>/dev/null; then
@@ -153,11 +164,14 @@ export XFACTORVR_STREAM=127.0.0.1:$PUERTO
 export XFACTORVR_STREAM_ANCHO=$STREAM_ANCHO
 export XFACTORVR_STREAM_ALTO=$STREAM_ALTO
 export XFACTORVR_STREAM_FPS=$STREAM_FPS
+# Camara desplazada alterna por ojo: es el ESTEREO REAL (el motor dibuja dos
+# vistas y el visor muestra cada una en su ojo).
+export XFACTORVR_3D_CAMARA=$CAMARA_DESPLAZAMIENTO
 export XFACTORVR_STREAM_DEBUG_PNG=/factorio/stream_debug.png
 export XFACTORVR_AUTOSTART='$SAVE'
 export XFACTORVR_AUTOSTART_DELAY_S=6
 cd /factorio
-exec ./bin/arm64/factorio --window-size ${VENTANA_ANCHO}x${VENTANA_ALTO} > $LOG_CLIENT 2>&1
+exec ./bin/arm64/factorio --window-size ${VENTANA_ANCHO}x${VENTANA_ALTO} --rcon-port $RCON_CLIENTE --rcon-password '$RCON_PASSWORD' > $LOG_CLIENT 2>&1
 "
 }
 
@@ -201,7 +215,25 @@ enfocar_juego() {
         true
     " >/dev/null 2>&1 || true
 }
+# Primero por RCON: es determinista.
+maquina_por_rcon() {
+    local cmd='/silent-command local p = game.player.position; local e = game.surfaces[1].create_entity{name="assembling-machine-1", position={p.x+4, p.y}}; if e then rcon.print("MQUINA CREADA") else rcon.print("NO SE PUDO") end'
+    printf '%s' "$cmd" > "$LOG_DIR/consola_rcon.txt"
+    "$PODMAN" cp "$LOG_DIR/consola_rcon.txt" "$CONTAINER:/tmp/consola_rcon.txt" >/dev/null 2>&1 || true
+    "$PODMAN" exec -i "$CONTAINER" python3 /tmp/rcon_probe.py 127.0.0.1 $RCON_CLIENTE '$RCON_PASSWORD' "$(cat "$LOG_DIR/consola_rcon.txt")" >/dev/null 2>&1 || true
+    sleep 4
+}
+
 for intento in 1 2 3; do
+    # El RCON del cliente: si esta abierto, la maquina se crea por ahi.
+    if "$PODMAN" exec "$CONTAINER" bash -c "exec 3<>/dev/tcp/127.0.0.1/$RCON_CLIENTE" 2>/dev/null; then
+        maquina_por_rcon
+        "$PODMAN" exec "$CONTAINER" cat "$LOG_CLIENT" > "$LOG_LOCAL" 2>/dev/null
+        if grep -q "caja: mundo=" "$LOG_LOCAL" 2>/dev/null; then
+            ok "maquina creada por RCON (el cubo 3D se dibuja)"
+            break
+        fi
+    fi
     enfocar_juego
     "$PODMAN" exec "$CONTAINER" bash -c "DISPLAY=$DISPLAY_NUM xdotool key grave" >/dev/null 2>&1 || true
     sleep 2
@@ -268,9 +300,30 @@ ok "la maquina se creo (hay entidad que se dibuja en 3D)"
 
 # El cubo son miles de pixeles magenta: un par de pixeles seria ruido.
 if [ "${max_cubo:-0}" -lt 100 ] 2>/dev/null; then
-    fail "los frames llegaron pero el cubo 3D no se ve (max_pixeles_cubo=$max_cubo, hacen falta hundreds)"
+    fail "los frames llegaron pero el cubo 3D no se ve (max_pixeles_cubo=$max_cubo, hacen falta cientos)"
 fi
 ok "$con_cubo frames con el cubo 3D dentro (maximo $max_cubo pixeles)"
+
+# Con la camara desplazada, las dos vistas tienen que diferir: el cubo sale
+# mas a la izquierda en una que en la otra.  Es el paralaje real.
+X_IZQ=$(python3 -c "import json;v=json.load(open('$RESUMEN_LOCAL')).get('cubo_x_izq');print(v if v is not None else -1)" 2>/dev/null || echo -1)
+X_DER=$(python3 -c "import json;v=json.load(open('$RESUMEN_LOCAL')).get('cubo_x_der');print(v if v is not None else -1)" 2>/dev/null || echo -1)
+if [ "$CAMARA_DESPLAZAMIENTO" != "0" ]; then
+    if [ "$X_IZQ" = "-1" ] || [ "$X_DER" = "-1" ]; then
+        fail "no hay frames de los dos ojos (izq=$X_IZQ der=$X_DER)"
+    fi
+    DIF=$(( X_IZQ > X_DER ? X_IZQ - X_DER : X_DER - X_IZQ ))
+    if [ "$DIF" -lt 5 ]; then
+        fail "las dos vistas son casi iguales (cubo izq=$X_IZQ der=$X_DER): la camara no se desplaza"
+    fi
+    ok "paralaje real: el cubo sale en x=$X_IZQ (izq) y x=$X_DER (der), diferencia $DIF px"
+fi
+
+# El frame con mas pixeles del cubo (lo guarda el receptor).
+if "$PODMAN" exec "$CONTAINER" test -f /factorio/frame_cubo.png 2>/dev/null; then
+    "$PODMAN" exec "$CONTAINER" cat /factorio/frame_cubo.png > "$LOG_DIR/frame_cubo.png" 2>/dev/null || true
+    ok "frame con el cubo: $LOG_DIR/frame_cubo.png"
+fi
 
 # El PNG de diagnostico es lo que se manda de verdad: se reduce DENTRO del
 # contenedor (los ficheros grandes se cortan al copiarlos) y se trae la

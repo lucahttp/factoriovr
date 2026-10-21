@@ -134,6 +134,9 @@ fi
 export XFACTORVR_HOOK_TARGET="${XFACTORVR_HOOK_TARGET:-GameRenderer::render}"
 export XFACTORVR_HOOK_EVERY="${XFACTORVR_HOOK_EVERY:-60}"
 export XFACTORVR_3D="${XFACTORVR_3D:-1}"
+# ESTEREO REAL: el motor dibuja el mundo desplazado a la izquierda en un frame
+# y a la derecha en el siguiente, y el visor muestra cada vista en su ojo.
+export XFACTORVR_3D_CAMARA="${XFACTORVR_3D_CAMARA:-24}"
 # El visor VR (el APK) escucha en 127.0.0.1:27020 y pinta lo que llega.
 export XFACTORVR_STREAM="${XFACTORVR_STREAM:-127.0.0.1:27020}"
 export XFACTORVR_STREAM_ANCHO="${XFACTORVR_STREAM_ANCHO:-640}"

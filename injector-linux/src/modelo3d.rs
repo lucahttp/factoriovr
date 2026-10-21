@@ -146,6 +146,25 @@ static CAPTURAR_VOLTEADA: AtomicU64 = AtomicU64::new(0);
 /// Ya se ha hecho el diagnostico del estado de GL (una sola vez).
 static DIAG_GL: AtomicU64 = AtomicU64::new(0);
 
+/// Desplazamiento de la camara del motor, en pixeles del framebuffer.
+///
+/// Es lo que hace el ESTEREO REAL: el motor dibuja el mundo desplazado a la
+/// derecha en un frame y a la izquierda en el siguiente, y el visor muestra
+/// cada vista en el ojo que le toca.  La imagen que dibuja el motor es de
+/// verdad (con el 3D dentro), asi que el paralaje es el de verdad.
+///
+/// Cero = desactivado (lo de antes: el visor desplaza la UV).
+static DESPLAZAMIENTO_CAMARA: AtomicU64 = AtomicU64::new(0);
+
+/// Numero de frame del motor (lo lleva la cuenta el hook de render).
+static FRAME: AtomicU64 = AtomicU64::new(0);
+
+/// Frame en el que se capturo la camara BASE (sin desplazar).
+static FRAME_CAMARA: AtomicU64 = AtomicU64::new(u64::MAX);
+
+/// La camara BASE (sin desplazar) del frame actual.
+static CAMARA_BASE: Mutex<(u64, f64)> = Mutex::new((u64::MAX, 0.0));
+
 /// Diagnostico del streaming: frames enviados y frames con el cubo, por
 /// flush (sprites / instanced / primitives / text).
 static STAT_ORIGEN: [AtomicU64; 4] = [
@@ -990,6 +1009,72 @@ fn leer_direccion(this: *mut c_void) -> u8 {
 /// cuenta que hace `SpriteDrawOrder::setup`, desensamblada):
 ///
 ///     mundo = (mapa / 256) * (32 * escala) - camara
+
+// --------------------------------------------------------------------------
+// Estereo real: desplazar la camara del motor por ojo
+// --------------------------------------------------------------------------
+
+/// El desplazamiento configurado (en pixeles). Cero = desactivado.
+pub fn desplazamiento_camara() -> f64 {
+    f64::from_bits(DESPLAZAMIENTO_CAMARA.load(Ordering::Relaxed))
+}
+
+/// Avisa de que empieza un frame nuevo (lo llama el hook de render).
+///
+/// El desplazamiento de camara alterna: un frame a la derecha, el siguiente a
+/// la izquierda.  Asi el visor puede enseñar cada vista en el ojo que le
+/// corresponde y el paralaje es REAL (lo ha dibujado el motor).
+pub fn nuevo_frame() {
+    FRAME.fetch_add(1, Ordering::Relaxed);
+}
+
+/// El ojo al que pertenece el frame actual: 0 = izquierdo, 1 = derecho.
+pub fn ojo_actual() -> u8 {
+    (FRAME.load(Ordering::Relaxed) & 1) as u8
+}
+
+/// Desplaza la camara del motor ANTES de que dibuje.
+///
+/// La camara vive en los `RenderParameters` que el motor pasa al `DrawQueue`
+/// (offset +0x1b8).  El motor calcula la posicion de cada sprite con ella
+/// (`mundo = (mapa / 256) * (32 * escala) - camara`), asi que escribiendola
+/// aqui ANTES del original, todo el frame sale desplazado lo mismo.
+///
+/// Se escribe un valor ABSOLUTO (la camara base + el desplazamiento), no un
+/// "sumar": si no, la camara se iria acumulando frame a frame.
+fn aplicar_desplazamiento_camara(this: *mut c_void) {
+    let d = desplazamiento_camara();
+    if d == 0.0 || this.is_null() {
+        return;
+    }
+    // El primer puntero del DrawQueue son los RenderParameters.
+    // SAFETY: `this` es el `DrawQueue` (ver el hook de abajo).
+    let rp = unsafe { std::ptr::read_unaligned(this as *const *mut c_void) };
+    if rp.is_null() {
+        return;
+    }
+    let p = rp as usize;
+    let frame = FRAME.load(Ordering::Relaxed);
+
+    // La camara base: la que tiene el motor al empezar el frame.
+    let base = {
+        let mut g = CAMARA_BASE.lock().unwrap_or_else(|p| p.into_inner());
+        if g.0 != frame {
+            // SAFETY: offset verificado en el desensamblado de
+            // `SpriteDrawOrder::setup` (la camara esta en +0x1b8).
+            let actual = unsafe { std::ptr::read_unaligned((p + 0x1b8) as *const f64) };
+            *g = (frame, actual);
+        }
+        g.1
+    };
+
+    // El desplazamiento alterna de signo cada frame.
+    let signo = if ojo_actual() == 0 { 1.0 } else { -1.0 };
+    let desplazada = base + signo * d;
+    // SAFETY: offset verificado (ver arriba).
+    unsafe { std::ptr::write_unaligned((p + 0x1b8) as *mut f64, desplazada) };
+}
+
 #[no_mangle]
 pub extern "C" fn xfv_hook_draw_queue(
     this: *mut c_void,
@@ -1014,6 +1099,10 @@ extern "C" fn hook_draw_queue(
     _size_x: f32,
     _size_y: f32,
 ) {
+    // El desplazamiento de camara va ANTES del original: el motor tiene que
+    // calcular las posiciones de los sprites con la camara ya desplazada.
+    aplicar_desplazamiento_camara(this);
+
     // El original primero: el sprite tiene que existir.
     let tramp = TRAMPOLIN_DQ.load(Ordering::Relaxed);
     if tramp != 0 {
@@ -1322,7 +1411,7 @@ fn leer_framebuffer(gl: &Gl, vp: &[i32; 4], origen: &str) -> Option<()> {
             log::aviso("no se pudo leer el framebuffer");
             return None;
         }
-        if crate::stream::enviar(&buf, w as u32, h as u32) {
+        if crate::stream::enviar(&buf, w as u32, h as u32, ojo_actual()) {
             log::info(&format!(
                 "frame transmitido al visor: {w}x{h} (enviados={}, perdidos={})",
                 crate::stream::enviados(),
@@ -2241,6 +2330,13 @@ pub fn configurar() {
     }
     if let Ok(v) = std::env::var("XFACTORVR_3D_CAPTURA") {
         CAPTURAR.store(if v != "0" { 1 } else { 0 }, Ordering::Relaxed);
+    }
+    if let Ok(v) = std::env::var("XFACTORVR_3D_CAMARA") {
+        if let Ok(d) = v.trim().parse::<f64>() {
+            if d.is_finite() {
+                DESPLAZAMIENTO_CAMARA.store(d.to_bits(), Ordering::Relaxed);
+            }
+        }
     }
     if let Ok(v) = std::env::var("XFACTORVR_3D_VOLTEAR") {
         CAPTURAR_VOLTEADA.store(if v != "0" { 1 } else { 0 }, Ordering::Relaxed);

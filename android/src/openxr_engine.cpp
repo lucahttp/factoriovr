@@ -2603,12 +2603,17 @@ struct GameFrame {
 };
 
 static std::mutex s_game_mutex;
-static GameFrame s_game_frame;
+// Una ranura por ojo: el motor dibuja el mundo desplazado a la izquierda en
+// un frame y a la derecha en el siguiente (estereo real), asi que el visor
+// guarda las DOS vistas y muestra cada una en su ojo.
+static GameFrame s_game_frame[2];
 static std::atomic<bool> s_game_corriendo{false};
 static std::atomic<uint64_t> s_game_frames{0};
-static GLuint s_tex_juego = 0;
-static uint16_t s_tex_juego_w = 0;
-static uint16_t s_tex_juego_h = 0;
+static GLuint s_tex_juego[2] = {0, 0};
+static uint16_t s_tex_juego_w[2] = {0, 0};
+static uint16_t s_tex_juego_h[2] = {0, 0};
+/// Ya han llegado vistas de los DOS ojos (estereo real del motor).
+static bool s_juego_estereo = false;
 static GLuint s_vao_juego = 0;
 static GLuint s_vbo_juego = 0;
 static int s_juego_vertices = 0;
@@ -2673,6 +2678,7 @@ static void* game_receiver_thread(void* /*arg*/) {
                 memcpy(&w, cab.data() + 8, 2);
                 memcpy(&h, cab.data() + 10, 2);
                 const uint8_t formato = cab[13];
+                const uint8_t flags = cab[12];
                 if (magic != 0x31564658u) {
                     LOGE("Cabecera desconocida del render del juego: 0x%08x", magic);
                     break;
@@ -2686,11 +2692,15 @@ static void* game_receiver_thread(void* /*arg*/) {
                 if (!leer_exacto(cli, pix.data(), tam)) break;
                 {
                     std::lock_guard<std::mutex> lock(s_game_mutex);
-                    s_game_frame.pix.swap(pix);
-                    s_game_frame.w = w;
-                    s_game_frame.h = h;
-                    s_game_frame.numero = numero;
-                    s_game_frame.nuevo = true;
+                    const int ranura = (flags & 1) ? 1 : 0;
+                    s_game_frame[ranura].pix.swap(pix);
+                    s_game_frame[ranura].w = w;
+                    s_game_frame[ranura].h = h;
+                    s_game_frame[ranura].numero = numero;
+                    s_game_frame[ranura].nuevo = true;
+                    if (s_game_frame[0].nuevo && s_game_frame[1].nuevo) {
+                        s_juego_estereo = true;
+                    }
                 }
                 s_game_frames.fetch_add(1);
             }
@@ -2735,7 +2745,7 @@ static void construir_panel_juego() {
 }
 
 /// Sube a la textura el frame mas reciente (si hay uno nuevo).
-static void subir_frame_juego() {
+static void subir_frame_juego(int ojo) {
     // El buffer del hilo de render y el del hilo receptor se intercambian:
     // asi los dos buffers (900 KB cada uno) van y vienen en vez de estar
     // reservandose y liberandose en cada frame.
@@ -2743,27 +2753,28 @@ static void subir_frame_juego() {
     uint16_t w = 0, h = 0;
     {
         std::lock_guard<std::mutex> lock(s_game_mutex);
-        if (!s_game_frame.nuevo) return;
-        s_pix.swap(s_game_frame.pix);
-        w = s_game_frame.w;
-        h = s_game_frame.h;
-        s_game_frame.nuevo = false;
+        if (ojo < 0 || ojo > 1) return;
+        if (!s_game_frame[ojo].nuevo) return;
+        s_pix.swap(s_game_frame[ojo].pix);
+        w = s_game_frame[ojo].w;
+        h = s_game_frame[ojo].h;
+        s_game_frame[ojo].nuevo = false;
     }
     if (w == 0 || h == 0 || s_pix.empty()) return;
 
-    if (s_tex_juego == 0) {
-        glGenTextures(1, &s_tex_juego);
-        glBindTexture(GL_TEXTURE_2D, s_tex_juego);
+    if (s_tex_juego[ojo] == 0) {
+        glGenTextures(1, &s_tex_juego[ojo]);
+        glBindTexture(GL_TEXTURE_2D, s_tex_juego[ojo]);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
     }
-    glBindTexture(GL_TEXTURE_2D, s_tex_juego);
-    if (w != s_tex_juego_w || h != s_tex_juego_h) {
+    glBindTexture(GL_TEXTURE_2D, s_tex_juego[ojo]);
+    if (w != s_tex_juego_w[ojo] || h != s_tex_juego_h[ojo]) {
         glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, s_pix.data());
-        s_tex_juego_w = w;
-        s_tex_juego_h = h;
+        s_tex_juego_w[ojo] = w;
+        s_tex_juego_h[ojo] = h;
     } else {
         glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, w, h, GL_RGBA, GL_UNSIGNED_BYTE, s_pix.data());
     }
@@ -2779,8 +2790,9 @@ static void draw_game_panel(const float* vp_mat, const float* model_mesa, bool o
     // En modo observador el mundo esta a escala 1:1 (x25) y el panel de la
     // mesa no tiene sentido ahi.
     if (s_observer_mode) return;
-    subir_frame_juego();
-    if (s_tex_juego == 0) return;
+    const int ojo = ojo_primario ? 0 : 1;
+    subir_frame_juego(ojo);
+    if (s_tex_juego[ojo] == 0) return;
     construir_panel_juego();
     if (s_vao_juego == 0) return;
 
@@ -2799,11 +2811,14 @@ static void draw_game_panel(const float* vp_mat, const float* model_mesa, bool o
     glUniform1f(s_lit_loc, 0.0f);
     glUniform3f(s_emissive_loc, 1.0f, 1.0f, 1.0f);
     glUniform1f(s_enable_clipping_loc, 0.0f);
-    // El ojo primario ve la imagen sin desplazar; el otro la desplaza un poco.
-    const float desfase = ojo_primario ? -JUEGO_PARALAJE : JUEGO_PARALAJE;
+    // Con el motor mandando DOS vistas (estereo real) no hay que desplazar
+    // nada: el paralaje ya viene en la imagen.  Si solo llega una vista
+    // (el motor no puede desplazar la camara), se desplaza la UV un poco,
+    // que es el efecto "TV 3D" de antes.
+    const float desfase = s_juego_estereo ? 0.0f : (ojo_primario ? -JUEGO_PARALAJE : JUEGO_PARALAJE);
     glUniform2f(s_uv_offset_loc, desfase, 0.0f);
     glActiveTexture(GL_TEXTURE0);
-    glBindTexture(GL_TEXTURE_2D, s_tex_juego);
+    glBindTexture(GL_TEXTURE_2D, s_tex_juego[ojo]);
     glUniform1i(s_tex_loc, 0);
 
     glEnable(GL_BLEND);

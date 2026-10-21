@@ -46,6 +46,9 @@ START_SERVER=1
 STRIP=0
 MODO_CLIENT=0
 MODO_CAMPANA=0
+# Cliente grafico LIGERO (binario del cliente + datos del headless, sin
+# audio): 280 MB en vez de 2 GB.  Con --completo se sube el paquete entero.
+CLIENTE_COMPLETO=0
 for arg in "$@"; do
     case "$arg" in
         --stream)   STREAM=1 ;;
@@ -53,6 +56,7 @@ for arg in "$@"; do
         --strip)    STRIP=1 ;;
         --client)   MODO_CLIENT=1 ;;
         --campana)  MODO_CLIENT=1; MODO_CAMPANA=1 ;;
+        --completo) CLIENTE_COMPLETO=1 ;;
     esac
 done
 
@@ -195,7 +199,38 @@ if [ "$MODO_CLIENT" -eq 1 ]; then
 
     CLIENT_TAR="$PROJECT_ROOT/build/factorio_client.tar"
     MESA_TAR="$PROJECT_ROOT/build/mesa.tar.gz"
-    COPYFILE_DISABLE=1 tar -cf "$CLIENT_TAR" -C "$(dirname "$LOCAL_CLIENT")" "$(basename "$LOCAL_CLIENT")"
+
+    # Cliente LIGERO (por defecto): el binario del cliente grafico (250 MB) con
+    # los datos del motor headless (82 MB) en vez de los 2 GB del paquete
+    # completo de Steam.
+    #
+    # Por que funciona: al motor grafico solo le falta el directorio de
+    # sonidos (1,2 GB) y las expansiones.  Los datos del headless traen la
+    # campana de la base, que es la que se juega; las expansiones (space-age,
+    # quality) se quitan porque el motor grafico no las trae y mezclarlas
+    # revienta al cargar los datos.  Validado en el contenedor ARM64.
+    #
+    # Con --completo se sube el paquete entero (2 GB), que ademas trae el
+    # audio del juego.
+    CLIENT_STAGE="$PROJECT_ROOT/build/factorio_stage_ligero/factorio"
+    if [ "$CLIENTE_COMPLETO" -eq 1 ]; then
+        echo "    empaquetando el cliente grafico COMPLETO (2 GB)..."
+        COPYFILE_DISABLE=1 tar -cf "$CLIENT_TAR" -C "$(dirname "$LOCAL_CLIENT")" "$(basename "$LOCAL_CLIENT")"
+    else
+        echo "    empaquetando el cliente grafico LIGERO (sin audio)..."
+        mkdir -p "$CLIENT_STAGE"
+        cp -R "$LOCAL_CLIENT/bin" "$CLIENT_STAGE/" 2>/dev/null || true
+        mkdir -p "$CLIENT_STAGE/data"
+        cp -R "$LOCAL_FACTORIO/data/." "$CLIENT_STAGE/data/" 2>/dev/null || true
+        # Las expansiones sobran (y chocan): el cliente grafico no las trae.
+        for extra in space-age quality elevated-rails recycler; do
+            rm -rf "$CLIENT_STAGE/data/$extra"
+        done
+        # El motor grafico espera base/sound: se crea vacio (sin audio).
+        mkdir -p "$CLIENT_STAGE/data/base/sound"
+        COPYFILE_DISABLE=1 tar -cf "$CLIENT_TAR" -C "$(dirname "$CLIENT_STAGE")" "$(basename "$CLIENT_STAGE")"
+    fi
+
     # El tar del payload de Mesa lo hace prepare_mesa.py con Python y
     # dereference=True: nunca guarda enlaces duros.  Con el tar del sistema
     # (bsdtar en macOS) no se puede pedir eso, y si el tar llevase enlaces
@@ -214,10 +249,11 @@ if [ "$MODO_CLIENT" -eq 1 ]; then
     echo "    cliente: $(du -h "$CLIENT_TAR" | cut -f1)  mesa: $(du -h "$MESA_TAR" | cut -f1)"
     "$ADB" shell "mkdir -p $REMOTE_CLIENT $REMOTE_MESA"
     "$ADB" push "$CLIENT_TAR" "$REMOTE_CLIENT/client.tar"
-    # El tar del cliente contiene la carpeta "factorio/": se extrae en
-    # /data/local/tmp para que quede en /data/local/tmp/factorio, que es la
-    # ruta que espera el script de arranque del cliente.
-    "$ADB" shell "cd /data/local/tmp && tar -xf factorio_client/client.tar && rm -f factorio_client/client.tar && chmod 755 factorio/bin/arm64/factorio && mkdir -p factorio/mods factorio/config factorio/saves"
+    # El tar del cliente contiene la carpeta "factorio/" (o el nombre del
+    # stage): se extrae en /data/local/tmp para que quede en
+    # /data/local/tmp/factorio, que es la ruta que espera el script de
+    # arranque del cliente.
+    "$ADB" shell "cd /data/local/tmp && rm -rf factorio && tar -xf factorio_client/client.tar && rm -f factorio_client/client.tar && chmod 755 factorio/bin/arm64/factorio && mkdir -p factorio/mods factorio/config factorio/saves"
     "$ADB" push "$MESA_TAR" "$REMOTE_MESA/mesa.tar.gz"
     # El tar contiene la carpeta "mesa/", asi que se extrae en /data/local/tmp
     # para que quede en /data/local/tmp/mesa, que es lo que espera el script

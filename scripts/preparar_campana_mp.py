@@ -223,6 +223,26 @@ local function jugador()
   if not ch then return nil end
   return _xfv_emulador(ch)
 end
+
+-- [XFactorVR-MP] El nivel solo avanza cuando le llega un evento del juego, y
+-- casi todos los que espera son de JUGADOR (seleccionar un mineral con el
+-- raton, abrir la GUI de fabricacion, minar...). Un personaje virtual no
+-- tiene controlador de GUI, asi que esos eventos no le llegan NUNCA y la
+-- historia se queda clavada.
+--
+-- Solucion: cuando no hay ningun jugador real conectado, se le pasa a la
+-- historia un evento sintetico de "accion del jugador" en cada tick. Las
+-- condiciones de los nodos son de ESTADO (selected, get_item_count, la
+-- distancia...), asi que el tutorial avanza en cuanto el jugador virtual ha
+-- hecho lo que el nodo pide. Con un jugador real conectado esto NO se hace:
+-- el nivel se comporta exactamente igual que siempre.
+script.on_event(defines.events.on_tick, function(event)
+  if game.players[1] then return end
+  if game.tick_paused then return end
+  local st = storage.story
+  if not st then return end
+  story_update(st, { name = "script_raised_built", tick = event.tick }, "level-02")
+end)
 -- [XFactorVR-MP] ==================================================================
 '''
 

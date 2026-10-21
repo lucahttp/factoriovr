@@ -462,6 +462,238 @@ local function inv_remove_any(names, count)
     return 0
 end
 
+-- ---------------------------------------------------------------------------
+-- Barra rapida virtual
+--
+-- En VR el inventario del jugador se DIBUJA pero no es interactivo: no se
+-- pueden coger items con las manos. El tutorial de campana tiene un nodo
+-- ("add_filter") que exige que la perforadora este en la barra rapida como
+-- filtro. Con esta ayuda el mod lo pone solo: cuando el actor lleva un item
+-- que el nivel puede usar de la barra, lo mete en la primera ranura libre y
+-- el nodo se resuelve sin tocar la UI del visor.
+--
+-- OJO: NUNCA se pisa una ranura que el jugador haya puesto a mano. Esas
+-- ranuras se apuntan en `xfactorvr_bar_manual` y el mod automatico no las
+-- toca (solo rellena las vacias y las que el propio mod habia rellenado).
+-- ---------------------------------------------------------------------------
+
+-- Items que el nivel de campana puede necesitar en la barra rapida.
+local QUICK_BAR_ITEMS = {
+    "burner-mining-drill",   -- el filtro que pide el nodo "add_filter"
+    "stone-furnace",
+    "iron-chest",
+    "wooden-chest",
+    "iron-ore",
+    "copper-ore",
+    "coal",
+    "stone",
+    "iron-plate",
+    "copper-plate",
+    "iron-gear-wheel",
+}
+
+--- La barra rapida virtual y el registro de ranuras puestas a mano.
+local function barra_rapida()
+    local st = state()
+    if not st.xfactorvr_bar then st.xfactorvr_bar = {} end
+    if not st.xfactorvr_bar_manual then st.xfactorvr_bar_manual = {} end
+    return st.xfactorvr_bar, st.xfactorvr_bar_manual
+end
+
+--- ¿Esta este nombre en la lista?
+local function esta_en_lista(lista, nombre)
+    for _, n in ipairs(lista) do
+        if n == nombre then return true end
+    end
+    return false
+end
+
+--- ¿Esta este item en la barra?
+local function esta_en_barra(bar, nombre)
+    for _, n in pairs(bar) do
+        if n == nombre then return true end
+    end
+    return false
+end
+
+--- La primera ranura libre de la barra (nil si no queda ninguna).
+local function primera_ranura_libre(bar, manual)
+    for page = 1, 4 do
+        for slot = 1, 10 do
+            local clave = tostring(page) .. "_" .. tostring(slot)
+            if bar[clave] == nil and not manual[clave] then
+                return clave
+            end
+        end
+    end
+    return nil
+end
+
+--- Actualiza la barra rapida virtual con lo que lleva el actor.
+---
+--- Rellena las ranuras libres con los items que lleva el actor (el real o el
+--- virtual) y vacia las que el propio mod habia rellenado y que ya no se
+--- llevan. Las ranuras puestas a mano no se tocan.
+local function actualizar_barra_rapida()
+    local bar, manual = barra_rapida()
+
+    -- 1. Lo que lleva el actor.
+    local carried = {}
+    for _, nombre in ipairs(QUICK_BAR_ITEMS) do
+        if inv_get(nombre) > 0 then
+            carried[#carried + 1] = nombre
+        end
+    end
+    if #carried == 0 then return end
+
+    -- 2. Las ranuras automaticas cuyo item ya no se lleva se vacian.
+    for clave, nombre in pairs(bar) do
+        if not manual[clave] and not esta_en_lista(carried, nombre) then
+            bar[clave] = nil
+        end
+    end
+
+    -- 3. Los items que faltan van a la primera ranura libre.
+    for _, nombre in ipairs(carried) do
+        if not esta_en_barra(bar, nombre) then
+            local clave = primera_ranura_libre(bar, manual)
+            if clave then
+                bar[clave] = nombre
+            end
+        end
+    end
+end
+
+-- ---------------------------------------------------------------------------
+-- Combustible de las maquinas
+--
+-- En VR el inventario no es interactivo, asi que el jugador no puede meter
+-- carbon en el horno a mano. El nodo "put-coal" del tutorial lo espera, asi
+-- que al interactuar con una maquina el mod le mete el combustible que lleva
+-- el actor.
+-- ---------------------------------------------------------------------------
+
+--- Mete carbon en una maquina (horno, perforadora de combustible) si el actor
+--- lleva carbon y la maquina no tiene. Devuelve cuantos items se metieron.
+local function abastecer_combustible(e)
+    if not e or not e.valid then return 0 end
+
+    local ok_fuel, fuel_inv = pcall(function() return e.get_fuel_inventory() end)
+    if not (ok_fuel and fuel_inv) then return 0 end
+
+    local ok_count, count = pcall(function() return fuel_inv.get_item_count("coal") end)
+    if not (ok_count and count) then return 0 end
+    if count >= 1 then return 0 end
+
+    if inv_get("coal") <= 0 then return 0 end
+
+    local removed = inv_remove("coal", 1)
+    if removed <= 0 then return 0 end
+
+    local ok, inserted = pcall(function()
+        return fuel_inv.insert({ name = "coal", count = 1 })
+    end)
+    if not (ok and inserted and inserted > 0) then
+        -- Si no se ha podido meter, el carbon vuelve al bolsillo.
+        inv_add("coal", 1)
+        return 0
+    end
+    return inserted
+end
+
+-- ---------------------------------------------------------------------------
+-- Recoger items del suelo
+--
+-- El juego solo lanza on_player_mined_entity cuando hay un JUGADOR REAL (con
+-- su controlador). Un personaje virtual no lo lanza nunca, asi que el ultimo
+-- nodo del tutorial ("show-miner-blockage") se queda clavado. El mod anota
+-- aqui el minado y el escenario parcheado se lo pasa a la historia.
+-- ---------------------------------------------------------------------------
+
+--- Recoge un item del suelo (entidad "item-on-ground") y lo mete en el
+--- inventario del actor. Devuelve true si el item ha acabado en el
+--- inventario.
+---
+--- OJO: hay dos trampas aqui (las dos costaron una tarde):
+---
+---  1. La API de 2.1 NO tiene `entity.item`: la pila del item del suelo
+---     esta en `entity.stack`. Con `item` el pcall se come el error y el
+---     item se pierde.
+---  2. `mine_entity` NO borra la entidad al instante: el personaje "coge"
+---     el item y la entidad sigue viva un par de ticks. Por eso no se puede
+---     mirar si la entidad sigue viva, sino lo que devuelve mine_entity.
+---
+--- Con un JUGADOR DE VERDAD se deja que lo haga el motor (asi el juego
+--- lanza sus eventos de verdad). Con el PERSONAJE VIRTUAL se coge a mano:
+--- el motor lo hace de forma asincrona y a veces no llega.
+local function recoger_item_del_suelo(e)
+    local p = actor()
+    if not p then return false end
+
+    -- 1) Camino normal (solo con jugador real): que lo haga el motor.
+    if real_player() then
+        local ok, minado = pcall(function() return p.mine_entity(e, true) end)
+        if ok and minado then return true end
+    end
+
+    -- 2) A mano: se lee la pila del item y se mete en el inventario.
+    local ok_stack, stack = pcall(function() return e.stack end)
+    if not (ok_stack and stack) then return false end
+
+    local ok_nombre, nombre = pcall(function() return stack.name end)
+    local ok_cant, cantidad = pcall(function() return stack.count end)
+    if not (ok_nombre and ok_cant) then return false end
+    if not nombre or not cantidad or cantidad <= 0 then
+        pcall(function() e.destroy() end)
+        return false
+    end
+
+    local inv = actor_inventory()
+    if not inv then return false end
+
+    local spec = { name = nombre, count = cantidad }
+    local ok_cal, calidad = pcall(function() return stack.quality end)
+    if ok_cal and calidad then spec.quality = calidad end
+
+    local ok_ins, inserted = pcall(function() return inv.insert(spec) end)
+    if not (ok_ins and inserted and inserted > 0) then return false end
+
+    -- El item ya esta en la mochila: la entidad del suelo sobra.
+    pcall(function() e.destroy() end)
+    return true
+end
+
+--- Anota que el actor ha recogido un item del suelo.
+---
+--- El escenario parcheado pregunta por el remoto "get_mined_item" y le pasa
+--- a la historia el mismo evento (on_player_mined_entity) que habria
+--- lanzado el juego.
+local function anotar_minado(nombre, pos)
+    state().xfactorvr_minado = {
+        name = nombre,
+        position = pos,
+        tick = game.tick,
+    }
+end
+
+--- Busca el item del suelo mas cercano a un punto. Devuelve la entidad o nil.
+---
+--- OJO: se filtra por nombre ("item-on-ground") y no por "lo que haya": al
+--- lado del item esta la perforadora, y si se mina lo que se pille se
+--- demoleria.
+local function buscar_item_del_suelo(surface, x, y)
+    if not surface then return nil end
+    local found = surface.find_entities_filtered({
+        position = { x, y },
+        radius = 1.0,
+        name = "item-on-ground",
+    })
+    for _, e in ipairs(found) do
+        if e.valid then return e end
+    end
+    return nil
+end
+
 --- Vacia un inventario de una entidad en el inventario del actor.
 --- Devuelve cuantos items se han movido.
 local function loot_inventory(inv)
@@ -820,14 +1052,33 @@ remote.add_interface("xfactorvr", {
         end
 
         inv_remove_any(alternatives, 1)
+        actualizar_barra_rapida()
         rcon.print("OK")
         return true
     end,
 
     -- Mina un edificio y devuelve sus materiales al inventario.
+    --
+    -- Si en el sitio hay un item del suelo, se recoge ese (es lo que el
+    -- jugador haria) y NO se toca el resto: al lado del item suele estar la
+    -- perforadora, y demolerla rompe la campana.
     mine_entity = function(x, y)
         local surface = game.surfaces[1]
         if not surface then return false end
+
+        local item = buscar_item_del_suelo(surface, x, y)
+        if item then
+            local nombre = item.name
+            local pos = { x = item.position.x, y = item.position.y }
+            if recoger_item_del_suelo(item) then
+                anotar_minado(nombre, pos)
+                actualizar_barra_rapida()
+                rcon.print("OK")
+                return true
+            end
+            rcon.print("ERR|no_pick")
+            return false
+        end
 
         local found = surface.find_entities_filtered({
             position = { x, y },
@@ -846,12 +1097,49 @@ remote.add_interface("xfactorvr", {
                     local ok2 = pcall(function() e.destroy() end)
                     if not ok2 then return false end
                 end
+                actualizar_barra_rapida()
                 rcon.print("OK")
                 return true
             end
         end
         rcon.print("ERR|no_entity")
         return false
+    end,
+
+    -- Recoge un item del suelo (la entidad "item-on-ground").
+    --
+    -- Es la version "de jugador" de minar: el juego lanza on_player_mined_entity
+    -- cuando un JUGADOR recoge un item del suelo. Un personaje virtual no lo
+    -- lanza nunca, asi que el item se recoge a mano y se anota, para que el
+    -- escenario parcheado le pase a la historia ese mismo evento.
+    pick_up_item = function(x, y)
+        local surface = game.surfaces[1]
+        if not surface then
+            rcon.print("ERR|no_surface")
+            return false
+        end
+
+        local e = buscar_item_del_suelo(surface, x, y)
+        if not e then
+            rcon.print("ERR|no_item")
+            return false
+        end
+
+        -- El nombre y la posicion se copian ANTES de recogerlo.
+        local nombre = e.name
+        local pos = { x = e.position.x, y = e.position.y }
+
+        if not recoger_item_del_suelo(e) then
+            rcon.print("ERR|no_pick")
+            return false
+        end
+
+        -- El juego solo lanza on_player_mined_entity con un JUGADOR REAL: se
+        -- anota para que el escenario parcheado se lo pase a la historia.
+        anotar_minado(nombre, pos)
+        actualizar_barra_rapida()
+        rcon.print("OK")
+        return true
     end,
 
     -- Minado manual con pico sobre una veta. Devuelve el id del mineral.
@@ -876,6 +1164,7 @@ remote.add_interface("xfactorvr", {
                         local ok = pcall(function() e.amount = amount - 1 end)
                         if ok then
                             inv_add(e.name, 1)
+                            actualizar_barra_rapida()
                             rcon.print(tostring(ore))
                             return ore
                         end
@@ -923,13 +1212,9 @@ remote.add_interface("xfactorvr", {
             end
 
             -- 2. Abastecer de combustible (solo hornos de combustible).
-            local ok_fuel, fuel_inv = pcall(function() return e.get_fuel_inventory() end)
-            if ok_fuel and fuel_inv then
-                if fuel_inv.get_item_count("coal") < 1 and inv_get("coal") > 0 then
-                    inv_remove("coal", 1)
-                    pcall(function() fuel_inv.insert({ name = "coal", count = 1 }) end)
-                end
-            end
+            -- En VR el inventario no es interactivo: sin esta ayuda el nodo
+            -- "put-coal" del tutorial no se resuelve nunca.
+            abastecer_combustible(e)
 
             -- 3. Sin nada que recoger: la ensambladora rota de receta.
             if looted == 0 and e.type == "assembling-machine" then
@@ -1037,6 +1322,12 @@ remote.add_interface("xfactorvr", {
             end
         end
 
+        -- Abastecer de combustible: en VR el inventario no es interactivo, asi
+        -- que al interactuar con el horno se le mete el carbon que lleva el
+        -- actor (nodo "put-coal" del tutorial).
+        abastecer_combustible(mejor)
+
+        actualizar_barra_rapida()
         rcon.print("OK|" .. tostring(cogido))
         return true
     end,
@@ -1131,6 +1422,7 @@ remote.add_interface("xfactorvr", {
             local after = 0
             pcall(function() after = tonumber(a.crafting_queue_size) or 0 end)
             if after > before then
+                actualizar_barra_rapida()
                 rcon.print("OK")
                 return true
             end
@@ -1160,6 +1452,7 @@ remote.add_interface("xfactorvr", {
             inv_add(product.name, (product.amount or 1) * count)
         end
 
+        actualizar_barra_rapida()
         rcon.print("OK")
         return true
     end,
@@ -1258,19 +1551,55 @@ remote.add_interface("xfactorvr", {
     -- Un personaje no tiene barra rapida (es cosa del jugador con raton),
     -- pero el nivel de campana mira si el jugador tiene la perforadora
     -- asignada a un hueco antes de dejarle colocarla.
+    --
+    -- OJO: una ranura puesta aqui es "del jugador": el mod automatico no la
+    -- pisa nunca (ver actualizar_barra_rapida).
     set_quick_bar = function(page, slot, item_name)
         page = page or 1
         slot = slot or 1
-        local st = state()
-        if not st.xfactorvr_bar then st.xfactorvr_bar = {} end
+        local bar, manual = barra_rapida()
         local clave = tostring(page) .. "_" .. tostring(slot)
         if item_name and item_name ~= "" then
-            st.xfactorvr_bar[clave] = item_name
+            bar[clave] = item_name
+            manual[clave] = true
         else
-            st.xfactorvr_bar[clave] = nil
+            bar[clave] = nil
+            manual[clave] = nil
         end
         rcon.print("OK")
         return true
+    end,
+
+    -- Contenido de la barra rapida virtual: "1_1=iron-ore;1_2=coal".
+    -- El "!" detrás del item marca una ranura puesta a mano.
+    -- Lo usa el banco de pruebas y el visor.
+    get_quick_bar = function()
+        local bar, manual = barra_rapida()
+        local partes = {}
+        for clave, nombre in pairs(bar) do
+            partes[#partes + 1] = clave .. "=" .. nombre ..
+                (manual[clave] and "!" or "")
+        end
+        table.sort(partes)
+        local out = table.concat(partes, ";")
+        rcon.print(out)
+        return out
+    end,
+
+    -- Dice si el actor ha recogido un item del suelo desde la ultima vez que
+    -- se pregunto (y lo consume).
+    --
+    -- El juego solo lanza on_player_mined_entity cuando hay un JUGADOR REAL
+    -- (con su controlador); un personaje virtual no lo lanza nunca. El
+    -- escenario parcheado usa este remoto para darle a la historia el mismo
+    -- evento que habria lanzado el juego (nodo "show-miner-blockage").
+    get_mined_item = function()
+        local st = state()
+        local info = st.xfactorvr_minado
+        st.xfactorvr_minado = nil
+        if not info then return nil end
+        rcon.print("MINED|" .. tostring(info.name))
+        return info
     end,
 
     -- Mete items en el inventario de una maquina (al horno, al quemador).
@@ -1299,6 +1628,7 @@ remote.add_interface("xfactorvr", {
                     return inv.insert({ name = item_name, count = count })
                 end)
                 if ok and inserted and inserted > 0 then
+                    actualizar_barra_rapida()
                     rcon.print("OK|" .. tostring(inserted))
                     return true
                 end
@@ -1341,6 +1671,14 @@ if event_tick and script.on_event then
         end
 
         st.xfactorvr_tick = (st.xfactorvr_tick or 0) + 1
+
+        -- La barra rapida virtual se refresca dos veces por segundo: puede
+        -- que el actor coja items sin pasar por un remoto del mod (por
+        -- ejemplo si el juego le da algo solo).
+        if (st.xfactorvr_tick % 30) == 0 then
+            actualizar_barra_rapida()
+        end
+
         -- Cada 5 segundos se comprueba que el personaje sigue en pie.
         if (st.xfactorvr_tick % 300) ~= 0 then return end
         if real_player() then return end

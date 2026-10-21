@@ -104,12 +104,30 @@ STUB_JUGADOR = '''
 -- no existe); los que necesitan el mundo (get_item_count, can_reach_entity,
 -- cursor_stack, position, force, surface, character) leen del personaje de
 -- verdad.
-local function _xfv_personaje_virtual()
-  local info = nil
+--
+-- OJO: la info del remoto se cachea por tick. El nodo "add_filter" del
+-- tutorial mira los 40 huecos de la barra rapida (4 paginas x 10) y cada
+-- consulta es una llamada al remoto: sin cache serian 40 llamadas por tick.
+local _xfv_cache_ok = false
+local _xfv_cache_tick = nil
+local _xfv_cache_info = nil
+
+local function _xfv_info()
+  if _xfv_cache_ok and _xfv_cache_tick == game.tick then
+    return _xfv_cache_info
+  end
+  _xfv_cache_ok = true
+  _xfv_cache_tick = game.tick
+  _xfv_cache_info = nil
   local ok, res = pcall(function()
     return remote.call("xfactorvr", "get_virtual_player")
   end)
-  if ok then info = res end
+  if ok then _xfv_cache_info = res end
+  return _xfv_cache_info
+end
+
+local function _xfv_personaje_virtual()
+  local info = _xfv_info()
   if type(info) ~= "table" then return nil, nil end
 
   local un = info.unit_number
@@ -248,6 +266,35 @@ local function jugador()
   return _xfv_emulador(ch, info)
 end
 
+-- [XFactorVR-MP] El ULTIMO nodo del tutorial (show-miner-blockage) espera
+-- este evento:
+--
+--     if event.name == defines.events.on_player_mined_entity
+--        and event.entity.name == 'item-on-ground' then
+--
+-- Ese evento es del JUEGO, no del script: solo se lanza si hay un JUGADOR REAL
+-- (con su controlador). Un personaje virtual no lo lanza nunca, por mucho que
+-- mine la entidad del suelo, asi que la historia se queda clavada ahi.
+--
+-- El mod anota cuando el jugador virtual recoge un item del suelo y lo
+-- cuenta por el remoto. Aqui se le pasa a la historia el mismo evento que
+-- habria lanzado el juego, con la entidad "item-on-ground".
+local function _xfv_minado_pendiente(tick)
+  -- Lo que ya se sabe y todavia no ha servido (puede que el nodo no estuviera
+  -- listo cuando llego el minado).
+  if storage.xfv_minado then return storage.xfv_minado end
+  -- No se pregunta en cada tick (son 60 por segundo): con 5 va sobrado.
+  if not tick or (tick % 5) ~= 0 then return nil end
+  local ok, info = pcall(function()
+    return remote.call("xfactorvr", "get_mined_item")
+  end)
+  if ok and type(info) == "table" and info.name then
+    storage.xfv_minado = info
+    return info
+  end
+  return nil
+end
+
 -- [XFactorVR-MP] El nivel solo avanza cuando le llega un evento del juego, y
 -- casi todos los que espera son de JUGADOR (seleccionar un mineral con el
 -- raton, abrir la GUI de fabricacion, minar...). Un personaje virtual no
@@ -269,6 +316,22 @@ if story_update then
   story_update = function(st, event, next_level, onwin)
     local r = _xfv_story_update_real(st, event, next_level, onwin)
     if not game.players[1] and event.name == defines.events.on_tick then
+      -- El minado del jugador virtual: se le pasa a la historia el evento
+      -- on_player_mined_entity con la entidad "item-on-ground", que es
+      -- exactamente lo que lanzaria el juego con un jugador de verdad.
+      local pendiente = _xfv_minado_pendiente(event.tick)
+      if pendiente then
+        local antes = st.story_position
+        _xfv_story_update_real(st, {
+          name = defines.events.on_player_mined_entity,
+          entity = { name = pendiente.name, position = pendiente.position },
+          tick = event.tick,
+        }, next_level, onwin)
+        -- Si la historia ha avanzado, el evento ya ha servido: se limpia.
+        if st.story_position ~= antes then
+          storage.xfv_minado = nil
+        end
+      end
       _xfv_story_update_real(st, { name = "script_raised_built", tick = event.tick },
                              next_level, onwin)
     end

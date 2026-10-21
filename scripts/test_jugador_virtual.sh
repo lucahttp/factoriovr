@@ -404,8 +404,9 @@ esac
 # tiene que pasar de 'setup' a los nodos que dependen de lo que hace el
 # jugador (moverse, coger el pecio, minar el mineral, fundirlo...). El banco
 # hace de jugador: cada vez que ve un nodo, hace lo que ese nodo pide.
-echo
-printf '  --- siguiendo la historia (el banco hace de jugador) ---\n'
+#
+# (Abajo, ya con los ayudantes de consulta, se comprueba la barra rapida
+# virtual y luego se sigue la historia.)
 
 # Nodo en el que esta la historia ahora.
 nodo_actual() {
@@ -477,6 +478,45 @@ CMDS"
     printf '%s' "${v%% *}"
 }
 
+# Posicion de un item del suelo cerca de un punto ("x,y"), o cadena vacia.
+# El item que bloquea a la perforadora cae en su posicion de descarga.
+pos_item_cerca() {
+    in_container "cat > '$CMDS' <<CMDS
+/silent-command local r=game.surfaces[1].find_entities_filtered({position={$1}, radius=3, name='item-on-ground'})[1]; rcon.print('pos='..tostring(r and r.position.x)..','..tostring(r and r.position.y))
+/silent-command local r=game.surfaces[1].find_entities_filtered({position={$1}, radius=3, name='item-on-ground'})[1]; rcon.print('pos='..tostring(r and r.position.x)..','..tostring(r and r.position.y))
+CMDS"
+    local v
+    v="$(valor_de "/silent-command local r=" "$(rcon_query "$CMDS")")"
+    v="${v#pos=}"
+    printf '%s' "${v%% *}"
+}
+
+# Foto del estado de la partida en UNA sola llamada al RCON (el banco tarda
+# una eternidad si va pregunta por pregunta):
+#   planchas_actor,carbon_actor,taladro_actor,energia_taladro,carbon_taladro,
+#   pos_taladro,energia_horno,carbon_horno,pos_horno,planchas_horno
+# Las posiciones van como "x:y" (la coma separaria los campos).
+estado_maquinas() {
+    in_container "cat > '$CMDS' <<'CMDS'
+/silent-command local ch=game.surfaces[1].find_entities_filtered({type='character'})[1]; local m=game.surfaces[1].find_entities_filtered({name='burner-mining-drill'})[1]; local f=game.surfaces[1].find_entities_filtered({name='stone-furnace'})[1]; rcon.print('st='..tostring(ch and ch.get_item_count('iron-plate'))..','..tostring(ch and ch.get_item_count('coal'))..','..tostring(ch and ch.get_item_count('burner-mining-drill'))..','..tostring(m and m.energy)..','..tostring(m and m.get_fuel_inventory() and m.get_fuel_inventory().get_item_count('coal'))..','..tostring(m and m.position.x)..':'..tostring(m and m.position.y)..','..tostring(f and f.energy)..','..tostring(f and f.get_fuel_inventory() and f.get_fuel_inventory().get_item_count('coal'))..','..tostring(f and f.position.x)..':'..tostring(f and f.position.y)..','..tostring(f and f.get_item_count('iron-plate')))
+/silent-command local ch=game.surfaces[1].find_entities_filtered({type='character'})[1]; local m=game.surfaces[1].find_entities_filtered({name='burner-mining-drill'})[1]; local f=game.surfaces[1].find_entities_filtered({name='stone-furnace'})[1]; rcon.print('st='..tostring(ch and ch.get_item_count('iron-plate'))..','..tostring(ch and ch.get_item_count('coal'))..','..tostring(ch and ch.get_item_count('burner-mining-drill'))..','..tostring(m and m.energy)..','..tostring(m and m.get_fuel_inventory() and m.get_fuel_inventory().get_item_count('coal'))..','..tostring(m and m.position.x)..':'..tostring(m and m.position.y)..','..tostring(f and f.energy)..','..tostring(f and f.get_fuel_inventory() and f.get_fuel_inventory().get_item_count('coal'))..','..tostring(f and f.position.x)..':'..tostring(f and f.position.y)..','..tostring(f and f.get_item_count('iron-plate')))
+CMDS"
+    local v
+    v="$(valor_de "/silent-command local ch=" "$(rcon_query "$CMDS")")"
+    printf '%s' "${v#st=}"
+}
+
+# Contenido de la barra rapida virtual (la rellena el mod solo).
+contenido_barra() {
+    in_container "cat > '$CMDS' <<'CMDS'
+/silent-command rcon.print(remote.call('xfactorvr', 'get_quick_bar'))
+/silent-command rcon.print(remote.call('xfactorvr', 'get_quick_bar'))
+CMDS"
+    local v
+    v="$(valor_de "/silent-command rcon.print(remote.call" "$(rcon_query "$CMDS")")"
+    printf '%s' "$v"
+}
+
 # Envia ordenes remotas al mod. Se acumulan y se mandan todas juntas en una
 # sola sesion RCON (cada orden va duplicada porque el primer comando de una
 # sesion RCON a veces se rechaza).
@@ -517,12 +557,69 @@ CMDS"
     ORDENES=()
 }
 
+# La barra rapida virtual: la rellena el mod solo, pero una ranura puesta a
+# mano NO se puede pisar.
+#
+# El item manual es "iron-stick": no esta en la lista de items que el mod
+# mete solo, asi que si el mod la tocase se veria enseguida.
+in_container "cat > '$CMDS' <<'CMDS'
+/silent-command remote.call('xfactorvr', 'set_quick_bar', 1, 1, 'iron-stick')
+/silent-command remote.call('xfactorvr', 'set_quick_bar', 1, 1, 'iron-stick')
+CMDS"
+rcon_query "$CMDS" >/dev/null
+
+# Se fuerza al mod a rellenar la barra (cambia el inventario del actor).
+PIEDRA="$(pos_recurso 'stone')"
+if pos_valida "$PIEDRA"; then
+    in_container "cat > '$CMDS' <<CMDS
+/silent-command remote.call('xfactorvr', 'manual_mine', ${PIEDRA}, 0)
+/silent-command remote.call('xfactorvr', 'manual_mine', ${PIEDRA}, 0)
+CMDS"
+    rcon_query "$CMDS" >/dev/null
+fi
+
+BARRA_MANUAL="$(contenido_barra)"
+printf '  RCON: barra %s\n' "$BARRA_MANUAL"
+case "$BARRA_MANUAL" in
+    1_1=iron-stick!*)
+        ok "la ranura puesta a mano no se pisa ($BARRA_MANUAL)" ;;
+    *)
+        fail "el mod ha pisado la ranura puesta a mano ($BARRA_MANUAL)" ;;
+esac
+
+echo
+printf '  --- siguiendo la historia (el banco hace de jugador) ---\n'
+
 NODO_ANTES="${NODO#nodo=}"
 NODO_ANTES="${NODO_ANTES%% *}"
 NODO_FINAL="$NODO_ANTES"
+BARRA_COMPROBADA=0
 for i in $(seq 1 "${XFV_PASOS:-30}"); do
     NODO_FINAL="$(nodo_actual)"
     printf '    t+%2ss  nodo=%s\n' "$((i * 5))" "$NODO_FINAL"
+
+    # Foto del estado (una sola llamada): planchas del actor, carbon, taladro
+    # en la mochila, energia y combustible de las maquinas...
+    ESTADO="$(estado_maquinas)"
+    IFS=',' read -r PLANCHAS CARBON_ACTOR TALADRO_ACTOR E_TALADRO C_TALADRO \
+        P_TALADRO E_HORNO C_HORNO P_HORNO P_HORNO_PLAT <<< "$ESTADO"
+    if [ "${XFV_DEBUG:-0}" = "1" ]; then
+        printf '      ESTADO: %s\n' "$ESTADO"
+    fi
+
+    # La barra rapida virtual la rellena el mod solo. Se comprueba con el
+    # taladro en la mochila: es el item que el nodo "add_filter" quiere en la
+    # barra, y tiene que estar ahi SIN que nadie lo ponga a mano.
+    if [ "$BARRA_COMPROBADA" = "0" ] && [ "${TALADRO_ACTOR:-0}" -ge 1 ] 2>/dev/null; then
+        BARRA="$(contenido_barra)"
+        case "$BARRA" in
+            *burner-mining-drill*)
+                ok "el mod rellena solo la barra rapida virtual ($BARRA)"
+                BARRA_COMPROBADA=1 ;;
+            *)
+                fail "la barra rapida virtual no se ha rellenado sola ($BARRA)" ;;
+        esac
+    fi
 
     case "$NODO_FINAL" in
         movement)
@@ -624,8 +721,11 @@ for i in $(seq 1 "${XFV_PASOS:-30}"); do
             agregar_orden craft "'iron-gear-wheel'" 3
             agregar_orden craft "'burner-mining-drill'" 1 ;;
         add_filter)
-            # Asignar la perforadora a un hueco de la barra rapida virtual.
-            agregar_orden set_quick_bar 1 1 "'burner-mining-drill'" ;;
+            # El nodo quiere la perforadora en la barra rapida como filtro.
+            # NO se hace nada aqui a proposito: el mod rellena la barra rapida
+            # virtual solo, con lo que lleva el jugador en la mochila. Asi el
+            # banco comprueba que el nodo se resuelve SIN tocar la UI.
+            ;;
         place-burner-mining-drill)
             # Colocarla encima de la veta de hierro.
             O="$(pos_recurso 'iron-ore')"
@@ -643,27 +743,46 @@ for i in $(seq 1 "${XFV_PASOS:-30}"); do
                 agregar_orden insert_item "${M}" "'coal'" 1 1
             fi ;;
         craft-iron-chest)
-            agregar_orden craft "'iron-chest'" 1 ;;
-        place-iron-chest)
-            # La caja va al lado de la perforadora (una casilla mas alla).
-            M="$(pos_entidad 'burner-mining-drill')"
-            if pos_valida "$M"; then
-                agregar_orden place_entity "'iron-chest'" "${M}" 0
+            # La caja de hierro son 8 planchas: el banco funde mas mineral en
+            # el horno y recoge las planchas hasta tener las 8 (el nodo
+            # espera a que el jugador tenga la caja, asi que aqui se puede
+            # fundir tranquilamente).
+            F="$(pos_entidad 'stone-furnace')"
+            if pos_valida "$F"; then
+                agregar_orden insert_item "${F}" "'iron-ore'" 5 2
+                agregar_orden interact_entity "${F}" 0
+            fi
+            if [ "${PLANCHAS:-0}" -ge 8 ] 2>/dev/null; then
+                agregar_orden craft "'iron-chest'" 1
             fi ;;
         show-miner-blockage)
             # Recoger del suelo el mineral que ha minado la perforadora: el
-            # nivel espera el evento de "minado" del jugador.
-            I="$(pos_entidad 'item-on-ground')"
+            # nivel espera el evento de "minado" del jugador. El personaje
+            # virtual tiene que estar AL LADO del item (si no, no llega).
+            D="$(pos_solte_minero)"
+            pos_valida "$D" || D="0,0"
+            I="$(pos_item_cerca "$D")"
+            if ! pos_valida "$I"; then
+                I="$(pos_entidad 'item-on-ground')"
+            fi
             if pos_valida "$I"; then
-                agregar_orden mine_entity "${I}" 0
+                agregar_orden teleport_player "${I%%,*}" "${I#*,}"
+                agregar_orden pick_up_item "${I}" 0
             fi ;;
         wait-to-check-target|remove-blocking-entity)
             # Nada que hacer: la perforadora trabaja y el nivel ya mira donde.
             ;;
         place-iron-chest)
-            # La caja va donde suelta el mineral la perforadora.
+            # La caja va donde suelta el mineral la perforadora. Si hay un
+            # item del suelo en ese sitio la caja no cabe: se recoge antes
+            # (es lo que hace el jugador en el juego).
             D="$(pos_solte_minero)"
             if pos_valida "$D"; then
+                I="$(pos_item_cerca "$D")"
+                if pos_valida "$I"; then
+                    agregar_orden teleport_player "${I%%,*}" "${I#*,}"
+                    agregar_orden pick_up_item "${I}" 0
+                fi
                 agregar_orden place_entity "'iron-chest'" "${D}" 0
             fi ;;
         take-items)
@@ -673,6 +792,27 @@ for i in $(seq 1 "${XFV_PASOS:-30}"); do
                 agregar_orden interact_entity "${C}" 0
             fi ;;
     esac
+
+    # --- mantenimiento: que las maquinas no se queden sin combustible -------
+    #
+    # La perforadora de combustible y el horno de piedra se paran sin carbon.
+    # Sin esto el nivel se queda clavado a mitad y el banco no podria
+    # comprobar que se llega AL FINAL.
+    if [ "${E_TALADRO:-nil}" != "nil" ] && [ "${C_TALADRO:-0}" = "0" ]; then
+        C="$(pos_recurso 'coal')"
+        if pos_valida "$C"; then
+            agregar_orden manual_mine "${C}" 0
+            agregar_orden insert_item "${P_TALADRO/:/,}" "'coal'" 1 1
+        fi
+    fi
+    if [ "${E_HORNO:-nil}" != "nil" ] && [ "${C_HORNO:-0}" = "0" ]; then
+        C="$(pos_recurso 'coal')"
+        if pos_valida "$C"; then
+            agregar_orden manual_mine "${C}" 0
+            agregar_orden insert_item "${P_HORNO/:/,}" "'coal'" 1 1
+        fi
+    fi
+
     ejecutar_ordenes
     if [ "${XFV_DEBUG:-0}" = "1" ]; then
         in_container "cat > '$CMDS' <<'CMDS'
@@ -684,6 +824,11 @@ CMDS"
         rcon_query "$CMDS" | cut -f2 | sed 's/^/      /'
     fi
     sleep 5
+
+    # La partida ha terminado: no hay nada mas que hacer.
+    if [ "$NODO_FINAL" = "victory" ]; then
+        break
+    fi
 done
 
 printf '  RCON: nodo inicial=%s  nodo final=%s\n' "$NODO_ANTES" "$NODO_FINAL"
@@ -702,12 +847,10 @@ case "$NODO_ANTES" in
 esac
 
 case "$NODO_FINAL" in
-    movement|open-wreck|take-plates-from-wreck|put-plates|close-wreck-gui|iron-ore-gathering|handmining|show-tooltip|craft-furnace-start|craft-furnace-finish|show-crafting-queue|place-stone-furnace|open-furnace|put-iron-ore|put-coal|show-furnace-smelting|wait-for-iron-plates|take-plates-from-furnace)
-        ok "el nivel ha llegado a los nodos que dependen del jugador ($NODO_FINAL)" ;;
     victory)
-        ok "el nivel ha llegado al FINAL (victory)" ;;
+        ok "el nivel ha llegado AL FINAL (victory)" ;;
     *)
-        aviso "el nivel se ha parado en '$NODO_FINAL' (nodos de GUI: necesitan el cliente)" ;;
+        fail "el nivel NO ha llegado al final: se ha quedado en '$NODO_FINAL'" ;;
 esac
 
 # --------------------------------------------------------------------------

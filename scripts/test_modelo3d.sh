@@ -219,7 +219,21 @@ if [ -z "$encontrada" ]; then
 fi
 
 # Traer la captura al host.
-"$PODMAN" cp "$CONTAINER:$CAPTURA_CONT" "$LOG_DIR/cubo_3d.png" >/dev/null 2>&1 || true
+#
+# `podman cp` se corta con los ficheros grandes (la captura son 3,6 MB y
+# llegaban 688 KB), y el banco daba un fallo que parecen del cubo cuando lo
+# que estaba mal era la copia.  Se copia comprimida y se comprueba el
+# tamaño antes de dar nada por bueno.
+"$PODMAN" exec "$CONTAINER" bash -c "gzip -c '$CAPTURA_CONT' > /tmp/xfv_captura.gz" >/dev/null 2>&1 || true
+"$PODMAN" exec "$CONTAINER" cat /tmp/xfv_captura.gz > "$LOG_DIR/cubo_3d.png.gz" 2>/dev/null || true
+if [ -s "$LOG_DIR/cubo_3d.png.gz" ]; then
+    gunzip -f "$LOG_DIR/cubo_3d.png.gz" 2>/dev/null || true
+    mv -f "$LOG_DIR/cubo_3d.png" "$LOG_DIR/cubo_3d.png" 2>/dev/null || true
+fi
+if [ -f "$LOG_DIR/cubo_3d.png.gz" ]; then
+    say "AVISO: la captura no se pudo traer entera (copia truncada)"
+    rm -f "$LOG_DIR/cubo_3d.png"
+fi
 
 PIDE="$(grep -oE 'caja: mundo=\([^)]*\) tamano=[0-9.]+x[0-9.]+' "$LOG_LOCAL" 2>/dev/null | head -1)"
 DIBUJA="$(grep -oE '[0-9]+ cajas?[^\n]*' "$LOG_LOCAL" 2>/dev/null | tail -1)"
@@ -239,39 +253,35 @@ fi
 
 # El PNG tiene que ser valido (zlib con el Adler-32 bien puesto) y tener
 # pixeles del cubo: eso es la prueba de que el cubo SE VE en la imagen.
-if [ -f "$LOG_DIR/cubo_3d.png" ]; then
-    if python3 - "$LOG_DIR/cubo_3d.png" <<'PY' >/dev/null 2>&1
-import struct, sys, zlib
-d = open(sys.argv[1], "rb").read()
-assert d[:8] == b"\x89PNG\r\n\x1a\n", "firma PNG"
-pos, idat, w, h = 8, b"", 0, 0
-while pos < len(d) - 8:
-    ln = struct.unpack(">I", d[pos:pos + 4])[0]
-    typ = d[pos + 4:pos + 8]
-    data = d[pos + 8:pos + 8 + ln]
-    if typ == b"IHDR":
-        w, h = struct.unpack(">II", data[:8])
-    elif typ == b"IDAT":
-        idat += data
-    pos += 12 + ln
-raw = zlib.decompress(idat)
-assert len(raw) == (w * 4 + 1) * h, "tamano de la imagen raro"
-n = 0
-for y in range(h):
-    fila = raw[y * (w * 4 + 1) + 1:(y + 1) * (w * 4 + 1)]
-    for x in range(0, len(fila), 4):
-        r, g, b = fila[x], fila[x + 1], fila[x + 2]
-        if r >= 60 and b >= 60 and (r - g) >= 40 and (b - g) >= 30:
-            n += 1
-assert n > 0, "no hay pixeles del cubo en la captura"
-PY
-    then
-        ok "PNG valido con pixeles del cubo"
-    else
-        fail "el PNG de la captura no es valido o no tiene el cubo"
-    fi
+#
+# La validacion se hace DENTRO del contenedor: la captura son 3,6 MB y
+# cualquier copia por el socket de podman se corta (llegan 688 KB o 3 MB),
+# lo que hacia que el banco fallara por la copia y no por el cubo.
+"$PODMAN" cp "$PROJECT_ROOT/scripts/validar_png_cubo.py" "$CONTAINER:/tmp/validar_png_cubo.py" >/dev/null 2>&1 || true
+"$PODMAN" exec -i "$CONTAINER" sh -c 'cat > /tmp/validar_png_cubo.py' < "$PROJECT_ROOT/scripts/validar_png_cubo.py" >/dev/null 2>&1 || true
+if "$PODMAN" exec "$CONTAINER" python3 /tmp/validar_png_cubo.py "$CAPTURA_CONT" 2>&1 | tail -3 | sed 's/^/    /'; then
+    ok "PNG valido con pixeles del cubo"
 else
-    fail "no se trajo la captura a $LOG_DIR/cubo_3d.png"
+    fail "el PNG de la captura no es valido o no tiene el cubo"
+fi
+
+# La imagen se deja en el contenedor; al host se trae en trozos (por si se
+# quiere mirar).
+"$PODMAN" exec "$CONTAINER" bash -c "gzip -c '$CAPTURA_CONT' > /tmp/xfv_captura.gz" >/dev/null 2>&1 || true
+TROZOS=0
+while [ "$TROZOS" -lt 40 ]; do
+    "$PODMAN" exec "$CONTAINER" bash -c \
+        "dd if=/tmp/xfv_captura.gz bs=262144 skip=$TROZOS count=1 2>/dev/null" \
+        >> "$LOG_DIR/cubo_3d.png.gz" 2>/dev/null || true
+    TROZOS=$((TROZOS + 1))
+    if ! "$PODMAN" exec "$CONTAINER" bash -c \
+        "dd if=/tmp/xfv_captura.gz bs=262144 skip=$TROZOS count=1 2>/dev/null | head -c 1" \
+        2>/dev/null | grep -q .; then
+        break
+    fi
+done
+if [ -s "$LOG_DIR/cubo_3d.png.gz" ]; then
+    gunzip -f "$LOG_DIR/cubo_3d.png.gz" 2>/dev/null || true
 fi
 
 say ""

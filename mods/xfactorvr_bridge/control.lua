@@ -289,6 +289,21 @@ local function virtual_inventory()
     return st.xfactorvr_inventory
 end
 
+--- Quita `count` items de un inventario concreto.
+--- En Factorio 2.0 `LuaInventory.remove` espera un ItemStackIdentification
+--- ({name=, count=}); la forma antigua (nombre, cantidad) se deja como
+--- respaldo porque hay builds que la aceptan.
+local function inv_take(inv, name, count)
+    if not inv or count <= 0 then return 0 end
+    local ok, removed = pcall(function()
+        return inv.remove({ name = name, count = count })
+    end)
+    if ok and removed and removed > 0 then return removed end
+    local ok2, removed2 = pcall(function() return inv.remove(name, count) end)
+    if ok2 and removed2 and removed2 > 0 then return removed2 end
+    return 0
+end
+
 --- Cantidad de un item en el inventario activo.
 --- El inventario activo es el del jugador real si lo hay y, si no, el del
 --- personaje virtual (que es un inventario de verdad, asi que el nivel de
@@ -325,14 +340,12 @@ local function inv_remove(name, count)
         local have = inv_get(name)
         local take = math.min(have, count)
         if take > 0 then
-            -- En Factorio 2.0 el metodo es `remove(nombre, cantidad)`.
-            -- Antes se usaba `remove_item`, que no existe: el pcall lo
+            -- Antes se usaba `remove_item`, que no existe en 2.0: el pcall lo
             -- silenciaba y los items nunca se consumian del inventario.
-            local ok, removed = pcall(function() return inv.remove(name, take) end)
-            if ok and removed and removed > 0 then return removed end
+            local removed = inv_take(inv, name, take)
+            if removed > 0 then return removed end
         end
-    end
-    local v = virtual_inventory()
+    end    local v = virtual_inventory()
     local have = v[name] or 0
     local take = math.min(have, count)
     if take > 0 then
@@ -341,18 +354,14 @@ local function inv_remove(name, count)
     return take
 end
 
---- Quita `count` items de un inventario concreto.
---- En Factorio 2.0 `LuaInventory.remove` espera un ItemStackIdentification
---- ({name=, count=}); la forma antigua (nombre, cantidad) se deja como
---- respaldo porque hay builds que la aceptan.
-local function inv_take(inv, name, count)
-    if not inv or count <= 0 then return 0 end
-    local ok, removed = pcall(function()
-        return inv.remove({ name = name, count = count })
-    end)
-    if ok and removed and removed > 0 then return removed end
-    local ok2, removed2 = pcall(function() return inv.remove(name, count) end)
-    if ok2 and removed2 and removed2 > 0 then return removed2 end
+--- Quita el primero de varios nombres alternativos que este disponible.
+local function inv_remove_any(names, count)
+    for _, name in ipairs(names) do
+        if inv_get(name) > 0 then
+            local taken = inv_remove(name, count)
+            if taken > 0 then return taken end
+        end
+    end
     return 0
 end
 
@@ -376,17 +385,6 @@ local function loot_inventory(inv)
         end
     end
     return cogido
-end
-
---- Quita el primero de varios nombres alternativos que este disponible.
-local function inv_remove_any(names, count)
-    for _, name in ipairs(names) do
-        if inv_get(name) > 0 then
-            local taken = inv_remove(name, count)
-            if taken > 0 then return taken end
-        end
-    end
-    return 0
 end
 
 -- ---------------------------------------------------------------------------
@@ -876,9 +874,11 @@ remote.add_interface("xfactorvr", {
 
     -- Interactua con una entidad: abre su GUI (abrir el pecio), le coje
     -- piezas, la activa. Es lo que usa el jugador con el raton.
+    --
+    -- Si no hay jugador real, interactua con el PERSONAJE VIRTUAL.
     interact_entity = function(x, y)
         local surface = game.surfaces[1]
-        local p = real_player()
+        local p = actor()
         if not surface or not p then
             rcon.print("ERR|no_player")
             return false
@@ -910,30 +910,29 @@ remote.add_interface("xfactorvr", {
             return false
         end
 
+        -- Seleccionar la entidad: el nivel de campana mira
+        -- `jugador().selected` para saber que ha señalado el jugador.
+        pcall(function() p.selected = mejor end)
+
         -- `opened` es lo que el juego usa para "tener abierto" el GUI de una
-        -- entidad. Si la entidad tiene inventario, se le recoge antes.
-        local ok_open, err_open = pcall(function()
+        -- entidad. Un personaje sin controlador de GUI no puede abrir nada,
+        -- pero eso no es un error: se sigue con el inventario.
+        pcall(function()
             p.opened = mejor
         end)
-        if not ok_open then
-            rcon.print("ERR|open")
-            return false
-        end
 
         -- Si tiene inventario con contenido, se le coge al jugador.
         local cogido = 0
         local ok_out, out_inv = pcall(function() return mejor.get_output_inventory() end)
         if ok_out and out_inv then
-            local ok_contents, contents = pcall(function() return out_inv.get_contents() end)
-            if ok_contents and contents then
-                for name, value in pairs(contents) do
-                    local amount = value
-                    if type(value) == "table" then amount = value.count end
-                    if type(amount) == "number" and amount > 0 then
-                        inv_add(name, amount)
-                        cogido = cogido + amount
-                    end
-                end
+            -- Maquinas: lo que ha producido.
+            cogido = loot_inventory(out_inv)
+        else
+            -- Cajas y pecios (el del tutorial) no tienen inventario de salida:
+            -- su contenido esta en el inventario principal.
+            local ok_main, main_inv = pcall(function() return mejor.get_inventory(1) end)
+            if ok_main and main_inv then
+                cogido = loot_inventory(main_inv)
             end
         end
 
@@ -946,21 +945,18 @@ remote.add_interface("xfactorvr", {
         local items = {}
         local seen = {}
 
-        local p = real_player()
-        if p then
-            local inv = p.get_main_inventory()
-            if inv then
-                local ok, contents = pcall(function() return inv.get_contents() end)
-                if ok and contents then
-                    for name, value in pairs(contents) do
-                        local amount = value
-                        if type(value) == "table" then amount = value.count end
-                        if type(amount) == "number" and amount > 0 then
-                            local id = ITEM_IDS_MAP[name]
-                            if id and id > 0 and not seen[name] then
-                                seen[name] = true
-                                table.insert(items, string.format('{"id":%d,"count":%d}', id, amount))
-                            end
+        local inv = actor_inventory()
+        if inv then
+            local ok, contents = pcall(function() return inv.get_contents() end)
+            if ok and contents then
+                for name, value in pairs(contents) do
+                    local amount = value
+                    if type(value) == "table" then amount = value.count end
+                    if type(amount) == "number" and amount > 0 then
+                        local id = ITEM_IDS_MAP[name]
+                        if id and id > 0 and not seen[name] then
+                            seen[name] = true
+                            table.insert(items, string.format('{"id":%d,"count":%d}', id, amount))
                         end
                     end
                 end
@@ -1000,6 +996,31 @@ remote.add_interface("xfactorvr", {
             if inv_get(ing.name) < need then
                 rcon.print("ERR|missing_" .. ing.name)
                 return false
+            end
+        end
+
+        -- Si el actor tiene cola de fabricacion se encola la receta: asi el
+        -- juego la fabrica de verdad y el nivel de campana ve
+        -- "crafting_queue_size > 0". Solo se acepta si la cola ha crecido:
+        -- un personaje sin controlador no puede fabricar en cola.
+        local a = actor()
+        if a then
+            local before = 0
+            pcall(function() before = tonumber(a.crafting_queue_size) or 0 end)
+            local ok, began = pcall(function()
+                return a.begin_crafting(count, recipe_name)
+            end)
+            if not (ok and began) then
+                -- Otra firma: {count=, recipe=}.
+                pcall(function()
+                    return a.begin_crafting{ count = count, recipe = recipe_name }
+                end)
+            end
+            local after = 0
+            pcall(function() after = tonumber(a.crafting_queue_size) or 0 end)
+            if after > before then
+                rcon.print("OK")
+                return true
             end
         end
 
@@ -1056,11 +1077,108 @@ remote.add_interface("xfactorvr", {
 
         rcon.print("ERR|no_machine")
         return false
+    end,
+
+    -- ---------------------------------------------------------------
+    -- Jugador virtual
+    --
+    -- El escenario de campana necesita saber quien es "el jugador" cuando
+    -- no hay nadie conectado. Este remoto se lo dice: devuelve los datos
+    -- del personaje virtual (o del jugador real, si lo hay).
+    --
+    -- OJO: por el remoto NO se puede devolver una entidad (los objetos Lua
+    -- no cruzan la frontera del remoto), asi que se devuelve su
+    -- unit_number y el escenario lo localiza con
+    -- game.get_entity_by_unit_number (el prototipo "character" lleva el flag
+    -- "get-by-unit-number").
+    -- ---------------------------------------------------------------
+    get_virtual_player = function()
+        local p = real_player()
+        if p then
+            local pos = p.position or { x = 0, y = 0 }
+            local out = {
+                found = true,
+                real = true,
+                name = p.name or "VR",
+                tag = p.tag or VIRTUAL_TAG,
+                index = p.index,
+                x = pos.x,
+                y = pos.y,
+                unit_number = nil,
+                surface_index = p.surface and p.surface.index or 1,
+                crafting_queue_size = p.crafting_queue_size or 0,
+            }
+            rcon.print("VR|real|" .. tostring(out.name))
+            return out
+        end
+
+        local c = ensure_virtual_character()
+        if not c then
+            local out = { found = false, real = false, name = VIRTUAL_NAME, tag = VIRTUAL_TAG }
+            rcon.print("VR|none")
+            return out
+        end
+
+        local pos = c.position or { x = 0, y = 0 }
+        local out = {
+            found = true,
+            real = false,
+            name = VIRTUAL_NAME,
+            tag = VIRTUAL_TAG,
+            unit_number = c.unit_number,
+            surface_index = c.surface and c.surface.index or 1,
+            x = pos.x,
+            y = pos.y,
+            crafting_queue_size = c.crafting_queue_size or 0,
+        }
+        rcon.print("VR|virtual|" .. tostring(out.name))
+        return out
+    end,
+
+    -- Mete items en el inventario de una maquina (al horno, al quemador).
+    -- Es lo que hace falta para jugar la campana sin ratón.
+    insert_item = function(x, y, item_name, count)
+        count = count or 1
+        local surface = game.surfaces[1]
+        if not surface or not item_name then
+            rcon.print("ERR|no_surface")
+            return false
+        end
+
+        local found = surface.find_entities_filtered({
+            position = { x, y },
+            radius = 1.5,
+        })
+        for _, e in ipairs(found) do
+            if e.valid then
+                local ok_inv, inv = pcall(function() return e.get_inventory(1) end)
+                if ok_inv and inv then
+                    local ok, inserted = pcall(function()
+                        return inv.insert({ name = item_name, count = count })
+                    end)
+                    if ok and inserted and inserted > 0 then
+                        rcon.print("OK|" .. tostring(inserted))
+                        return true
+                    end
+                end
+            end
+        end
+
+        rcon.print("ERR|no_machine")
+        return false
     end
 })
 
 script.on_init(function()
     virtual_inventory()
+    -- En un servidor headless no hay jugador: se crea el personaje virtual
+    -- para que el nivel de campana pueda arrancar (ver docs/ADR-007).
+    local c = ensure_virtual_character()
+    if c then
+        local pos = c.position or { x = 0, y = 0 }
+        log("[XFactorVR] Jugador virtual '" .. VIRTUAL_NAME .. "' creado en " ..
+            tostring(pos.x) .. "," .. tostring(pos.y))
+    end
     -- La version real del motor se lee del mod "core"; no hay una API directa
     -- y "2.0" a pelo mentia en cuanto el visor corre Factorio 2.1.
     local version = "?"
@@ -1069,3 +1187,22 @@ script.on_init(function()
     log("[XFactorVR] Bridge mod initialized. Factorio " .. version ..
         " con " .. tostring(EAST_STEP) .. " como paso de direccion este.")
 end)
+
+-- El personaje virtual se recrea si muere (por ejemplo por un biter).
+-- Se registra con cuidado porque el banco unitario de pruebas no expone
+-- on_event.
+local event_tick = defines.events and defines.events.on_tick
+if event_tick and script.on_event then
+    script.on_event(event_tick, function(event)
+        local st = state()
+        st.xfactorvr_tick = (st.xfactorvr_tick or 0) + 1
+        -- Cada 5 segundos se comprueba que el personaje sigue en pie.
+        if (st.xfactorvr_tick % 300) ~= 0 then return end
+        if real_player() then return end
+        if virtual_character() then return end
+        local c = ensure_virtual_character()
+        if c then
+            log("[XFactorVR] Jugador virtual recreado.")
+        end
+    end)
+end

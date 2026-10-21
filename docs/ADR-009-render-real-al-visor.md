@@ -60,6 +60,14 @@ de UV por ojo.**
   dibujo antes de leer y se devuelve el estado al motor después (hace falta
   `glBindFramebuffer`, que no estaba en la lista de funciones GL del
   inyector).
+- **El frame se lee COMPLETO, no a medio dibujar.** El motor dibuja el mundo
+  por trozos: leer en el `flush` cogía el framebuffer a medio rellenar (de
+  1927 frames, **770 salían incompletos**, algunos con solo 4626 píxeles de
+  color). En el visor eso es un panel que parpadea. Ahora se lee en el hook de
+  `GameRenderer::render`, que se dispara al principio del frame siguiente:
+  en ese momento el framebuffer del mundo todavía tiene el frame anterior
+  entero (el motor lo vacía después). Medido: de 18 frames, el más
+  incompleto tiene 230.254 píxeles de color de 230.400.
 
 Variables de entorno:
 

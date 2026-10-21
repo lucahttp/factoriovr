@@ -138,6 +138,8 @@ fondo de la mesa.
 export XFACTORVR_STREAM=127.0.0.1:27020   # destino del visor
 export XFACTORVR_STREAM_ANCHO=640          # tamaño del frame
 export XFACTORVR_STREAM_FPS=12             # fps objetivo
+export XFACTORVR_3D_CAMARA=24              # estereo real: desplazamiento
+                                            # de la camara del motor, en px
 ```
 
 Para comprobarlo **sin Pico** (el motor real en el contenedor):

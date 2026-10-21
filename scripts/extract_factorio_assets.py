@@ -2893,7 +2893,7 @@ def _empaquetar_atlas_terreno(src_terrain, out_dir, manifest, args):
                 page[off_destino:off_destino + tile * 4] = \
                     fila[off_origen:off_origen + tile * 4]
             Placement.setdefault(nombre, []).append({
-                "page": p, "x": cx, "y": cy,
+                "page": p, "x": cx, "y": cy, "w": tile, "h": tile,
             })
 
         base = "terrain_atlas_%d" % p

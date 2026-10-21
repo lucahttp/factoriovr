@@ -113,6 +113,47 @@ textura se sube tal cual y el shader invierte la V.
   mundo y el cubo 3D que pinta el inyector gana volumen. El shader ya tenía
   `u_uv_offset` de antes (se usaba para el terreno), no ha hecho falta tocar
   los shaders.
+  (Con `XFACTORVR_3D_CAMARA` esto se sustituye por el estéreo real: ver la
+  sección de más abajo.)
+
+### El paralaje: de "TV 3D" a estéreo real
+
+La primera versión movía la UV de la imagen un 1,8 % por ojo: el efecto
+"TV 3D" (una foto con profundidad). Funciona, pero el paralaje no es el de la
+escena: es un desplazamiento de pantalla.
+
+**El estéreo real se consigue desplazando la cámara del motor.** La cámara
+vive en los `RenderParameters` que el motor pasa al `DrawQueue` (offset +0x1b8,
+verificado en el desensamblado de `SpriteDrawOrder::setup`), y el motor calcula
+la posición de cada sprite con ella:
+
+```
+mundo = (mapa / 256) * (32 * escala) - camara
+```
+
+Así que el inyector, **antes** de que el motor dibuje, escribe la cámara
+desplazada. Alterna el signo en cada frame: una vista a la izquierda, la
+siguiente a la derecha. Son dos renders de verdad del juego (con el 3D
+dentro), no un truco de pantalla.
+
+- El valor escrito es **absoluto** (la cámara base + el desplazamiento), no
+  un "sumar": si no, la cámara se iría acumulando frame a frame. La base se
+  captura una vez por frame (la lleva la cuenta el hook de `GameRenderer::render`).
+- El protocolo XFV1 lleva ahora **el ojo del frame** en el bit 0 de `flags`.
+- El APK guarda las dos vistas (una textura por ojo) y muestra cada una en
+  el ojo que le toca. Si solo llega una vista (motor sin desplazamiento
+  posible), se sigue usando el desplazamiento de UV de antes.
+- `XFACTORVR_3D_CAMARA` (en píxeles del framebuffer) lo activa. 24 px es el
+  paralaje de una IPD de 64 mm a un metro de distancia.
+
+Lo que **no** es estéreo real: el juego no se dibuja con la cámara de la
+cabeza (el panel muestra la vista del juego, no la de quien la mira), y las
+dos vistas se capturan en frames consecutivos (unos 16 ms de diferencia).
+
+Un efecto secundario: **la ventana del juego tiembla** (el mundo se desplaza
+±24 px en cada frame). Es lo que produce las dos vistas; en la Pico el juego
+se ve en el panel del visor, así que no molesta, y para apuntar 24 px de 1280
+es despreciable.
 
 ## Alternativas descartadas
 
@@ -158,6 +199,19 @@ textura se sube tal cual y el shader invierte la V.
 
 Verde = llegaron frames **con el cubo 3D dentro**, o sea: la imagen que compone
 el motor (con el 3D) viaja al visor.
+
+### Tres trampas del banco (costaron tiempo)
+
+- **La partida de freeplay tiene un diálogo de bienvenida MODAL** ("Welcome to
+  Factorio: Freeplay"). Se come el teclado: la consola del juego no abre, la
+  máquina no se crea y no hay cubo que enviar. El banco usa la partida de
+  campaña (`xfv-virtual.zip`), que no lo tiene. (Pulsar ESC "para cerrar" es
+  contraproducente: en el juego abre el menú.)
+- **El cliente gráfico no abre RCON**: `--rcon-port` solo aplica al servidor.
+  La consola del juego es la única vía para mandar órdenes al cliente.
+- **El motor tarda más de 100 s en arrancar** en el contenedor (tiene que
+  generar los mipmaps de 1,3 GB de atlas con el rasterizador por software).
+  Con una espera menor, el banco falla sin que haya ningún fallo de verdad.
 
 La evidencia visual es el PNG de diagnóstico (`build/stream_debug_small.png`):
 es literalmente el frame que viaja por el socket, con el terreno real del

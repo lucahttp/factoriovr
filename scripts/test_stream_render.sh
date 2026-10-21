@@ -32,7 +32,7 @@ CONTAINER="xfactorvr-client"
 INJECTOR_DIR="$PROJECT_ROOT/injector-linux"
 LOG_DIR="$PROJECT_ROOT/build"
 TIMEOUT=300
-SAVE="/factorio/saves/freeplay.zip"
+SAVE="/factorio/saves/xfv-virtual.zip"
 VENTANA_ANCHO=1280
 VENTANA_ALTO=720
 PUERTO=27020
@@ -171,7 +171,7 @@ export XFACTORVR_STREAM_DEBUG_PNG=/factorio/stream_debug.png
 export XFACTORVR_AUTOSTART='$SAVE'
 export XFACTORVR_AUTOSTART_DELAY_S=6
 cd /factorio
-exec ./bin/arm64/factorio --window-size ${VENTANA_ANCHO}x${VENTANA_ALTO} --rcon-port $RCON_CLIENTE --rcon-password '$RCON_PASSWORD' > $LOG_CLIENT 2>&1
+exec ./bin/arm64/factorio --window-size ${VENTANA_ANCHO}x${VENTANA_ALTO} > $LOG_CLIENT 2>&1
 "
 }
 
@@ -215,25 +215,11 @@ enfocar_juego() {
         true
     " >/dev/null 2>&1 || true
 }
-# Primero por RCON: es determinista.
-maquina_por_rcon() {
-    local cmd='/silent-command local p = game.player.position; local e = game.surfaces[1].create_entity{name="assembling-machine-1", position={p.x+4, p.y}}; if e then rcon.print("MQUINA CREADA") else rcon.print("NO SE PUDO") end'
-    printf '%s' "$cmd" > "$LOG_DIR/consola_rcon.txt"
-    "$PODMAN" cp "$LOG_DIR/consola_rcon.txt" "$CONTAINER:/tmp/consola_rcon.txt" >/dev/null 2>&1 || true
-    "$PODMAN" exec -i "$CONTAINER" python3 /tmp/rcon_probe.py 127.0.0.1 $RCON_CLIENTE '$RCON_PASSWORD' "$(cat "$LOG_DIR/consola_rcon.txt")" >/dev/null 2>&1 || true
-    sleep 4
-}
-
+# OJO: el RCON del cliente grafico NO se abre (--rcon-port solo aplica al
+# servidor), asi que la maquina se crea con la consola del juego.  Y la
+# partida de campana es la que hay que usar: la de freeplay abre un dialogo
+# de bienvenida MODAL que se come el teclado (la consola no abre).
 for intento in 1 2 3; do
-    # El RCON del cliente: si esta abierto, la maquina se crea por ahi.
-    if "$PODMAN" exec "$CONTAINER" bash -c "exec 3<>/dev/tcp/127.0.0.1/$RCON_CLIENTE" 2>/dev/null; then
-        maquina_por_rcon
-        "$PODMAN" exec "$CONTAINER" cat "$LOG_CLIENT" > "$LOG_LOCAL" 2>/dev/null
-        if grep -q "caja: mundo=" "$LOG_LOCAL" 2>/dev/null; then
-            ok "maquina creada por RCON (el cubo 3D se dibuja)"
-            break
-        fi
-    fi
     enfocar_juego
     "$PODMAN" exec "$CONTAINER" bash -c "DISPLAY=$DISPLAY_NUM xdotool key grave" >/dev/null 2>&1 || true
     sleep 2

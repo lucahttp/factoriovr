@@ -1306,6 +1306,13 @@ fn pintar_si_toca(origen: &str) {
     if vp[2] < 320 || vp[3] < 240 {
         return;
     }
+    // El minimapa tambien es un DrawQueue (con su propia escala): ahi el
+    // cubo sale gigante.  El framebuffer del mundo tiene la forma de la
+    // ventana, asi que se descarta el que sea casi cuadrado.
+    let aspecto = vp[2] as f32 / vp[3].max(1) as f32;
+    if aspecto < 1.2 || aspecto > 2.4 {
+        return;
+    }
 
     if DIAG_GL.swap(1, Ordering::Relaxed) == 0 {
         let muestras = gl_int(gl, GL_SAMPLES);
@@ -1682,6 +1689,11 @@ fn dibujar_cajas(gl: &Gl, vp: &[i32; 4]) {
 
     for c in cajas.iter() {
         if c.sx <= 0.0 || c.sy <= 0.0 {
+            continue;
+        }
+        // Una caja mas grande que la pantalla es una lectura erroneous del
+        // tamano del sprite: si se dibuja, tapa media imagen de magenta.
+        if c.sx > vp[2] as f32 || c.sy > vp[3] as f32 {
             continue;
         }
         // Las entidades que estan fuera de la pantalla no se pintan: si se

@@ -2773,10 +2773,151 @@ def build_arg_parser():
                         help="no listar los sonidos del juego")
     parser.add_argument("--skip-terrain", action="store_true",
                         help="no copiar los tiles de terreno")
+    parser.add_argument("--terrain-variants", type=int, default=16,
+                        help="variantes de suelo que se guardan por tipo de "
+                             "terreno (por defecto 16). Cada variante es una "
+                             "casilla de 32x32")
     parser.add_argument("--strict", action="store_true",
                         help="salir con codigo != 0 si falta algun PNG referenciado")
     parser.add_argument("--quiet", action="store_true", help="silencia el resumen")
     return parser
+
+
+def _variantes_de_terreno(cab, filas, max_variantes):
+    """Elige celdas de 32x32 de suelo plano dentro de una hoja de terreno.
+
+    Las hojas de terreno de Factorio son tiras de 4096x576: 128 columnas de
+    32 px (variantes) por 18 bandas de 32 px.  El juego las reparte en
+    grupos "main" (ver tile_variations_template en
+    base/prototypes/tile/tiles.lua: y = 0, 128 y 320 pixeles de la hoja), y
+    las bandas 8-9 estan vacias (los huecos de transicion).
+
+    Para el suelo de una casilla hacen falta celdas COMPLETAMENTE opacas:
+    las de las bandas con bordes tienen alfa parcial y al muestrear se ve el
+    recorte.  Se cogen de las bandas altas (10-17), que son las que el juego
+    usa para el grupo "size 4" y son suelo liso, repartidas por las columnas
+    para que las casillas contiguas no se repitan.
+
+    Devuelve [(banda, columna), ...] con max_variantes celdas como mucho."""
+    T = 32
+    columnas = cab.width // T
+    bandas = cab.height // T
+    # El grupo "size 4" del juego empieza en la fila 320 de la hoja, que es
+    # la banda 10 en celdas de 32 px.
+    primera_banda = 10
+    candidatas = []
+    for b in range(primera_banda, bandas):
+        for c in range(columnas):
+            candidatas.append((b, c))
+    if not candidatas:
+        return []
+    if len(candidatas) <= max_variantes:
+        return candidatas
+    # Repartidas por las columnas: se recorre de izquierda a derecha dando
+    # un salto, para que las variantes elegidas esten separadas.
+    paso = len(candidatas) / float(max_variantes)
+    return [candidatas[int(i * paso)] for i in range(max_variantes)]
+
+
+def _empaquetar_atlas_terreno(src_terrain, out_dir, manifest, args):
+    """Empaqueta el suelo de las hojas de terreno en un atlas paginado.
+
+    El motor del visor (y el del juego) suben las texturas crudas a la GPU:
+    el PNG no se decodifica en Android.  Ademas una hoja de terreno son
+    4096x576 y no cabe como una sola textura en la GPU movil, asi que el
+    suelo se recorta a celdas de 32x32 (el tamano de una casilla) y se
+    pagina igual que el atlas de sprites.
+
+    Se escribe en manifest["terrain_atlas"]:
+      {"page_size": 2048, "tile_size": 32, "pages": [...],
+       "tiles": {"grass-1": {"variants": [{"page":0,"x":0,"y":0}, ...]}}}"""
+    if not os.path.isdir(src_terrain):
+        return 0
+
+    page_size = args.page_size
+    tile = 32
+    por_pagina = max(1, (page_size // tile) ** 2)
+
+    # 1. Recoger las celdas de cada tipo de terreno.
+    eleccion = {}
+    for filename in sorted(os.listdir(src_terrain)):
+        if not filename.lower().endswith(".png"):
+            continue
+        src = os.path.join(src_terrain, filename)
+        if not os.path.isfile(src):
+            continue
+        nombre = filename[:-4]
+        try:
+            cab = read_png_header(src)
+            filas = {}
+            for idx, fila in decode_png_rows(src, wanted_rows=None):
+                filas[idx] = fila
+        except (PngError, OSError) as exc:
+            sys.stderr.write("AVISO: no se pudo leer el terreno %s: %s\n"
+                             % (filename, exc))
+            continue
+        celdas = _variantes_de_terreno(cab, filas, args.terrain_variants)
+        if celdas:
+            eleccion[nombre] = (cab, filas, celdas)
+
+    if not eleccion:
+        sys.stderr.write("AVISO: no se encontraron celdas de terreno usables\n")
+        return 0
+
+    # 2. Repartirlas en paginas (rejilla regular: todos los tiles son 32x32).
+    paginas = []
+    tiles = []
+    for nombre, (cab, filas, celdas) in sorted(eleccion.items()):
+        for banda, columna in celdas:
+            tiles.append((nombre, banda, columna, filas, cab))
+
+    # 3. Escribir las paginas.
+    total_paginas = (len(tiles) + por_pagina - 1) // por_pagina
+    paginas_info = []
+    Placement = {}
+    for p in range(total_paginas):
+        trozo = tiles[p * por_pagina:(p + 1) * por_pagina]
+        page = bytearray(page_size * page_size * 4)
+        for i, (nombre, banda, columna, filas, cab) in enumerate(trozo):
+            celdas_por_fila = page_size // tile
+            cx = (i % celdas_por_fila) * tile
+            cy = (i // celdas_por_fila) * tile
+            sx = columna * tile
+            sy = banda * tile
+            for r in range(tile):
+                fila = filas.get(sy + r)
+                if fila is None:
+                    continue
+                off_origen = sx * 4
+                off_destino = ((cy + r) * page_size + cx) * 4
+                page[off_destino:off_destino + tile * 4] = \
+                    fila[off_origen:off_origen + tile * 4]
+            Placement.setdefault(nombre, []).append({
+                "page": p, "x": cx, "y": cy,
+            })
+
+        base = "terrain_atlas_%d" % p
+        raw_path = os.path.join(out_dir, base + ".rgba")
+        if not args.no_raw:
+            with open(raw_path, "wb") as fh:
+                fh.write(bytes(page))
+        png_path = os.path.join(out_dir, base + ".png")
+        with open(png_path, "wb") as fh:
+            fh.write(png_encode_rgba(page_size, page_size, bytes(page)))
+        paginas_info.append({
+            "file": base + (".rgba" if not args.no_raw else ".png"),
+            "width": page_size,
+            "height": page_size,
+        })
+
+    manifest["terrain_atlas"] = {
+        "page_size": page_size,
+        "tile_size": tile,
+        "pixel_format": "RGBA8",
+        "pages": paginas_info,
+        "tiles": {nombre: {"variants": vs} for nombre, vs in sorted(Placement.items())},
+    }
+    return len(tiles)
 
 
 def main(argv=None):
@@ -3358,7 +3499,7 @@ def main(argv=None):
                 shutil.copyfile(src, os.path.join(dst_terrain, filename))
                 manifest["terrain"][filename[:-4]] = "terrain/" + filename
                 terrain_count += 1
-            _empaquetar_atlas_terreno(src_terrain, out_dir, manifest, terrain_count)
+            _empaquetar_atlas_terreno(src_terrain, out_dir, manifest, args)
 
     # --- sonidos ----------------------------------------------------------
     sound_count = 0
@@ -3422,6 +3563,13 @@ def main(argv=None):
                   "el atlas" % (dropped_entities, dropped_layers))
         print("Iconos     : %d -> %s" % (icon_count, os.path.join(out_dir, "icons")))
         print("Terreno    : %d -> %s" % (terrain_count, os.path.join(out_dir, "terrain")))
+        if manifest.get("terrain_atlas"):
+            ta = manifest["terrain_atlas"]
+            n_tiles = sum(len(v["variants"]) for v in ta["tiles"].values())
+            print("Suelo      : %d celdas de %d px en %d paginas de %dx%d "
+                  "(%d tipos de terreno)"
+                  % (n_tiles, ta["tile_size"], len(ta["pages"]),
+                     ta["page_size"], ta["page_size"], len(ta["tiles"])))
         print("Textos     : %d -> %s" % (string_count, os.path.join(out_dir, "strings.json")))
         print("Sonidos    : %d (en manifest.json)" % sound_count)
         print("Manifest   : %s" % os.path.join(out_dir, "manifest.json"))

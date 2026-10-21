@@ -27,6 +27,7 @@ pub mod gnu_unwind;
 pub mod hooks;
 pub mod log;
 pub mod maps;
+pub mod modelo3d;
 pub mod resolver;
 
 /// Version del inyector (por si hay que distinguir .so en el campo).

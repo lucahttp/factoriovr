@@ -214,9 +214,15 @@ if [ "$MODO_CLIENT" -eq 1 ]; then
     echo "    cliente: $(du -h "$CLIENT_TAR" | cut -f1)  mesa: $(du -h "$MESA_TAR" | cut -f1)"
     "$ADB" shell "mkdir -p $REMOTE_CLIENT $REMOTE_MESA"
     "$ADB" push "$CLIENT_TAR" "$REMOTE_CLIENT/client.tar"
-    "$ADB" shell "cd $REMOTE_CLIENT && tar -xf client.tar && rm -f client.tar && chmod 755 factorio/bin/arm64/factorio && mkdir -p factorio/mods factorio/config factorio/saves"
+    # El tar del cliente contiene la carpeta "factorio/": se extrae en
+    # /data/local/tmp para que quede en /data/local/tmp/factorio, que es la
+    # ruta que espera el script de arranque del cliente.
+    "$ADB" shell "cd /data/local/tmp && tar -xf factorio_client/client.tar && rm -f factorio_client/client.tar && chmod 755 factorio/bin/arm64/factorio && mkdir -p factorio/mods factorio/config factorio/saves"
     "$ADB" push "$MESA_TAR" "$REMOTE_MESA/mesa.tar.gz"
-    "$ADB" shell "cd $REMOTE_MESA && tar -xzf mesa.tar.gz && rm -f mesa.tar.gz && chmod 755 mesa/lib/ld-linux-aarch64.so.1"
+    # El tar contiene la carpeta "mesa/", asi que se extrae en /data/local/tmp
+    # para que quede en /data/local/tmp/mesa, que es lo que espera el script
+    # del cliente ($MESA_DIR/lib/ld-linux-aarch64.so.1).
+    "$ADB" shell "cd /data/local/tmp && tar -xzf mesa/mesa.tar.gz && rm -f mesa/mesa.tar.gz && chmod 755 mesa/lib/ld-linux-aarch64.so.1"
     # Se comprueba que Zink llego de verdad: si no, el cliente arranca sin
     # aceleracion (o no arranca) y el fallo se ve mucho mas tarde.
     if ! "$ADB" shell "test -f $REMOTE_MESA/mesa/usr/lib/aarch64-linux-gnu/dri/zink_dri.so"; then

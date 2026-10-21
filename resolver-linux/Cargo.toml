@@ -1,0 +1,18 @@
+[package]
+name = "xfactorvr_resolver"
+version = "0.1.0"
+edition = "2021"
+
+# El shim se carga con LD_PRELOAD en el proceso de Factorio (que es glibc).
+[lib]
+name = "xfactorvr_resolver"
+crate-type = ["cdylib"]
+
+[profile.release]
+opt-level = 2
+panic = "abort"
+strip = true
+
+# El crate es independiente del workspace raiz del proyecto (asi puede tener
+# su propio .cargo/config.toml con el enlazador cruzado para ARM64).
+[workspace]

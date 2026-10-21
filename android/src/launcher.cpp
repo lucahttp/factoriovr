@@ -29,6 +29,12 @@ static const char* FACTORIO_DIR = "/data/local/tmp/factorio_arm64";
 static const char* FACTORIO_BIN = "/data/local/tmp/factorio_arm64/bin/arm64/factorio";
 static const char* FACTORIO_MODS = "/data/local/tmp/factorio_arm64/mods";
 static const char* START_SCRIPT = "/data/local/tmp/start_factorio_standalone.sh";
+// Escenario de campana (el nivel de tutorial parcheado para multijugador).
+// Lo deja el despliegue en el data del motor; si esta, el servidor arranca
+// con el y no con una partida guardada.
+static const char* CAMPAIGN_SCENARIO = "base/xfv-nivel";
+static const char* CAMPAIGN_PATH =
+    "/data/local/tmp/factorio_arm64/data/base/scenarios/xfv-nivel";
 static const int   RCON_PORT = 27015;
 static const char* RCON_PASSWORD = "xfactorvr";
 
@@ -148,7 +154,29 @@ static bool prepare_app_factorio_home(const char* internal_data_path) {
              "[path]\n"
              "read-data=%s/data\n"
              "write-data=%s\n", FACTORIO_DIR, home);
-    return write_file(ini_path, content);
+    if (!write_file(ini_path, content)) return false;
+
+    // Ajustes del servidor.  El motor los lee del directorio de escritura
+    // (el de la app), asi que hay que ponerlos aqui y no solo en el motor.
+    //
+    // auto_pause=true congela el mapa mientras no haya nadie conectado.  Con
+    // la campana es lo que queremos (el nivel espera al jugador); sin ella,
+    // el mundo se quedaria parado en el visor.
+    bool campana = (access(CAMPAIGN_PATH, F_OK) == 0);
+    snprintf(content, sizeof(content),
+             "{\n"
+             "  \"name\": \"XFactorVR\",\n"
+             "  \"description\": \"Factorio para Realidad Mixta\",\n"
+             "  \"visibility\": { \"public\": false, \"lan\": true },\n"
+             "  \"require_user_verification\": false,\n"
+             "  \"auto_pause\": %s,\n"
+             "  \"auto_pause_when_players_connect\": false,\n"
+             "  \"autosave_interval\": 10,\n"
+             "  \"autosave_slots\": 3\n"
+             "}\n", campana ? "true" : "false");
+    snprintf(cfg_dir, sizeof(cfg_dir), "%s/config/server-settings.json", home);
+    write_file(cfg_dir, content);
+    return true;
 }
 
 // Lanza el motor en segundo plano. Devuelve el PID o -1.
@@ -164,11 +192,17 @@ static pid_t spawn_factorio_server(const char* internal_data_path) {
     char* slash = strrchr(lib_dir, '/');
     if (slash) *slash = '\0';
 
-    char home[512], cfg_path[512], save[600], mod_dir[512];
+    char home[512], cfg_path[512], save[600], mod_dir[512], saves_dir[600];
     snprintf(home, sizeof(home), "%s/factorio", internal_data_path);
     snprintf(cfg_path, sizeof(cfg_path), "%s/config-path.cfg", home);
+    snprintf(saves_dir, sizeof(saves_dir), "%s/saves", home);
     snprintf(save, sizeof(save), "%s/saves/xfactorvr_world.zip", home);
     snprintf(mod_dir, sizeof(mod_dir), "%s", FACTORIO_MODS);
+    mkdir(saves_dir, 0755);
+
+    // Si el despliegue dejo el escenario de campana, el servidor arranca con
+    // el (el nivel de campana es single-player y necesita un jugador real).
+    bool campana = (access(CAMPAIGN_PATH, F_OK) == 0);
 
     if (!prepare_app_factorio_home(internal_data_path)) {
         LOGE("No se pudo preparar el directorio privado del motor: %s", home);
@@ -176,14 +210,16 @@ static pid_t spawn_factorio_server(const char* internal_data_path) {
     }
 
     // La partida se crea la primera vez; si ya existe se reutiliza.
-    if (access(save, F_OK) != 0) {
+    if (!campana && access(save, F_OK) != 0) {
         LOGI("Creando la partida inicial del motor...");
         pid_t cpid = fork();
         if (cpid == 0) {
             setenv("LD_LIBRARY_PATH", lib_dir, 1);
             char* args[] = {
                 (char*)loader, (char*)"--library-path", lib_dir, (char*)FACTORIO_BIN,
-                (char*)"--create", (char*)"xfactorvr_world.zip",
+                // Ruta ABSOLUTA: con un nombre relativo el motor la crea en
+                // el directorio de trabajo y luego no aparece en saves/.
+                (char*)"--create", (char*)save,
                 (char*)"--mod-directory", mod_dir,
                 (char*)"--config", cfg_path,
                 nullptr
@@ -205,7 +241,16 @@ static pid_t spawn_factorio_server(const char* internal_data_path) {
         setsid();
         setenv("LD_LIBRARY_PATH", lib_dir, 1);
         setenv("HOME", home, 1);
-        char* args[] = {
+        char* args_campana[] = {
+            (char*)loader, (char*)"--library-path", lib_dir, (char*)FACTORIO_BIN,
+            (char*)"--start-server-load-scenario", (char*)CAMPAIGN_SCENARIO,
+            (char*)"--rcon-port", (char*)"27015",
+            (char*)"--rcon-password", (char*)RCON_PASSWORD,
+            (char*)"--mod-directory", mod_dir,
+            (char*)"--config", cfg_path,
+            nullptr
+        };
+        char* args_partida[] = {
             (char*)loader, (char*)"--library-path", lib_dir, (char*)FACTORIO_BIN,
             (char*)"--start-server", save,
             (char*)"--rcon-port", (char*)"27015",
@@ -214,7 +259,7 @@ static pid_t spawn_factorio_server(const char* internal_data_path) {
             (char*)"--config", cfg_path,
             nullptr
         };
-        execv(loader, args);
+        execv(loader, campana ? args_campana : args_partida);
         _exit(127);
     }
     return pid;

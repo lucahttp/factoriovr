@@ -136,6 +136,16 @@ extern "C" fn hook_render(this: *mut c_void) {
             let f: Hook = std::mem::transmute(tramp);
             f(this);
         }
+
+        // El mundo ya esta dibujado: se anota el viewport del area de juego
+        // (el modulo 3D lo necesita para pintar el cubo en el mismo sitio) y
+        // se dibujan los cubos 3D de las entidades capturadas en su hook de
+        // dibujado. Solo se dibuja aqui si no hay un hook de presentacion
+        // (que es el sitio preferible).
+        crate::modelo3d::nota_viewport();
+        crate::modelo3d::preparar_gl();
+        crate::modelo3d::dibujar_cajas_si_no_hay_presentacion();
+        crate::modelo3d::capturar_si_pide();
     }
 }
 
@@ -237,6 +247,12 @@ pub fn instalar() {
         instalar_hook_app_manager(&simbolos);
         instalar_hook_process_events(&simbolos);
     }
+
+    // --- modulo 3D: dibujar las entidades en 3D ---
+    // Se instala siempre: el hook de `AssemblingMachine::draw` es independiente
+    // del resto y no toca nada del juego si `XFACTORVR_3D=0`.
+    crate::modelo3d::configurar();
+    crate::modelo3d::instalar(&simbolos);
 
     // --- resolver ---
     let encontrado = match simbolos.resolver(&objetivo) {

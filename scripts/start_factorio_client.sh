@@ -133,6 +133,21 @@ mkdir -p "$XDG_RUNTIME_DIR" 2>/dev/null || true
 # El .so engancha el pipeline de render del juego (resuelve los hooks por
 # nombre desde el symtab del ELF) y es lo que permite arrancar la partida y
 # dibujar el mundo en 3D. Es opcional: sin el, el juego funciona igual.
+# El motor lleva curl enlazado estatico, con su propia resolucion de nombres
+# (no encuentra /etc/resolv.conf y usa 127.0.0.1, donde no hay nada).  El
+# shim trae un proxy CONNECT y un resolutor DNS propios: con el proxy, el
+# padlock del auth server sale de verdad y el cliente se puede emparejar.
+RESOLVER="${XFACTORVR_RESOLVER:-/data/local/tmp/libxfactorvr_resolver.so}"
+PROXY_PUERTO="${XFACTORVR_PROXY_PUERTO:-8899}"
+if [ -f "$RESOLVER" ]; then
+    export https_proxy="http://127.0.0.1:$PROXY_PUERTO"
+    export http_proxy="http://127.0.0.1:$PROXY_PUERTO"
+    export XFACTORVR_RESOLVER_LOG="${XFACTORVR_RESOLVER_LOG:-$FACTORIO_DIR/logs/resolver.log}"
+    mkdir -p "$(dirname "$XFACTORVR_RESOLVER_LOG")" 2>/dev/null || true
+    export LD_PRELOAD="$RESOLVER${LD_PRELOAD:+:$LD_PRELOAD}"
+    log "resolutor: $RESOLVER (proxy en 127.0.0.1:$PROXY_PUERTO)"
+fi
+
 INJECTOR="${INJECTOR:-/data/local/tmp/libxfactorvr_injector.so}"
 if [ -f "$INJECTOR" ] && [ "${XFACTORVR_USE_INJECTOR:-1}" = "1" ]; then
     export LD_PRELOAD="$INJECTOR${LD_PRELOAD:+:$LD_PRELOAD}"

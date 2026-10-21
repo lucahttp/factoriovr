@@ -232,6 +232,39 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# 4 ter. Resolutor de nombres
+# ---------------------------------------------------------------------------
+# El motor es un binario de GLIBC y Android no tiene /etc/resolv.conf (la
+# resolucion la hace netd por binder).  Asi que dentro del motor no se
+# resuelve NINGUN nombre, y el servidor multijugador cae al pedir el
+# "server padlock" a auth.factorio.com:
+#
+#   CURL failed: code:6, 6; Could not resolve host: auth.factorio.com
+#
+# El shim intercepta getaddrinfo y, si la glibc falla, resuelve el nombre con
+# una consulta DNS por UDP propia.
+RESOLVER="${XFACTORVR_RESOLVER:-/data/local/tmp/libxfactorvr_resolver.so}"
+# El curl del motor va enlazado estatico, con su propia resolucion de
+# nombres (busca /etc/resolv.conf, que en Android no existe, y usa
+# 127.0.0.1 por defecto, donde no hay nada: la peticion del padlock se
+# queda 60 s y el servidor multijugador no arranca).  curl si lee las
+# variables del proxy, asi que se le apunta al proxy CONNECT que trae el
+# shim, que resuelve los nombres de verdad.
+PROXY_PUERTO="${XFACTORVR_PROXY_PUERTO:-8899}"
+export https_proxy="http://127.0.0.1:$PROXY_PUERTO"
+export http_proxy="http://127.0.0.1:$PROXY_PUERTO"
+
+PRELOAD=""
+if [ -f "$RESOLVER" ]; then
+    PRELOAD="$RESOLVER"
+    log "Resolutor de nombres: $RESOLVER"
+else
+    log "AVISO: no esta el resolutor de nombres en $RESOLVER."
+    log "       El servidor podria no arrancar (no puede resolver"
+    log "       auth.factorio.com para el padlock del modo multijugador)."
+fi
+
+# ---------------------------------------------------------------------------
 # 5. Crear la partida si no existe
 # ---------------------------------------------------------------------------
 # Con use-system-read-write-data-directories=false el motor usa su propia raiz
@@ -250,7 +283,7 @@ if [ -z "$SAVE_FILE" ]; then
     # de trabajo (la raiz del juego) y luego el script no la encuentra en
     # saves/ y da la partida por perdida.
     ( cd "$FACTORIO_DIR" && \
-        "$LOADER" --library-path "$GLIBC_LIB" "$FACTORIO_BIN" \
+        env LD_PRELOAD="$PRELOAD" "$LOADER" --library-path "$GLIBC_LIB" "$FACTORIO_BIN" \
             --config "$SERVER_CONFIG" \
         --create "$SAVE_DIR/$SAVE_NAME" --mod-directory "$MOD_DIR" ) >>"$LOG_FILE" 2>&1
 
@@ -283,7 +316,7 @@ launch() {
     if [ -n "${SCENARIO:-}" ]; then
         log "Arrancando el escenario de campana: $SCENARIO"
         nohup \
-            "$LOADER" --library-path "$GLIBC_LIB" "$FACTORIO_BIN" \
+            env LD_PRELOAD="$PRELOAD" "$LOADER" --library-path "$GLIBC_LIB" "$FACTORIO_BIN" \
             --config "$SERVER_CONFIG" \
             --start-server-load-scenario "$SCENARIO" \
             --port "${SERVER_PORT:-34197}" \
@@ -293,7 +326,7 @@ launch() {
             >>"$LOG_FILE" 2>&1 &
     else
         nohup \
-            "$LOADER" --library-path "$GLIBC_LIB" "$FACTORIO_BIN" \
+            env LD_PRELOAD="$PRELOAD" "$LOADER" --library-path "$GLIBC_LIB" "$FACTORIO_BIN" \
             --config "$SERVER_CONFIG" \
             --start-server "$SAVE_FILE" \
             --rcon-port "$RCON_PORT" \
@@ -328,7 +361,7 @@ while [ "$_waited" -lt "$WAIT_TIMEOUT" ]; do
         # de una ruta absoluta de partida depende de la version del motor.
         log "Reintentando con --start-server-load-latest..."
         SERVER_PID=$(cd "$FACTORIO_DIR" && nohup \
-            "$LOADER" --library-path "$GLIBC_LIB" "$FACTORIO_BIN" \
+            env LD_PRELOAD="$PRELOAD" "$LOADER" --library-path "$GLIBC_LIB" "$FACTORIO_BIN" \
             --config "$SERVER_CONFIG" \
             --start-server-load-latest \
             --rcon-port "$RCON_PORT" \

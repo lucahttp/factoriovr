@@ -604,13 +604,13 @@ pub fn reescribir_pc_relativa(
         let es_adrp = (insn & 0x8000_0000) != 0;
         let immlo = (insn >> 29) & 0x3;
         let immhi = (insn >> 5) & 0x7_FFFF;
-        let imm21 = (immhi << 2) | immlo;
-        // Signo: 21 bits con signo.
-        let imm21 = if (imm21 & 0x10_0000) != 0 {
-            imm21 | 0xFFE0_0000
-        } else {
-            imm21
-        };
+        // 21 bits con signo. OJO: el signo hay que extenderlo DENTRO de los
+        // 21 bits ((x << 11) as i32 >> 11).  Si se hace con una mascara de
+        // 32 bits (| 0xFFE0_0000) y luego se desplaza 12 para calcular la
+        // pagina, los bits altos se salen de rango y el ADRP reubicado
+        // apunta a una pagina inventada: el motor lee y escribe en una
+        // direccion cualquiera (y el cubo 3D no sale).
+        let imm21 = ((((immhi << 2) | immlo) << 11) as i32) >> 11;
         if es_adrp {
             // ADRP: alcance +-4 GB.
             let destino = (viejo_pc & !0xFFF).wrapping_add(((imm21 as i64) << 12) as u64);
@@ -917,12 +917,8 @@ mod tests_adrp_real {
     fn pagina_de(instruccion: u32, pc: u64) -> u64 {
         let immlo = (instruccion >> 29) & 0x3;
         let immhi = (instruccion >> 5) & 0x7_FFFF;
-        let imm21 = (immhi << 2) | immlo;
-        let imm21 = if (imm21 & 0x10_0000) != 0 {
-            imm21 | 0xFFE0_0000
-        } else {
-            imm21
-        };
+        // 21 bits con signo (igual que en reescribir_pc_relativa).
+        let imm21 = ((((immhi << 2) | immlo) << 11) as i32) >> 11;
         (pc & !0xFFF).wrapping_add(((imm21 as i64) << 12) as u64)
     }
 

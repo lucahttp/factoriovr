@@ -153,21 +153,129 @@ local function real_player()
     return nil
 end
 
---- Fuerza activa: la del jugador si hay alguno conectado, si no la primera
---- del juego. En Factorio 2.0 las recetas ya no cuelgan de `game.recipe_prototypes`
---- sino de `force.recipes`, asi que hace falta una fuerza de referencia.
-local function active_force()
-    local p = real_player()
-    if p and p.valid and p.force then return p.force end
-    return game.forces[1]
-end
-
 --- Estado persistente del mod.
 --- Factorio 2.0 elimino la tabla global en favor de storage; usar `global`
 --- en 2.x provoca un error no recuperable en on_init que impide arrancar la
 --- partida (detectado con el servidor real en contenedor ARM64).
 local function state()
     return storage
+end
+
+-- ---------------------------------------------------------------------------
+-- Jugador virtual
+--
+-- El nivel de campana (base/campaigns/tutorial/level-01) es singleplayer: su
+-- init usa game.players[1]. En un servidor headless no hay nadie conectado,
+-- asi que el nivel nunca arranca su logica y la campana no se puede jugar.
+-- Para que se pueda jugar sin cliente grafico, este mod crea un PERSONAJE de
+-- la fuerza "player" y lo deja disponible para el escenario.
+--
+-- En la API de Factorio una entidad de tipo "character" es un LuaControl,
+-- igual que un jugador: tiene position, surface, force, teleport(),
+-- mine_entity(), can_reach_entity(), get_item_count() y get_main_inventory().
+-- Por eso el personaje virtual se mueve, mina, fabrica e interactua con las
+-- maquinas exactamente igual que el jugador real.
+--
+-- OJO: LuaForce.create_character NO existe en 2.1.22 (la API actual solo
+-- tiene LuaPlayer.create_character, que exige un jugador ya conectado). La
+-- via que usa el propio juego base es surface.create_entity{name="character"}
+-- (ver base/script/team-production/team_production.lua).
+-- ---------------------------------------------------------------------------
+
+local VIRTUAL_TAG = "xfactorvr_player"
+local VIRTUAL_NAME = "VR"
+
+--- Entidad del personaje virtual, o nil si todavia no existe.
+local function virtual_character()
+    local st = state()
+    local c = st.xfactorvr_character
+    if c and c.valid then return c end
+    st.xfactorvr_character = nil
+    return nil
+end
+
+--- Crea el personaje virtual si no hay jugador real. Devuelve la entidad o nil.
+local function ensure_virtual_character()
+    -- Si hay un jugador de verdad, el escenario usa ese: no creamos nada.
+    if real_player() then return nil end
+
+    local c = virtual_character()
+    if c then return c end
+
+    local surface = game.surfaces[1]
+    if not surface then return nil end
+    local force = game.forces[1]
+    if not force then return nil end
+
+    -- Punto de aparicion de la fuerza en esa superficie.
+    local pos = { 0, 0 }
+    local ok_spawn, spawn = pcall(function() return force.get_spawn_position(surface) end)
+    if ok_spawn and spawn then
+        if spawn.x then
+            pos = { spawn.x, spawn.y }
+        elseif spawn[1] then
+            pos = { spawn[1], spawn[2] }
+        end
+    end
+
+    local function crear(p)
+        local ok, ent = pcall(function()
+            return surface.create_entity{
+                name = "character",
+                position = p,
+                force = force,
+                direction = defines.direction.south,
+            }
+        end)
+        if ok and ent then return ent end
+        return nil
+    end
+
+    local ent = crear(pos)
+    if not ent then
+        -- El punto de aparicion puede estar ocupado: se busca hueco cerca.
+        local ok_free, libre = pcall(function()
+            return surface.find_non_colliding_position("character", pos, 10, 2)
+        end)
+        if ok_free and libre then
+            ent = crear(libre)
+        end
+    end
+    if not ent then return nil end
+
+    -- El "tag" de un jugador no existe en una entidad: el nombre visible es
+    -- la mejor aproximacion y es lo que se ve en el mapa.
+    pcall(function() ent.name_tag = VIRTUAL_NAME end)
+
+    state().xfactorvr_character = ent
+    return ent
+end
+
+--- El actor sobre el que actuan las ordenes: el jugador real si hay alguno
+--- conectado y, si no, el personaje virtual.
+local function actor()
+    local p = real_player()
+    if p then return p end
+    return ensure_virtual_character()
+end
+
+--- Inventario principal del actor (jugador real o personaje virtual).
+local function actor_inventory()
+    local a = actor()
+    if not a then return nil end
+    local ok, inv = pcall(function() return a.get_main_inventory() end)
+    if ok then return inv end
+    return nil
+end
+
+--- Fuerza activa: la del actor si hay alguno (jugador real o personaje
+--- virtual) y, si no, la primera del juego. En Factorio 2.0 las recetas ya no
+--- cuelgan de `game.recipe_prototypes` sino de `force.recipes`, asi que hace
+--- falta una fuerza de referencia.
+local function active_force()
+    local a = actor()
+    if a and a.valid and a.force then return a.force end
+    return game.forces[1]
 end
 
 local function virtual_inventory()
@@ -182,14 +290,14 @@ local function virtual_inventory()
 end
 
 --- Cantidad de un item en el inventario activo.
+--- El inventario activo es el del jugador real si lo hay y, si no, el del
+--- personaje virtual (que es un inventario de verdad, asi que el nivel de
+--- campana ve los mismos items con get_item_count).
 local function inv_get(name)
-    local p = real_player()
-    if p then
-        local inv = p.get_main_inventory()
-        if inv then
-            local ok, count = pcall(function() return inv.get_item_count(name) end)
-            if ok and count then return count end
-        end
+    local inv = actor_inventory()
+    if inv then
+        local ok, count = pcall(function() return inv.get_item_count(name) end)
+        if ok and count then return count end
     end
     return virtual_inventory()[name] or 0
 end
@@ -197,15 +305,12 @@ end
 --- Anade items al inventario activo. Devuelve cuantos se pudieron agregar.
 local function inv_add(name, count)
     if count <= 0 then return 0 end
-    local p = real_player()
-    if p then
-        local inv = p.get_main_inventory()
-        if inv then
-            local ok, inserted = pcall(function()
-                return inv.insert({ name = name, count = count })
-            end)
-            if ok and inserted then return inserted end
-        end
+    local inv = actor_inventory()
+    if inv then
+        local ok, inserted = pcall(function()
+            return inv.insert({ name = name, count = count })
+        end)
+        if ok and inserted then return inserted end
     end
     local v = virtual_inventory()
     v[name] = (v[name] or 0) + count
@@ -215,19 +320,16 @@ end
 --- Quita items del inventario activo. Devuelve cuantos se quitaron.
 local function inv_remove(name, count)
     if count <= 0 then return 0 end
-    local p = real_player()
-    if p then
-        local inv = p.get_main_inventory()
-        if inv then
-            local have = inv_get(name)
-            local take = math.min(have, count)
-            if take > 0 then
-                -- En Factorio 2.0 el metodo es `remove(nombre, cantidad)`.
-                -- Antes se usaba `remove_item`, que no existe: el pcall lo
-                -- silenciaba y los items nunca se consumian del inventario.
-                local ok, removed = pcall(function() return inv.remove(name, take) end)
-                if ok and removed and removed > 0 then return removed end
-            end
+    local inv = actor_inventory()
+    if inv then
+        local have = inv_get(name)
+        local take = math.min(have, count)
+        if take > 0 then
+            -- En Factorio 2.0 el metodo es `remove(nombre, cantidad)`.
+            -- Antes se usaba `remove_item`, que no existe: el pcall lo
+            -- silenciaba y los items nunca se consumian del inventario.
+            local ok, removed = pcall(function() return inv.remove(name, take) end)
+            if ok and removed and removed > 0 then return removed end
         end
     end
     local v = virtual_inventory()
@@ -237,6 +339,43 @@ local function inv_remove(name, count)
         v[name] = have - take
     end
     return take
+end
+
+--- Quita `count` items de un inventario concreto.
+--- En Factorio 2.0 `LuaInventory.remove` espera un ItemStackIdentification
+--- ({name=, count=}); la forma antigua (nombre, cantidad) se deja como
+--- respaldo porque hay builds que la aceptan.
+local function inv_take(inv, name, count)
+    if not inv or count <= 0 then return 0 end
+    local ok, removed = pcall(function()
+        return inv.remove({ name = name, count = count })
+    end)
+    if ok and removed and removed > 0 then return removed end
+    local ok2, removed2 = pcall(function() return inv.remove(name, count) end)
+    if ok2 and removed2 and removed2 > 0 then return removed2 end
+    return 0
+end
+
+--- Vacia un inventario de una entidad en el inventario del actor.
+--- Devuelve cuantos items se han movido.
+local function loot_inventory(inv)
+    local cogido = 0
+    if not inv then return 0 end
+    local ok_contents, contents = pcall(function() return inv.get_contents() end)
+    if not (ok_contents and contents) then return 0 end
+    for name, value in pairs(contents) do
+        local amount = value
+        if type(value) == "table" then amount = value.count end
+        if type(amount) == "number" and amount > 0 then
+            local taken = inv_add(name, amount)
+            if taken > 0 then
+                cogido = cogido + taken
+                -- Del origen solo se quitan los items que se han llevado.
+                inv_take(inv, name, taken)
+            end
+        end
+    end
+    return cogido
 end
 
 --- Quita el primero de varios nombres alternativos que este disponible.
@@ -587,7 +726,7 @@ remote.add_interface("xfactorvr", {
         for _, e in ipairs(found) do
             if e.valid and e.type ~= "character" and e.type ~= "resource" then
                 -- Se preferie minar de verdad: devuelve el material al inventario.
-                local p = real_player()
+                local p = actor()
                 local mined = false
                 if p then
                     local ok = pcall(function() p.mine_entity(e, true) end)
@@ -709,14 +848,17 @@ remote.add_interface("xfactorvr", {
         return 0
     end,
 
-    -- Mueve al JUGADOR REAL a una posicion.
+    -- Mueve al JUGADOR (real o virtual) a una posicion.
     --
     -- En la campana el escenario exige un jugador (usa game.players[1]) y las
     -- ramas finales piden acciones reales: abrir el pecio, coger piezas. Desde
     -- VR el jugador se mueve con el control izquierdo, asi que el mod hace
     -- dePiernas: teleport() coloca al jugador donde toca.
+    --
+    -- Si no hay nadie conectado (servidor headless), mueve al PERSONAJE
+    -- VIRTUAL, que es lo que permite jugar la campana sin cliente grafico.
     teleport_player = function(x, y)
-        local p = real_player()
+        local p = actor()
         if not p then
             rcon.print("ERR|no_player")
             return false

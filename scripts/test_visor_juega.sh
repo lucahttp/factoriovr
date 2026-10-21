@@ -68,10 +68,14 @@ else
         exit 2
     fi
     # El host no alcanza la red interna del contenedor (slirp no hace NAT
-    # inverso), asi que el RCON se trae con un tunel por la maquina.
-    TUNEL_PUERTO=27915
-    "$PODMAN" machine ssh -- "true" >/dev/null 2>&1 || true
-    say "  (el tunel del contenedor se hace con 'podman machine ssh')"
+    # inverso) y la maquina de podman se maneja por socket local, sin puerto
+    # TCP al que abrir un tunel.  La via que queda es la de verdad: el
+    # dispositivo.
+    say "AVISO: el contenedor no publica el RCON al host."
+    say "       (la maquina de podman se maneja por socket local: no hay"
+    say "        puerto TCP al que abrir un tunel desde el Mac)."
+    say "       Para comprobar el visor hace falta el visor de verdad:"
+    say "         adb forward tcp:27015 tcp:27015 && bash $0 pico"
     exit 2
 fi
 

@@ -165,7 +165,11 @@ en_juego=0
 for intento in 1 2; do
     arrancar_cliente
     ok "cliente lanzado (intento $intento, transmitiendo a 127.0.0.1:$PUERTO)"
-    for t in $(seq 1 45); do
+    # El arranque es LENTO: en el contenedor (render por software) el motor
+    # tarda mas de 100 s en cargar la partida (tiene que generar los mipmaps
+    # de 1,3 GB de atlas).  Con menos de esto el banco falla sin que haya
+    # ningun fallo de verdad.
+    for t in $(seq 1 150); do
         "$PODMAN" exec "$CONTAINER" cat "$LOG_CLIENT" > "$LOG_LOCAL" 2>/dev/null
         if grep -q "cima_tipo=4" "$LOG_LOCAL" 2>/dev/null; then
             en_juego=1
@@ -186,19 +190,34 @@ ok "partida cargada"
 COMANDO_CONSOLA='/c local p = game.player.position; local e = game.surfaces[1].create_entity{name="assembling-machine-1", position={p.x+4, p.y}}; if e then game.print("MQUINA CREADA") else game.print("NO SE PUDO") end'
 printf '%s' "$COMANDO_CONSOLA" > "$LOG_DIR/consola_stream.txt"
 "$PODMAN" cp "$LOG_DIR/consola_stream.txt" "$CONTAINER:/tmp/consola_stream.txt" >/dev/null 2>&1 || true
+# Sin gestor de ventanas en el Xvfb la ventana del juego no tiene el foco, y
+# las teclas se pierden: hay que enfocarla antes de teclear.
+enfocar_juego() {
+    "$PODMAN" exec "$CONTAINER" bash -c "
+        for w in \$(DISPLAY=$DISPLAY_NUM xdotool search --name 'Factorio' 2>/dev/null | head -3); do
+            DISPLAY=$DISPLAY_NUM xdotool windowfocus \$w 2>/dev/null || true
+            DISPLAY=$DISPLAY_NUM xdotool windowactivate \$w 2>/dev/null || true
+        done
+        true
+    " >/dev/null 2>&1 || true
+}
 for intento in 1 2 3; do
+    enfocar_juego
     "$PODMAN" exec "$CONTAINER" bash -c "DISPLAY=$DISPLAY_NUM xdotool key grave" >/dev/null 2>&1 || true
     sleep 2
     "$PODMAN" exec "$CONTAINER" bash -c "DISPLAY=$DISPLAY_NUM xdotool type --delay 25 --file /tmp/consola_stream.txt" >/dev/null 2>&1 || true
     sleep 1
     "$PODMAN" exec "$CONTAINER" bash -c "DISPLAY=$DISPLAY_NUM xdotool key Return" >/dev/null 2>&1 || true
     sleep 8
+    # Cerrar la consola del juego: si se deja abierta, sale en la captura.
+    enfocar_juego
     "$PODMAN" exec "$CONTAINER" bash -c "DISPLAY=$DISPLAY_NUM xdotool key Escape" >/dev/null 2>&1 || true
     "$PODMAN" exec "$CONTAINER" cat "$LOG_CLIENT" > "$LOG_LOCAL" 2>/dev/null
     if grep -q "caja: mundo=" "$LOG_LOCAL" 2>/dev/null; then
         ok "maquina creada (el cubo 3D se dibuja)"
         break
     fi
+    say "    la consola del juego no respondio; se reintenta"
     "$PODMAN" exec "$CONTAINER" bash -c "DISPLAY=$DISPLAY_NUM xdotool key Escape" >/dev/null 2>&1 || true
     sleep 2
 done
@@ -240,8 +259,16 @@ if [ "${frames:-0}" -lt 1 ] 2>/dev/null; then
 fi
 ok "llegaron $frames frames ($STREAM_ANCHO x $STREAM_ALTO objetivo)"
 
-if [ "${con_cubo:-0}" -lt 1 ] 2>/dev/null; then
-    fail "los frames llegaron pero ninguno traia el cubo 3D (max_pixeles_cubo=$max_cubo)"
+# La maquina tiene que existir: sin ella no hay cubo que dibujar y el banco
+# no estaria comprobando nada.
+if ! grep -q "caja: mundo=" "$LOG_LOCAL" 2>/dev/null; then
+    fail "no se creo la maquina: el hook de la entidad no llego a la caja (no hay 3D que enviar)"
+fi
+ok "la maquina se creo (hay entidad que se dibuja en 3D)"
+
+# El cubo son miles de pixeles magenta: un par de pixeles seria ruido.
+if [ "${max_cubo:-0}" -lt 100 ] 2>/dev/null; then
+    fail "los frames llegaron pero el cubo 3D no se ve (max_pixeles_cubo=$max_cubo, hacen falta hundreds)"
 fi
 ok "$con_cubo frames con el cubo 3D dentro (maximo $max_cubo pixeles)"
 

@@ -343,8 +343,8 @@ static N_ENTIDADES: AtomicUsize = AtomicUsize::new(0);
 
 type GlGetIntegerv = unsafe extern "C" fn(pname: u32, params: *mut i32);
 type GlGetError = unsafe extern "C" fn() -> u32;
-/// `glIsEnabled(capability)`.
-type GlIsEnabled = unsafe extern "C" fn(capability: u32) -> u8;
+/// `glScissor(x, y, width, height)`: fija la caja de recorte.
+type GlScissor = unsafe extern "C" fn(x: i32, y: i32, width: i32, height: i32);
 /// `glBindFramebuffer(target, framebuffer)`.
 type GlBindFramebuffer = unsafe extern "C" fn(target: u32, framebuffer: u32);
 type GlCreateShader = unsafe extern "C" fn(shader_type: u32) -> u32;
@@ -413,7 +413,6 @@ const GL_TRIANGLES: u32 = 0x0004;
 const GL_FLOAT: u32 = 0x1406;
 const GL_UNSIGNED_INT: u32 = 0x1405;
 const GL_DEPTH_TEST: u32 = 0x0B71;
-const GL_SCISSOR_TEST: u32 = 0x0C11;
 const GL_SCISSOR_BOX: u32 = 0x0C10;
 const GL_CULL_FACE: u32 = 0x0B44;
 const GL_BLEND: u32 = 0x0BE2;
@@ -446,7 +445,7 @@ const GL_SAMPLES: u32 = 0x80A9;
 struct Gl {
     get_integerv: GlGetIntegerv,
     get_error: GlGetError,
-    is_enabled: GlIsEnabled,
+    scissor: GlScissor,
     bind_framebuffer: GlBindFramebuffer,
     create_shader: GlCreateShader,
     shader_source: GlShaderSource,
@@ -482,7 +481,7 @@ struct Gl {
 struct GlAddr {
     get_integerv: usize,
     get_error: usize,
-    is_enabled: usize,
+    scissor: usize,
     bind_framebuffer: usize,
     create_shader: usize,
     shader_source: usize,
@@ -624,7 +623,7 @@ fn resolver_gl(simbolos: &resolver::Simbolos) -> Option<GlAddr> {
     Some(GlAddr {
         get_integerv: dir!("glad_glGetIntegerv"),
         get_error: dir!("glad_glGetError"),
-        is_enabled: dir!("glad_glIsEnabled"),
+        scissor: dir!("glad_glScissor"),
         bind_framebuffer: dir!("glad_glBindFramebuffer"),
         create_shader: dir!("glad_glCreateShader"),
         shader_source: dir!("glad_glShaderSource"),
@@ -679,7 +678,7 @@ fn construir_gl(dir: &GlAddr) -> Option<Gl> {
     Some(Gl {
         get_integerv: ptr!(get_integerv),
         get_error: ptr!(get_error),
-        is_enabled: ptr!(is_enabled),
+        scissor: ptr!(scissor),
         bind_framebuffer: ptr!(bind_framebuffer),
         create_shader: ptr!(create_shader),
         shader_source: ptr!(shader_source),
@@ -1376,12 +1375,11 @@ fn leer_framebuffer(gl: &Gl, vp: &[i32; 4], origen: &str) -> Option<()> {
             // no es lo que se ha pintado (y el cubo no sale nunca).
             let fb_dibujo = gl_int(gl, GL_DRAW_FRAMEBUFFER_BINDING);
             let fb_lectura = gl_int(gl, GL_READ_FRAMEBUFFER_BINDING);
-            let scissor = unsafe { (gl.is_enabled)(GL_SCISSOR_TEST) } != 0;
-            let mut caja_recorte = [0i32; 4];
-            unsafe { (gl.get_integerv)(GL_SCISSOR_BOX, caja_recorte.as_mut_ptr()) };
+            let mut caja = [0i32; 4];
+            unsafe { (gl.get_integerv)(GL_SCISSOR_BOX, caja.as_mut_ptr()) };
             log::info(&format!(
-                "diagnostico stream: framebuffer dibujo={fb_dibujo} lectura={fb_lectura} pixeles_cubo={pixeles} scissor={scissor} recorte={:?}",
-                caja_recorte
+                "diagnostico stream: framebuffer dibujo={fb_dibujo} lectura={fb_lectura} pixeles_cubo={pixeles} recorte={:?}",
+                caja
             ));
         }
         Some(())
@@ -1567,8 +1565,12 @@ fn dibujar_cajas(gl: &Gl, vp: &[i32; 4]) {
     let cull_previo = gl_int(gl, GL_CULL_FACE);
     // El motor dibuja el mundo por trozos con el recorte (scissor) activado:
     // si esta puesto, el cubo solo se ve en el trozo que se este pintando en
-    // ese momento (y casi nunca). Se quita mientras se dibuja el cubo.
-    let scissor_previo = unsafe { (gl.is_enabled)(GL_SCISSOR_TEST) } != 0;
+    // ese momento (y casi nunca).  Se ensancha la caja de recorte a todo el
+    // viewport mientras se dibuja el cubo y despues se devuelve la que
+    // tenia: asi el motor sigue viendo EXACTAMENTE el mismo estado (ni
+    // siquiera hay que saber si el recorte estaba activo).
+    let mut caja_recorte = [0i32; 4];
+    unsafe { (gl.get_integerv)(GL_SCISSOR_BOX, caja_recorte.as_mut_ptr()) };
 
     // Estado de dibujo.
     //
@@ -1580,9 +1582,6 @@ fn dibujar_cajas(gl: &Gl, vp: &[i32; 4]) {
         (gl.disable)(GL_DEPTH_TEST);
         (gl.disable)(GL_CULL_FACE);
         (gl.disable)(GL_BLEND);
-        if scissor_previo {
-            (gl.disable)(GL_SCISSOR_TEST);
-        }
         (gl.blend_func_separate)(
             GL_SRC_ALPHA,
             GL_ONE_MINUS_SRC_ALPHA,
@@ -1612,6 +1611,8 @@ fn dibujar_cajas(gl: &Gl, vp: &[i32; 4]) {
         let indices = orden_caras(&m);
 
         unsafe {
+            // Recorte a todo el viewport (el cubo tiene que verse entero).
+            (gl.scissor)(0, 0, vp[2], vp[3]);
             (gl.use_program)(cubo.programa);
             (gl.bind_vertex_array)(cubo.vao);
             (gl.bind_buffer)(GL_ARRAY_BUFFER, cubo.vbo);
@@ -1654,6 +1655,8 @@ fn dibujar_cajas(gl: &Gl, vp: &[i32; 4]) {
 
     // Se devuelve el estado al motor.
     unsafe {
+        // La caja de recorte, tal y como estaba.
+        (gl.scissor)(caja_recorte[0], caja_recorte[1], caja_recorte[2], caja_recorte[3]);
         (gl.bind_vertex_array)(vao_previo as u32);
         (gl.bind_buffer)(GL_ARRAY_BUFFER, vbo_previo as u32);
         if depth_previo != 0 {
@@ -1664,9 +1667,6 @@ fn dibujar_cajas(gl: &Gl, vp: &[i32; 4]) {
         }
         if cull_previo != 0 {
             (gl.enable)(GL_CULL_FACE);
-        }
-        if scissor_previo {
-            (gl.enable)(GL_SCISSOR_TEST);
         }
         (gl.use_program)(prog_previo as u32);
     }

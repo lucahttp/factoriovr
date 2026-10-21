@@ -147,6 +147,106 @@ pub struct LiveEntity {
     pub anim_frame: u32,
 }
 
+// ---------------------------------------------------------------------------
+// Inventario interactivo: lo que hay bajo el rayo de la mano
+//
+// En VR no hay raton ni ventana de inventario: la unica forma de coger un
+// item es apuntar con la mano y apretar. Para saber QUE hay que hacer hace
+// falta saber que hay en esa casilla:
+//
+//   - un item suelto en el suelo  -> se coge
+//   - una caja                    -> se saca de ella (o se mete en ella)
+//   - un horno                    -> se le meten ingredientes
+//
+// OJO: los items del suelo NO pueden ir en `LiveEntity`. Esa struct es
+// `#[repr(C)]` y esta espejada tal cual en el motor de VR
+// (android/src/openxr_engine.cpp), que indexa una tabla de sprites por
+// `entity_type` con un tope de ENTITY_TYPE_COUNT. Añadir un tipo nuevo
+// romperia el espejo. Por eso los items sueltos llegan en su propia seccion
+// del snapshot ("loose") y se guardan aparte.
+// ---------------------------------------------------------------------------
+
+/// Item suelto en el suelo (la entidad "item-on-ground" de Factorio).
+#[derive(Clone, Debug, PartialEq)]
+pub struct LooseItem {
+    /// Nombre del prototipo del item ("iron-plate", "coal"...).
+    pub item_name: String,
+    pub tile_x: f32,
+    pub tile_y: f32,
+    pub count: u32,
+}
+
+/// Radio (en casillas) en el que se considera que algo esta "bajo" el rayo.
+pub const TARGET_RADIUS: f32 = 1.0;
+
+/// Que hay bajo el rayo de la mano y con que se puede interactuar.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Interactable {
+    /// Un item suelto en el suelo: se puede coger.
+    LooseItem {
+        item_name: String,
+        count: u32,
+    },
+    /// Una caja: se puede sacar de ella y meter en ella.
+    Chest,
+    /// Un horno: se le pueden meter ingredientes (y combustible).
+    Furnace,
+    /// No hay nada con lo que interactuar.
+    Nothing,
+}
+
+/// Clasifica lo que hay en una casilla.
+///
+/// Se mira lo mas CERCA: si a la vez hay una caja y un item suelto al lado,
+/// manda el mas cercano. Las entidades mandan sobre los items sueltos cuando
+/// estan empatados (una caja ocupa su casilla entera).
+pub fn classify_target(
+    live: &[LiveEntity],
+    loose: &[LooseItem],
+    tile_x: f32,
+    tile_y: f32,
+) -> Interactable {
+    let mut mejor: Option<(f32, Interactable)> = None;
+
+    let mut considerar = |dist: f32, kind: Interactable| {
+        if dist > TARGET_RADIUS {
+            return;
+        }
+        let gana = match &mejor {
+            Some((mejor_dist, _)) => dist < *mejor_dist - 0.01,
+            None => true,
+        };
+        if gana {
+            mejor = Some((dist, kind));
+        }
+    };
+
+    for e in live {
+        let kind = match e.entity_type {
+            ENTITY_CHEST => Interactable::Chest,
+            ENTITY_FURNACE => Interactable::Furnace,
+            _ => continue,
+        };
+        let dx = e.tile_x - tile_x;
+        let dy = e.tile_y - tile_y;
+        considerar((dx * dx + dy * dy).sqrt(), kind);
+    }
+
+    for item in loose {
+        let dx = item.tile_x - tile_x;
+        let dy = item.tile_y - tile_y;
+        considerar(
+            (dx * dx + dy * dy).sqrt(),
+            Interactable::LooseItem {
+                item_name: item.item_name.clone(),
+                count: item.count,
+            },
+        );
+    }
+
+    mejor.map(|(_, kind)| kind).unwrap_or(Interactable::Nothing)
+}
+
 pub fn init_default_factory_entities() -> Vec<LiveEntity> {
     vec![
         // Ensambladora en (-5.5, -5.5) tiles
@@ -421,6 +521,98 @@ mod tests {
                     max_y = max_y.max(v.y);
                 }
                 println!("Model {:18}: {} verts, height = {:.3}m, base = {:.3}m", name, verts.len(), max_y - min_y, min_y);
+
+    #[test]
+    fn test_clasifica_lo_que_hay_bajo_el_rayo() {
+        let live = vec![
+            LiveEntity {
+                entity_type: ENTITY_CHEST,
+                tile_x: 5.0,
+                tile_y: 5.0,
+                orientation: 0.0,
+                status: 1,
+                animation_progress: 0.0,
+                health_ratio: 1.0,
+                arm_angle: 0.0,
+                sprite_id: 0,
+                anim_frame: 0,
+            },
+            LiveEntity {
+                entity_type: ENTITY_FURNACE,
+                tile_x: -5.0,
+                tile_y: -5.0,
+                orientation: 0.0,
+                status: 1,
+                animation_progress: 0.0,
+                health_ratio: 1.0,
+                arm_angle: 0.0,
+                sprite_id: 0,
+                anim_frame: 0,
+            },
+        ];
+        let loose = vec![LooseItem {
+            item_name: "iron-plate".to_string(),
+            tile_x: 0.5,
+            tile_y: 0.5,
+            count: 3,
+        }];
+
+        assert_eq!(
+            classify_target(&live, &loose, 5.0, 5.0),
+            Interactable::Chest
+        );
+        assert_eq!(
+            classify_target(&live, &loose, -5.0, -5.0),
+            Interactable::Furnace
+        );
+        assert_eq!(
+            classify_target(&live, &loose, 0.5, 0.5),
+            Interactable::LooseItem {
+                item_name: "iron-plate".to_string(),
+                count: 3,
+            }
+        );
+        // Lejos de todo: no hay nada con lo que interactuar.
+        assert_eq!(
+            classify_target(&live, &loose, 100.0, 100.0),
+            Interactable::Nothing
+        );
+    }
+
+    #[test]
+    fn test_lo_que_mas_cerca_manda() {
+        // Un item suelto pegado a una caja: manda el item (esta mas cerca).
+        let live = vec![LiveEntity {
+            entity_type: ENTITY_CHEST,
+            tile_x: 5.0,
+            tile_y: 5.0,
+            orientation: 0.0,
+            status: 1,
+            animation_progress: 0.0,
+            health_ratio: 1.0,
+            arm_angle: 0.0,
+            sprite_id: 0,
+            anim_frame: 0,
+        }];
+        let loose = vec![LooseItem {
+            item_name: "coal".to_string(),
+            tile_x: 4.2,
+            tile_y: 5.0,
+            count: 1,
+        }];
+        assert_eq!(
+            classify_target(&live, &loose, 4.2, 5.0),
+            Interactable::LooseItem {
+                item_name: "coal".to_string(),
+                count: 1,
+            }
+        );
+        // Y si se apunta a la caja, la caja.
+        assert_eq!(
+            classify_target(&live, &loose, 5.0, 5.0),
+            Interactable::Chest
+        );
+    }
             }
         }
     }

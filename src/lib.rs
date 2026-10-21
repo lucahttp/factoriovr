@@ -1148,6 +1148,165 @@ pub unsafe extern "C" fn xfactorvr_on_entity_draw(
     }
 }
 
+/// Coge un item del suelo con la mano de VR.
+///
+/// El remoto del mod ("pick_up_item") coge el item que hay en esa casilla y lo
+/// mete en el inventario del actor (el jugador real o el personaje virtual).
+/// Si no hay ningun item ahi, el mod responde "ERR|no_item" y no pasa nada.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn xfactorvr_pick_up_item(tile_x: f32, tile_y: f32) -> bool {
+    if let Ok(world) = game_bridge::get_simulation_world().read() {
+        if world.is_connected_to_rcon {
+            let cmd = format!(
+                "/silent-command remote.call('xfactorvr', 'pick_up_item', {:.2}, {:.2})",
+                tile_x, tile_y
+            );
+            if let Ok(mut rcon) = game_bridge::get_rcon_client().lock() {
+                rcon.execute(&cmd);
+            }
+            return true;
+        }
+    }
+    false
+}
+
+/// Saca un item de una caja (o de los ingredientes de un horno).
+///
+/// CASO RARO: `item_name` puede ser NULL o "", y entonces el mod coge el
+/// PRIMER item que haya en la caja. En VR todavia no hay HUD de inventario, asi
+/// que no se puede elegir QUE item se coge: se coge el primero que haya.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn xfactorvr_take_from_container(
+    tile_x: f32,
+    tile_y: f32,
+    item_name: *const std::os::raw::c_char,
+    count: u32,
+) -> bool {
+    // Un nombre vacio (o NULL) significa "el primer item de la caja".
+    let nombre = if item_name.is_null() {
+        String::new()
+    } else {
+        match std::ffi::CStr::from_ptr(item_name).to_str() {
+            Ok(s) => s.to_string(),
+            Err(_) => return false,
+        }
+    };
+    if let Ok(world) = game_bridge::get_simulation_world().read() {
+        if world.is_connected_to_rcon {
+            let cmd = format!(
+                "/silent-command remote.call('xfactorvr', 'take_from_container', {:.2}, {:.2}, '{}', {})",
+                tile_x,
+                tile_y,
+                nombre,
+                count.max(1)
+            );
+            if let Ok(mut rcon) = game_bridge::get_rcon_client().lock() {
+                rcon.execute(&cmd);
+            }
+            return true;
+        }
+    }
+    false
+}
+
+/// Mete en una maquina o en una caja el item que lleva el actor.
+///
+/// Es un TRASPASO real: el item sale del bolsillo del actor y aparece en la
+/// maquina. El remoto "insert_item" de antes NO quitaba nada del actor (sirve
+/// para el guion de la campana, que mete items que el actor no tiene), asi que
+/// para las manos de VR hace falta este.
+///
+/// CASO RARO: `item_name` NULL o "" = el mod mete el PRIMER item que lleve el
+/// actor (el que estaria "en la mano"). Y `inv_index` es el indice del
+/// inventario: 1 = el contenido de una caja, 2 = los ingredientes de un horno
+/// (en un horno el 1 es el COMBUSTIBLE, no el contenido).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn xfactorvr_insert_carried_item(
+    tile_x: f32,
+    tile_y: f32,
+    item_name: *const std::os::raw::c_char,
+    count: u32,
+    inv_index: u32,
+) -> bool {
+    // Un nombre vacio (o NULL) significa "el item que lleva en la mano".
+    let nombre = if item_name.is_null() {
+        String::new()
+    } else {
+        match std::ffi::CStr::from_ptr(item_name).to_str() {
+            Ok(s) => s.to_string(),
+            Err(_) => return false,
+        }
+    };
+    if let Ok(world) = game_bridge::get_simulation_world().read() {
+        if world.is_connected_to_rcon {
+            let cmd = format!(
+                "/silent-command remote.call('xfactorvr', 'insert_carried_item', {:.2}, {:.2}, '{}', {}, {})",
+                tile_x,
+                tile_y,
+                nombre,
+                count.max(1),
+                inv_index.max(1)
+            );
+            if let Ok(mut rcon) = game_bridge::get_rcon_client().lock() {
+                rcon.execute(&cmd);
+            }
+            return true;
+        }
+    }
+    false
+}
+
+/// Ejecuta la accion de inventario que decide la mano de VR.
+///
+/// `hand`: 0 = gatillo (coger), 1 = gripo (meter). Decide lo MISMO que la
+/// logica de las manos (src/openxr/actions.rs): si bajo el rayo hay un item
+/// suelto, una caja o un horno, hace su accion; si no hay nada interactuable,
+/// NO hace nada (no es una accion destructiva).
+///
+/// Es el gancho que el motor de VR llama con la casilla que apunta el rayo.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn xfactorvr_vr_hand_action(tile_x: f32, tile_y: f32, hand: u32) -> bool {
+    let live = get_live_entities_lock()
+        .read()
+        .map(|v| v.clone())
+        .unwrap_or_default();
+    let loose = game_bridge::get_simulation_world()
+        .read()
+        .map(|w| w.loose_items.clone())
+        .unwrap_or_default();
+    let target = tabletop::classify_target(&live, &loose, tile_x, tile_y);
+    let mano = if hand == 0 {
+        openxr::actions::VrHand::Trigger
+    } else {
+        openxr::actions::VrHand::Grip
+    };
+    match openxr::actions::decide_vr_action(&target, tile_x, tile_y, mano) {
+        Some(openxr::actions::VrAction::PickUpItem { tile_x, tile_y }) => {
+            xfactorvr_pick_up_item(tile_x, tile_y)
+        }
+        Some(openxr::actions::VrAction::TakeFromContainer {
+            tile_x,
+            tile_y,
+            item_name,
+            count,
+        }) => {
+            let nombre = std::ffi::CString::new(item_name).unwrap_or_default();
+            xfactorvr_take_from_container(tile_x, tile_y, nombre.as_ptr(), count)
+        }
+        Some(openxr::actions::VrAction::InsertItem {
+            tile_x,
+            tile_y,
+            item_name,
+            count,
+            inv_index,
+        }) => {
+            let nombre = std::ffi::CString::new(item_name).unwrap_or_default();
+            xfactorvr_insert_carried_item(tile_x, tile_y, nombre.as_ptr(), count, inv_index)
+        }
+        None => false,
+    }
+}
+
 // Constructor ejecutado automáticamente por el linker dinámico en Linux / Android
 #[cfg(any(target_os = "linux", target_os = "android"))]
 #[unsafe(export_name = "_init")]
@@ -1266,6 +1425,36 @@ mod tests {
         unsafe {
             xfactorvr_mine_entity(5.0, 5.0);
         }
+    }
+
+    /// La accion de la mano de VR no puede hacer nada tonto: si bajo el rayo
+    /// no hay ninguna entidad interactuable, la accion devuelve false (y no
+    /// manda ningun comando al juego).
+    #[test]
+    fn test_accion_vr_sin_entidad_no_hace_nada() {
+        let _guard = lock_test_state();
+        unsafe { xfactorvr_reset_world(false) };
+        // Lejos de todo: no hay caja, ni horno, ni item suelto.
+        assert!(!unsafe { xfactorvr_vr_hand_action(1000.0, 1000.0, 0) });
+        assert!(!unsafe { xfactorvr_vr_hand_action(1000.0, 1000.0, 1) });
+    }
+
+    /// Sin conexion RCON las acciones de la mano no mandan nada (devuelven
+    /// false): es la garantia de que el visor no hace inventos cuando el
+    /// puente con Factorio no esta conectado.
+    #[test]
+    fn test_acciones_vr_sin_rcon_no_mandan_nada() {
+        let _guard = lock_test_state();
+        unsafe { xfactorvr_reset_world(false) };
+        if let Ok(mut world) = game_bridge::get_simulation_world().write() {
+            world.is_connected_to_rcon = false;
+        }
+        assert!(!unsafe { xfactorvr_pick_up_item(1.0, 1.0) });
+        assert!(!unsafe { xfactorvr_take_from_container(1.0, 1.0, std::ptr::null(), 1) });
+        assert!(!unsafe { xfactorvr_insert_carried_item(1.0, 1.0, std::ptr::null(), 1, 1) });
+        // La caja de la fabrica de ejemplo esta en (-10.5, -1.5): aun asi no
+        // se manda nada, porque no hay RCON.
+        assert!(!unsafe { xfactorvr_vr_hand_action(-10.5, -1.5, 0) });
     }
 
     #[test]

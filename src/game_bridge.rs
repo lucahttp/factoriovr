@@ -15,7 +15,7 @@
 // Direcciones: Factorio 2.0 usa 16 direcciones (0 = norte, 4 = este) y los
 // radianes son dir * TAU/16. Ver factorio-3d-mod/src/entities.rs (dir_to_yaw).
 
-use crate::tabletop::LiveEntity;
+use crate::tabletop::{LiveEntity, LooseItem};
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::io::{Read, Write};
@@ -133,6 +133,9 @@ pub struct SimulationWorld {
     pub terrain: TerrainSnapshot,
     pub machine_states: HashMap<(i32, i32), MachineState>,
     pub player_inventory: HashMap<u32, u32>,
+    /// Items sueltos en el suelo que ha mandado el mod (seccion "loose" del
+    /// snapshot). Las manos de VR los usan para saber si pueden coger algo.
+    pub loose_items: Vec<LooseItem>,
     pub is_connected_to_rcon: bool,
     /// Centro de la vista actual en casillas: define que area pide al servidor.
     pub view_center: (f32, f32),
@@ -182,6 +185,7 @@ impl SimulationWorld {
             patches,
             terrain: TerrainSnapshot::default(),
             machine_states: HashMap::new(),
+            loose_items: Vec::new(),
             player_inventory: inv,
             is_connected_to_rcon: false,
             view_center: (0.0, 0.0),
@@ -198,6 +202,7 @@ impl SimulationWorld {
 
         self.player_inventory = inv;
         self.machine_states.clear();
+        self.loose_items.clear();
         self.view_center = (0.0, 0.0);
     }
 
@@ -333,6 +338,20 @@ impl SimulationWorld {
                 remaining: p.remaining,
             })
             .collect();
+
+        // Items sueltos en el suelo (seccion "loose"): no son entidades del
+        // diorama, pero las manos de VR necesitan saber que estan ahi.
+        self.loose_items = snap
+            .loose
+            .into_iter()
+            .map(|l| LooseItem {
+                item_name: l.item_name,
+                tile_x: l.x,
+                tile_y: l.y,
+                count: l.count,
+            })
+            .collect();
+
         self.terrain = snap.terrain;
     }
 
@@ -1267,6 +1286,24 @@ pub struct SnapshotPatch {
     pub remaining: u32,
 }
 
+/// Item suelto en el suelo ("item-on-ground").
+///
+/// Van en su propia seccion del snapshot porque NO pueden ir en la lista de
+/// entidades: `LiveEntity` es `#[repr(C)]` y esta espejada en el motor de VR,
+/// que indexa una tabla de sprites por tipo con un tope fijo. Añadir un tipo
+/// de entidad nuevo romperia ese espejo.
+#[derive(Debug, Deserialize)]
+pub struct SnapshotLooseItem {
+    pub x: f32,
+    pub y: f32,
+    /// Nombre del prototipo del item ("iron-plate", "coal"...).
+    #[serde(rename = "n")]
+    pub item_name: String,
+    /// Cantidad de items apilados en el suelo.
+    #[serde(rename = "c", default)]
+    pub count: u32,
+}
+
 fn default_patch_radius() -> f32 {
     2.4
 }
@@ -1277,6 +1314,9 @@ pub struct Snapshot {
     pub entities: Vec<SnapshotEntity>,
     #[serde(default)]
     pub patches: Vec<SnapshotPatch>,
+    /// Items sueltos en el suelo (seccion "loose" del snapshot).
+    #[serde(default)]
+    pub loose: Vec<SnapshotLooseItem>,
     /// Terreno real del mapa (hierba, tierra, arena, agua...).
     #[serde(default)]
     pub terrain: TerrainSnapshot,
@@ -1521,6 +1561,37 @@ mod tests {
         assert_eq!(parse_leading_number("1"), Some(1));
         assert_eq!(parse_leading_number("OK\n3"), Some(3));
         assert_eq!(parse_leading_number("ERR|no_entity"), None);
+    }
+
+    #[test]
+    fn test_snapshot_parsea_items_sueltos_del_suelo() {
+        // La seccion "loose" del snapshot lleva los items que hay sueltos en
+        // el suelo (no son entidades del diorama, pero las manos de VR los
+        // necesitan para saber si pueden coger algo).
+        let mut world = SimulationWorld::new();
+        let mut entities: Vec<LiveEntity> = Vec::new();
+        let raw = r#"{"entities":[{"t":"iron-chest","x":2.0,"y":3.0}],"patches":[],"loose":[{"x":1.5,"y":2.5,"n":"iron-plate","c":7}],"terrain":{}}"#;
+        world.apply_snapshot(&mut entities, raw);
+
+        assert_eq!(world.loose_items.len(), 1);
+        assert_eq!(world.loose_items[0].item_name, "iron-plate");
+        assert_eq!(world.loose_items[0].count, 7);
+        assert!((world.loose_items[0].tile_x - 1.5).abs() < 1e-6);
+        assert!((world.loose_items[0].tile_y - 2.5).abs() < 1e-6);
+
+        // La caja sigue entrando por la lista de entidades de siempre.
+        assert_eq!(entities.len(), 1);
+        assert_eq!(entities[0].entity_type, crate::tabletop::ENTITY_CHEST);
+    }
+
+    #[test]
+    fn test_snapshot_sin_seccion_loose_sigue_valiendo() {
+        // Un mod viejo (sin la seccion "loose") no debe romper nada.
+        let mut world = SimulationWorld::new();
+        let mut entities: Vec<LiveEntity> = Vec::new();
+        let raw = r#"{"entities":[],"patches":[],"terrain":{}}"#;
+        world.apply_snapshot(&mut entities, raw);
+        assert!(world.loose_items.is_empty());
     }
 
     #[test]

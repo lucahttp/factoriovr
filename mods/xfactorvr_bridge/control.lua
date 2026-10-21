@@ -382,6 +382,65 @@ local function inventory_contents(inv)
     return lista
 end
 
+--- Mete items en el inventario del actor y devuelve cuantos se metieron DE
+--- VERDAD.
+---
+--- A diferencia de `inv_add`, esta NO recurre al inventario virtual cuando el
+--- actor tiene inventario real (el del jugador de verdad) y no le cabe: si se
+--- recurriera, el item se guardaria en el inventario virtual, invisible para
+--- el jugador, y el original se quitaria de la caja: item perdido.
+local function meter_en_actor(name, count, quality)
+    if count <= 0 then return 0 end
+    local inv = actor_inventory()
+    if inv then
+        local spec = { name = name, count = count }
+        if quality then spec.quality = quality end
+        local ok, inserted = pcall(function()
+            return inv.insert(spec)
+        end)
+        if ok and inserted then return inserted end
+        return 0
+    end
+    local v = virtual_inventory()
+    v[name] = (v[name] or 0) + count
+    return count
+end
+
+--- Items que lleva el actor, en orden ALFABETICO (estable).
+---
+--- Devuelve una lista de {name, count}. En VR todavia no hay HUD de
+--- inventario, asi que no se puede elegir QUE item se coge o se mete: se
+--- prueban en orden y el primero que valga es el que se usa.
+local function items_del_actor()
+    local lista = {}
+    local inv = actor_inventory()
+    if inv then
+        for _, stack in ipairs(inventory_contents(inv)) do
+            table.insert(lista, { name = stack.name, count = stack.count, quality = stack.quality })
+        end
+    else
+        local v = virtual_inventory()
+        local nombres = {}
+        for nombre, cantidad in pairs(v) do
+            if type(cantidad) == "number" and cantidad > 0 then
+                table.insert(nombres, nombre)
+            end
+        end
+        for _, nombre in ipairs(nombres) do
+            table.insert(lista, { name = nombre, count = v[nombre] })
+        end
+    end
+
+    -- El contenido de un inventario real viene en un orden que NO es fijo (es
+    -- una tabla hash), asi que se ordena por nombre: el mismo inventario da
+    -- siempre el mismo item.
+    table.sort(lista, function(a, b)
+        if a.name == b.name then return false end
+        return a.name < b.name
+    end)
+    return lista
+end
+
 --- Quita `count` items de un inventario concreto.
 --- En Factorio 2.0 `LuaInventory.remove` espera un ItemStackIdentification
 --- ({name=, count=}); la forma antigua (nombre, cantidad) se deja como
@@ -694,6 +753,36 @@ local function buscar_item_del_suelo(surface, x, y)
     return nil
 end
 
+--- Inventario de "caja" de una entidad (el contenido de una caja o los
+--- ingredientes de una maquina).
+---
+--- OJO: el indice de inventario NO es el mismo en todas las entidades:
+---
+---  - en una CAJA (tipo "container") el contenido esta en el indice 1;
+---  - en un HORNO (tipo "furnace") el indice 1 es el COMBUSTIBLE y los
+---    ingredientes ("crafter_input") estan en el indice 2;
+---  - en una ensambladora el 1 son los ingredientes.
+---
+--- Por eso el indice se decide por el tipo de entidad y no por "el primero
+--- que exista". Leer `get_inventory` con un indice que la entidad no tiene
+--- LANZA ERROR, asi que va todo protegido con pcall.
+local function inventario_caja(e)
+    if not (e and e.valid) then return nil end
+
+    -- Horno: primero los ingredientes (2), luego el combustible (1).
+    if e.type == "furnace" then
+        local ok2, inv2 = pcall(function() return e.get_inventory(2) end)
+        if ok2 and inv2 then return inv2 end
+    end
+
+    -- Caja y ensambladora: el contenido esta en el 1.
+    for _, idx in ipairs({ 1, 2 }) do
+        local ok, inv = pcall(function() return e.get_inventory(idx) end)
+        if ok and inv then return inv end
+    end
+    return nil
+end
+
 --- Vacia un inventario de una entidad en el inventario del actor.
 --- Devuelve cuantos items se han movido.
 local function loot_inventory(inv)
@@ -823,6 +912,41 @@ local function serialize_entity(e)
     return out .. "}"
 end
 
+-- ---------------------------------------------------------------------------
+-- Items sueltos en el suelo
+--
+-- El item del suelo es una entidad "item-on-ground" que NO esta en la tabla
+-- de tipos compartidos con el motor de VR, asi que nunca llega al cliente por
+-- la lista de entidades. Como el cliente necesita saber QUE hay bajo el rayo
+-- para decidir si la mano coge un item, se manda en una seccion aparte del
+-- snapshot: "loose".
+--
+-- OJO: la API de 2.1 no tiene `entity.item`: la pila esta en `entity.stack`.
+-- ---------------------------------------------------------------------------
+
+local MAX_LOOSE = 300
+
+--- Recoge los items que hay sueltos en el suelo del area.
+local function collect_loose(found)
+    local sueltos = {}
+    for _, e in ipairs(found) do
+        if #sueltos >= MAX_LOOSE then break end
+        if e.valid and e.name == "item-on-ground" then
+            local ok_stack, stack = pcall(function() return e.stack end)
+            if ok_stack and stack then
+                local ok_nombre, nombre = pcall(function() return stack.name end)
+                local ok_cant, cantidad = pcall(function() return stack.count end)
+                if ok_nombre and ok_cant and nombre and cantidad and cantidad > 0 then
+                    table.insert(sueltos, string.format(
+                        '{"x":%.2f,"y":%.2f,"n":"%s","c":%d}',
+                        e.position.x, e.position.y, nombre, cantidad))
+                end
+            end
+        end
+    end
+    return sueltos
+end
+
 --- Acumula los recursos de una zona en parches compactos de 4x4 casillas.
 local function collect_patches(found)
     local buckets = {}
@@ -938,7 +1062,7 @@ remote.add_interface("xfactorvr", {
 
         local surface = game.surfaces[1]
         if not surface then
-            local empty = '{"entities":[],"patches":[],"terrain":{}}'
+            local empty = '{"entities":[],"patches":[],"loose":[],"terrain":{}}'
             rcon.print(empty)
             return empty
         end
@@ -950,7 +1074,7 @@ remote.add_interface("xfactorvr", {
 
         local ok, found = pcall(function() return surface.find_entities(area) end)
         if not ok or not found then
-            local empty = '{"entities":[],"patches":[],"terrain":{}}'
+            local empty = '{"entities":[],"patches":[],"loose":[],"terrain":{}}'
             rcon.print(empty)
             return empty
         end
@@ -964,6 +1088,10 @@ remote.add_interface("xfactorvr", {
             if s then table.insert(entities, s) end
         end
 
+        -- Items sueltos en el suelo (van en su propia seccion: el cliente los
+        -- usa para saber si la mano debe coger algo).
+        local loose = collect_loose(found)
+
         -- El terreno se recoge aparte: son miles de tiles y no deben
         -- romper el caso de que get_tile falle en alguna posicion.
         local terreno = "{}"
@@ -976,6 +1104,7 @@ remote.add_interface("xfactorvr", {
 
         local out = '{"entities":[' .. table.concat(entities, ",") ..
             '],"patches":[' .. table.concat(patches, ",") ..
+            '],"loose":[' .. table.concat(loose, ",") ..
             '],"terrain":' .. terreno .. '}'
         rcon.print(out)
         return out
@@ -1140,6 +1269,199 @@ remote.add_interface("xfactorvr", {
         actualizar_barra_rapida()
         rcon.print("OK")
         return true
+    end,
+
+    -- Saca un item de un contenedor (una caja) y lo mete en el inventario del
+    -- actor (el jugador real conectado o el personaje virtual).
+    --
+    -- Es el remoto que usa el visor VR para "coger un item de una caja": el
+    -- jugador REAL de Factorio puede abrir la caja y arrastrar, pero con las
+    -- manos VR no hay raton, asi que el puente hace de mano.
+    --
+    -- item_name vacio o nil = "coge el primer item que haya en la caja". En VR
+    -- todavia no se elige item (no hay HUD de inventario), asi que esa es la
+    -- forma normal de llamarlo.
+    take_from_container = function(x, y, item_name, count)
+        count = count or 1
+        if count <= 0 then count = 1 end
+
+        local surface = game.surfaces[1]
+        if not surface then
+            rcon.print("ERR|no_surface")
+            return false
+        end
+
+        -- El contenedor mas cercano al punto, sin contar al propio actor.
+        local found = surface.find_entities_filtered({
+            position = { x, y },
+            radius = 1.5,
+        })
+        local e = entidad_mas_cercana(found, x, y, actor_unit_number(actor()))
+        if not e then
+            rcon.print("ERR|no_container")
+            return false
+        end
+
+        local inv = inventario_caja(e)
+        if not inv then
+            rcon.print("ERR|no_container")
+            return false
+        end
+
+        -- Contenido de la caja como LISTA (get_contents devuelve un array).
+        local contenido = inventory_contents(inv)
+        if #contenido == 0 then
+            rcon.print("ERR|empty")
+            return false
+        end
+
+        -- Que item se coge: el pedido o, si no hay ninguno, el primero.
+        local elegido = nil
+        if item_name and item_name ~= "" then
+            for _, stack in ipairs(contenido) do
+                if stack.name == item_name then
+                    elegido = stack
+                    break
+                end
+            end
+            if not elegido then
+                rcon.print("ERR|no_item")
+                return false
+            end
+        else
+            elegido = contenido[1]
+        end
+
+        -- Se coge como mucho lo que hay, y no mas de lo pedido.
+        local cantidad = math.min(count, elegido.count or 1)
+
+        -- Primero se mete en el actor y DESPUES se quita de la caja: si el
+        -- inventario del actor esta lleno, el item se queda en la caja en vez
+        -- de perderse por el camino.
+        local cogido = meter_en_actor(elegido.name, cantidad, elegido.quality)
+        if cogido <= 0 then
+            rcon.print("ERR|no_space")
+            return false
+        end
+
+        -- De la caja solo se quitan los items que se han llevado de verdad.
+        if cogido < cantidad then
+            cantidad = cogido
+        end
+        local quitado = inv_take(inv, elegido.name, cantidad, elegido.quality)
+        if quitado <= 0 then
+            -- No se pudo quitar de la caja: se devuelve al actor lo que se le
+            -- habia metido, para que el item no se duplique.
+            inv_remove(elegido.name, cogido)
+            rcon.print("ERR|no_take")
+            return false
+        end
+
+        actualizar_barra_rapida()
+        rcon.print("OK|" .. tostring(quitado) .. "|" .. tostring(elegido.name))
+        return true
+    end,
+
+    -- Mete en una maquina o en una caja el item que LLEVA el actor, y lo quita
+    -- de su inventario (es un traspaso, no una copia).
+    --
+    -- Es lo que usa el visor VR al meter la mano en el horno: el item sale del
+    -- bolsillo y aparece en la maquina. El remoto "insert_item" de antes NO
+    -- quitaba nada del actor (sirve para el guion de la campana, que mete
+    -- items que el actor no tiene), asi que para las manos de VR hace falta
+    -- este.
+    --
+    -- item_name vacio o nil = "mete el PRIMER item que lleve el actor". En VR
+    -- todavia no se puede elegir item (no hay HUD de inventario), asi que esa
+    -- es la forma normal de llamarlo.
+    --
+    -- inv_index: en un horno el 1 es el combustible y el 2 los ingredientes;
+    -- en una caja el 1 es su contenido.
+    insert_carried_item = function(x, y, item_name, count, inv_index)
+        count = count or 1
+        if count <= 0 then count = 1 end
+        inv_index = inv_index or 1
+
+        local surface = game.surfaces[1]
+        if not surface then
+            rcon.print("ERR|no_surface")
+            return false
+        end
+
+        -- Que item se mete: el pedido o, si no viene, los que lleva el actor.
+        --
+        -- CASO RARO: en un horno no vale cualquier cosa (una plancha no se
+        -- funde: solo el mineral). Como en VR no se puede elegir el item, se
+        -- prueban los que lleva el actor en orden alfabetico y se usa el
+        -- primero que la maquina acepte.
+        local candidatos = {}
+        if item_name and item_name ~= "" then
+            if inv_get(item_name) <= 0 then
+                rcon.print("ERR|no_item")
+                return false
+            end
+            table.insert(candidatos, { name = item_name, count = count })
+        else
+            candidatos = items_del_actor()
+            if #candidatos == 0 then
+                rcon.print("ERR|no_item")
+                return false
+            end
+        end
+
+        -- La entidad mas cercana al punto (sin contar al propio actor).
+        local found = surface.find_entities_filtered({
+            position = { x, y },
+            radius = 1.5,
+        })
+        local e = entidad_mas_cercana(found, x, y, actor_unit_number(actor()))
+        if not e then
+            rcon.print("ERR|no_machine")
+            return false
+        end
+
+        local ok_inv, inv = pcall(function() return e.get_inventory(inv_index) end)
+        if not (ok_inv and inv) then
+            rcon.print("ERR|no_machine")
+            return false
+        end
+
+        -- Se prueban los candidatos uno a uno hasta que uno entra.
+        for _, cand in ipairs(candidatos) do
+            -- 1) Se saca del bolsillo del actor (como mucho lo que lleva).
+            local wanted = math.min(count, cand.count or count)
+            local sacado = inv_remove(cand.name, wanted)
+            if sacado > 0 then
+                -- 2) Se mete en la maquina. Si no cabe, lo que no cupo vuelve
+                -- al bolsillo: los items no se pierden ni se duplican.
+                local spec = { name = cand.name, count = sacado }
+                if cand.quality then spec.quality = cand.quality end
+                local ok_ins, metido = pcall(function()
+                    return inv.insert(spec)
+                end)
+                if ok_ins and metido and metido > 0 then
+                    if metido < sacado then
+                        meter_en_actor(cand.name, sacado - metido)
+                    end
+
+                    -- 3) Si la maquina se ha quedado sin combustible, se le
+                    -- mete el carbon que lleva el actor (si lo lleva). El caso
+                    -- raro: meter la mano en un horno vacio tiene que poner
+                    -- algo a quemar, no solo ingredientes.
+                    abastecer_combustible(e)
+
+                    actualizar_barra_rapida()
+                    rcon.print("OK|" .. tostring(metido) .. "|" .. tostring(cand.name))
+                    return true
+                end
+                -- Este item no valia: vuelve al bolsillo y se prueba el
+                -- siguiente.
+                meter_en_actor(cand.name, sacado)
+            end
+        end
+
+        rcon.print("ERR|no_space")
+        return false
     end,
 
     -- Minado manual con pico sobre una veta. Devuelve el id del mineral.

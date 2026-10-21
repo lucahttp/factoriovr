@@ -122,7 +122,39 @@ validarlo (para no dar por bueno lo que no se ha comprobado).
   `scripts/preview_scene.py`).
 - El **mod 3D de verdad** (modelos `.glb` y cámara deformada, como el de GDani31) se está
   portando al inyector: el juego dibujaría los modelos 3D en su propio contexto GL.
-- La **publicación estéreo**: capturar el framebuffer del juego y presentarlo por OpenXR.
+- La **publicación estéreo**: la imagen real del juego ya llega al visor (ver §2 ter), pero
+  es **una sola vista**: se manda el framebuffer del mundo por TCP (protocolo XFV1) y el visor
+  lo pinta como un panel con un desplazamiento de UV por ojo (efecto "TV 3D"). Para estéreo
+  de verdad habría que renderizar el mundo dos veces (una por ojo) dentro del motor.
+
+### 2 ter. El render real del juego llega al visor
+
+Con el cliente gráfico en marcha (el que pinta de verdad), el inyector lee el framebuffer
+del mundo y lo manda al APK por TCP (`127.0.0.1:27020`). El APK lo pinta como un panel al
+fondo de la mesa.
+
+```bash
+# El cliente lo arranca con esto (ya va en scripts/start_factorio_client.sh):
+export XFACTORVR_STREAM=127.0.0.1:27020   # destino del visor
+export XFACTORVR_STREAM_ANCHO=640          # tamaño del frame
+export XFACTORVR_STREAM_FPS=12             # fps objetivo
+```
+
+Para comprobarlo **sin Pico** (el motor real en el contenedor):
+
+```bash
+bash scripts/test_stream_render.sh   # frames recibidos + pixeles del cubo 3D dentro
+```
+
+Y en el dispositivo, en el log del APK:
+
+| Línea | Significa |
+|---|---|
+| `Escuchando el render real del juego en 127.0.0.1:27020` | el visor espera frames |
+| `El juego se ha conectado: empieza el render real` | el inyector ha conectado |
+| `Se ha cortado la conexion del render del juego` | el juego se ha parado |
+
+Detalle completo en `docs/ADR-009-render-real-al-visor.md`.
 
 ## 7. Notas de arquitectura (por si hay que tocar esto)
 

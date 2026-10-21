@@ -22,6 +22,12 @@
 #include <chrono>
 #include <dlfcn.h>
 #include <aaudio/AAudio.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <cerrno>
+#include <mutex>
+#include <atomic>
 
 #define TAG "XFactorVR_OpenXR"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, TAG, __VA_ARGS__)
@@ -1572,6 +1578,10 @@ static void trigger_controller_haptics(XrSession session, XrAction haptic_action
     xrApplyHapticFeedback(session, &hapticInfo, (XrHapticBaseHeader*)&vib);
 }
 
+// Panel con el render real del juego (definido mas abajo, en su propio
+// bloque: necesita sockets y textura).
+static void draw_game_panel(const float* vp_mat, const float* model_mesa, bool ojo_primario);
+
 static void draw_tabletop_scene(const float* vp_mat,
                                 float anim_time,
                                 float dt,
@@ -2514,6 +2524,253 @@ static void draw_tabletop_scene(const float* vp_mat,
         glDrawArrays(GL_TRIANGLES, 0, (GLsizei)dyn_verts.size());
     }
 
+    // El render real del juego (si el juego lo esta mandando) se pinta como un
+    // panel al fondo de la mesa: es la imagen que compone el motor, con el
+    // cubo 3D dentro. Va lo ultimo para que quede por encima de la mesa.
+    draw_game_panel(vp_mat, active_model, is_primary_eye);
+
+    glBindVertexArray(0);
+    glBindBuffer(GL_ARRAY_BUFFER, 0);
+}
+
+// ============================================================================
+// RENDER REAL DEL JUEGO (protocolo XFV1)
+// ============================================================================
+//
+// El inyector (dentro del proceso del juego) manda por TCP el framebuffer del
+// mundo: lo que el jugador ve de verdad, con el cubo 3D del modulo 3D dentro.
+// Aqui se recibe y se pinta como un panel en MR.
+//
+// Protocolo XFV1 (little-endian):
+//   0..4    magic u32 = 0x31564658 ("XFV1")
+//   4..8    numero de frame u32
+//   8..10   ancho u16
+//   10..12  alto u16
+//   12      flags u8
+//   13      formato u8 (0 = RGBA8888)
+//   14..16  reservado u16
+//   carga: ancho*alto*4 bytes RGBA (filas de abajo arriba, como en GL)
+//
+// El panel se dibuja con un pequeño desplazamiento de UV por ojo: eso es el
+// efecto "TV 3D", y da volumen al cubo que pinta el inyector.
+
+static const uint16_t JUEGO_PUERTO = 27020;
+/// Desplazamiento horizontal de la UV por ojo (fraccion del ancho de la imagen).
+static const float JUEGO_PARALAJE = 0.018f;
+/// Altura del panel sobre la mesa, en metros.
+static const float JUEGO_ALTURA = 0.30f;
+/// Distancia del panel al borde lejano de la mesa, en metros.
+static const float JUEGO_PROFUNDIDAD = -0.56f;
+/// Ancho del panel, en metros (16:9 con la altura que sale de la textura).
+static const float JUEGO_ANCHO = 1.00f;
+
+/// Frame recibido del juego.
+struct GameFrame {
+    std::vector<uint8_t> pix;
+    uint16_t w = 0;
+    uint16_t h = 0;
+    uint32_t numero = 0;
+    bool nuevo = false;
+};
+
+static std::mutex s_game_mutex;
+static GameFrame s_game_frame;
+static std::atomic<bool> s_game_corriendo{false};
+static std::atomic<uint64_t> s_game_frames{0};
+static GLuint s_tex_juego = 0;
+static uint16_t s_tex_juego_w = 0;
+static uint16_t s_tex_juego_h = 0;
+static GLuint s_vao_juego = 0;
+static GLuint s_vbo_juego = 0;
+static int s_juego_vertices = 0;
+static pthread_t s_game_thread = 0;
+
+/// Lee exactamente N bytes del socket. Devuelve false si se corta.
+static bool leer_exacto(int fd, uint8_t* buf, size_t n) {
+    size_t leidos = 0;
+    while (leidos < n) {
+        ssize_t r = ::read(fd, buf + leidos, n - leidos);
+        if (r <= 0) {
+            if (r < 0 && errno == EINTR) continue;
+            return false;
+        }
+        leidos += (size_t)r;
+    }
+    return true;
+}
+
+/// Hilo receptor del render del juego.
+///
+/// Escucha en 127.0.0.1:27020 y guarda el ultimo frame recibido. NO toca el
+/// GL: el hilo de OpenXR es el unico que puede subir la textura.
+static void* game_receiver_thread(void* /*arg*/) {
+    while (s_game_corriendo.load()) {
+        int srv = socket(AF_INET, SOCK_STREAM, 0);
+        if (srv < 0) {
+            LOGE("No se pudo crear el socket del render del juego");
+            sleep(1);
+            continue;
+        }
+        int uno = 1;
+        setsockopt(srv, SOL_SOCKET, SO_REUSEADDR, &uno, sizeof(uno));
+
+        sockaddr_in addr{};
+        addr.sin_family = AF_INET;
+        addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        addr.sin_port = htons(JUEGO_PUERTO);
+        if (bind(srv, (sockaddr*)&addr, sizeof(addr)) < 0 || listen(srv, 1) < 0) {
+            LOGE("No se pudo escuchar el render del juego en el puerto %d", JUEGO_PUERTO);
+            ::close(srv);
+            sleep(2);
+            continue;
+        }
+        LOGI("Escuchando el render real del juego en 127.0.0.1:%d", JUEGO_PUERTO);
+
+        while (s_game_corriendo.load()) {
+            int cli = accept(srv, nullptr, nullptr);
+            if (cli < 0) {
+                if (errno == EINTR) continue;
+                break;
+            }
+            LOGI("El juego se ha conectado: empieza el render real");
+            std::vector<uint8_t> cab(16);
+            while (s_game_corriendo.load()) {
+                if (!leer_exacto(cli, cab.data(), cab.size())) break;
+                uint32_t magic = 0, numero = 0;
+                uint16_t w = 0, h = 0;
+                memcpy(&magic, cab.data() + 0, 4);
+                memcpy(&numero, cab.data() + 4, 4);
+                memcpy(&w, cab.data() + 8, 2);
+                memcpy(&h, cab.data() + 10, 2);
+                const uint8_t formato = cab[13];
+                if (magic != 0x31564658u) {
+                    LOGE("Cabecera desconocida del render del juego: 0x%08x", magic);
+                    break;
+                }
+                if (w == 0 || h == 0 || formato != 0) break;
+                const size_t tam = (size_t)w * (size_t)h * 4;
+                std::vector<uint8_t> pix(tam);
+                if (!leer_exacto(cli, pix.data(), tam)) break;
+                {
+                    std::lock_guard<std::mutex> lock(s_game_mutex);
+                    s_game_frame.pix.swap(pix);
+                    s_game_frame.w = w;
+                    s_game_frame.h = h;
+                    s_game_frame.numero = numero;
+                    s_game_frame.nuevo = true;
+                }
+                s_game_frames.fetch_add(1);
+            }
+            ::close(cli);
+            LOGI("Se ha cortado la conexion del render del juego");
+        }
+        ::close(srv);
+    }
+    return nullptr;
+}
+
+/// Crea el quad del panel (se hace una sola vez).
+static void construir_panel_juego() {
+    if (s_vao_juego != 0) return;
+    std::vector<DioramaVertex> verts;
+    const float w = JUEGO_ANCHO * 0.5f;
+    const float h = w * 9.0f / 16.0f;
+    auto push = [&](float x, float y, float u, float v) {
+        DioramaVertex d{};
+        d.x = x; d.y = y; d.z = 0.0f;
+        d.nx = 0.0f; d.ny = 0.0f; d.nz = 1.0f;
+        d.u = u; d.v = v;
+        d.r = 1.0f; d.g = 1.0f; d.b = 1.0f; d.a = 1.0f;
+        verts.push_back(d);
+    };
+    // Cara que mira a +Z.
+    push(-w, -h, 0.0f, 0.0f);
+    push( w, -h, 1.0f, 0.0f);
+    push( w,  h, 1.0f, 1.0f);
+    push(-w, -h, 0.0f, 0.0f);
+    push( w,  h, 1.0f, 1.0f);
+    push(-w,  h, 0.0f, 1.0f);
+    s_juego_vertices = (int)verts.size();
+    s_vao_juego = create_mesh_vao(verts, s_vbo_juego);
+}
+
+/// Sube a la textura el frame mas reciente (si hay uno nuevo).
+static void subir_frame_juego() {
+    std::vector<uint8_t> pix;
+    uint16_t w = 0, h = 0;
+    {
+        std::lock_guard<std::mutex> lock(s_game_mutex);
+        if (!s_game_frame.nuevo) return;
+        pix.swap(s_game_frame.pix);
+        w = s_game_frame.w;
+        h = s_game_frame.h;
+        s_game_frame.nuevo = false;
+    }
+    if (w == 0 || h == 0 || pix.empty()) return;
+
+    if (s_tex_juego == 0) {
+        glGenTextures(1, &s_tex_juego);
+        glBindTexture(GL_TEXTURE_2D, s_tex_juego);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    }
+    glBindTexture(GL_TEXTURE_2D, s_tex_juego);
+    if (w != s_tex_juego_w || h != s_tex_juego_h) {
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, pix.data());
+        s_tex_juego_w = w;
+        s_tex_juego_h = h;
+    } else {
+        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, w, h, GL_RGBA, GL_UNSIGNED_BYTE, pix.data());
+    }
+    glBindTexture(GL_TEXTURE_2D, 0);
+}
+
+/// Pinta el panel con el render real del juego.
+///
+/// El desplazamiento por ojo (`u_uv_offset`) es lo que da el paralaje: la
+/// imagen se ve como si fuera una ventana al mundo y el cubo 3D del inyector
+/// gana volumen.
+static void draw_game_panel(const float* vp_mat, const float* model_mesa, bool ojo_primario) {
+    // En modo observador el mundo esta a escala 1:1 (x25) y el panel de la
+    // mesa no tiene sentido ahi.
+    if (s_observer_mode) return;
+    subir_frame_juego();
+    if (s_tex_juego == 0) return;
+    construir_panel_juego();
+    if (s_vao_juego == 0) return;
+
+    // Posicion: en el espacio de la mesa, en el borde lejano y por encima.
+    float m_pos[16], m_panel[16];
+    mat4_translate(m_pos, 0.0f, JUEGO_ALTURA, JUEGO_PROFUNDIDAD);
+    mat4_multiply(model_mesa, m_pos, m_panel);
+
+    float mvp[16];
+    mat4_multiply(vp_mat, m_panel, mvp);
+
+    glUseProgram(s_program);
+    glUniformMatrix4fv(s_model_loc, 1, GL_FALSE, m_panel);
+    glUniformMatrix4fv(s_mvp_loc, 1, GL_FALSE, mvp);
+    glUniform1f(s_use_tex_loc, 1.0f);
+    glUniform1f(s_lit_loc, 0.0f);
+    glUniform3f(s_emissive_loc, 1.0f, 1.0f, 1.0f);
+    glUniform1f(s_enable_clipping_loc, 0.0f);
+    // El ojo primario ve la imagen sin desplazar; el otro la desplaza un poco.
+    const float desfase = ojo_primario ? -JUEGO_PARALAJE : JUEGO_PARALAJE;
+    glUniform2f(s_uv_offset_loc, desfase, 0.0f);
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, s_tex_juego);
+    glUniform1i(s_tex_loc, 0);
+
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    glDepthMask(GL_FALSE);
+    glBindVertexArray(s_vao_juego);
+    glDrawArrays(GL_TRIANGLES, 0, s_juego_vertices);
+    glDepthMask(GL_TRUE);
+    glDisable(GL_BLEND);
+
     glBindVertexArray(0);
     glBindBuffer(GL_ARRAY_BUFFER, 0);
 }
@@ -2536,6 +2793,14 @@ static void* openxr_thread_main(void* arg) {
 
     // Validar matemáticas 3D y transformaciones de OpenXR estilo Generals XR
     selfCheckMath();
+
+    // Receptor del render real del juego: el inyector (dentro del proceso
+    // del juego) se conecta a este puerto y manda los frames.
+    s_game_corriendo.store(true);
+    if (pthread_create(&s_game_thread, nullptr, game_receiver_thread, nullptr) != 0) {
+        LOGE("No se pudo arrancar el hilo receptor del render del juego");
+        s_game_corriendo.store(false);
+    }
 
     // 1. Inicializar Loader Android
     PFN_xrInitializeLoaderKHR xrInitializeLoaderKHR = nullptr;
@@ -3347,6 +3612,14 @@ static void* openxr_thread_main(void* arg) {
     }
 
     shutdown_audio_system();
+
+    // El receptor del render del juego se para aqui.
+    s_game_corriendo.store(false);
+    if (s_game_thread) {
+        pthread_join(s_game_thread, nullptr);
+        s_game_thread = 0;
+    }
+
     activity->vm->DetachCurrentThread();
     LOGI("=== Hilo OpenXR finalizado ===");
     return nullptr;

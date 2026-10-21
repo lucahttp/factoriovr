@@ -248,6 +248,10 @@ pub fn instalar() {
     crate::modelo3d::configurar();
     crate::modelo3d::instalar(&simbolos);
 
+    // --- envio de la imagen real del juego al visor VR ---
+    // Se activa con `XFACTORVR_STREAM=host:puerto`. Si no esta, no hace nada.
+    crate::stream::configurar();
+
     // --- resolver ---
     let encontrado = match simbolos.resolver(&objetivo) {
         Some(r) => r,

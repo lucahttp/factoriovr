@@ -182,6 +182,16 @@ if [ -f "$INJECTOR" ] && [ "${XFACTORVR_USE_INJECTOR:-1}" = "1" ]; then
     # Destino de los hooks: por defecto el render del juego.
     export XFACTORVR_HOOK_TARGET="${XFACTORVR_HOOK_TARGET:-GameRenderer::render}"
     export XFACTORVR_HOOK_EVERY="${XFACTORVR_HOOK_EVERY:-60}"
+    # Envio del render real al visor VR: el APK escucha en 127.0.0.1:27020
+    # y el juego le manda el framebuffer del mundo (protocolo XFV1).
+    # Se puede desactivar con XFACTORVR_STREAM=0.
+    if [ "${XFACTORVR_STREAM:-1}" = "1" ]; then
+        export XFACTORVR_STREAM="${XFACTORVR_STREAM_ADDR:-127.0.0.1:27020}"
+        export XFACTORVR_STREAM_ANCHO="${XFACTORVR_STREAM_ANCHO:-640}"
+        export XFACTORVR_STREAM_ALTO="${XFACTORVR_STREAM_ALTO:-360}"
+        export XFACTORVR_STREAM_FPS="${XFACTORVR_STREAM_FPS:-12}"
+        log "render real al visor: $XFACTORVR_STREAM (${XFACTORVR_STREAM_ANCHO}x${XFACTORVR_STREAM_ALTO})"
+    fi
 fi
 
 # --- 4. Estado inicial ------------------------------------------------------

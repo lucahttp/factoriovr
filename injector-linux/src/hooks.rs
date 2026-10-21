@@ -90,8 +90,15 @@ pub extern "C" fn xfv_hook_process_events(this: *mut c_void, in_game: u8) -> u8 
 
 /// Cuerpo del hook.
 extern "C" fn hook_render(this: *mut c_void) {
+    // El frame COMPLETO del juego se manda aqui: en este momento (antes de
+    // que el motor vacie el framebuffer del mundo) todavia esta el frame
+    // anterior entero.  Leyendolo en el flush salia a medio dibujar, porque
+    // el motor dibuja el mundo por trozos.
+    crate::modelo3d::capturar_frame_completo();
+
     // Un frame nuevo: el desplazamiento de camara (estereo real) alterna de
-    // signo en cada frame.
+    // signo en cada frame.  Va DESPUES de la captura, para que la vista
+    // capturada sea la del ojo que le toca.
     crate::modelo3d::nuevo_frame();
 
     // Traza minima de la entrada (diagnostico): se escribe con write(2) para

@@ -158,33 +158,14 @@ static DESPLAZAMIENTO_CAMARA: AtomicU64 = AtomicU64::new(0);
 /// Numero de frame del motor (lo lleva la cuenta el hook de render).
 static FRAME: AtomicU64 = AtomicU64::new(0);
 
+/// El ultimo framebuffer del mundo en el que se ha dibujado (lo que hay que
+/// leer para tener el frame COMPLETO: el motor dibuja el mundo por trozos y
+/// a mitad de frame todavia falta medio mapa).
+static FB_MUNDO: AtomicU64 = AtomicU64::new(0);
+
 /// La camara BASE (sin desplazar) del frame actual.
 static CAMARA_BASE: Mutex<(u64, f64)> = Mutex::new((u64::MAX, 0.0));
 
-/// Diagnostico del streaming: frames enviados y frames con el cubo, por
-/// flush (sprites / instanced / primitives / text).
-static STAT_ORIGEN: [AtomicU64; 4] = [
-    AtomicU64::new(0),
-    AtomicU64::new(0),
-    AtomicU64::new(0),
-    AtomicU64::new(0),
-];
-static STAT_ORIGEN_CUBO: [AtomicU64; 4] = [
-    AtomicU64::new(0),
-    AtomicU64::new(0),
-    AtomicU64::new(0),
-    AtomicU64::new(0),
-];
-
-/// Indice del flush en las tablas de estadisticas.
-fn indice_origen(origen: &str) -> usize {
-    match origen {
-        "instanced" => 1,
-        "primitives" => 2,
-        "text" => 3,
-        _ => 0,
-    }
-}
 
 /// Ya se ha hecho el diagnostico de `bindUniformBuffer` (una sola vez).
 static DIAG_UB: AtomicU64 = AtomicU64::new(0);
@@ -444,6 +425,8 @@ const GL_DRAW_FRAMEBUFFER_BINDING: u32 = 0x8CA6;
 const GL_READ_FRAMEBUFFER_BINDING: u32 = 0x8CAA;
 /// Objetivo de `glBindFramebuffer` para elegir solo el framebuffer de lectura.
 const GL_READ_FRAMEBUFFER: u32 = 0x8CAA;
+/// Objetivo de `glBindFramebuffer` para elegir solo el framebuffer de dibujo.
+const GL_DRAW_FRAMEBUFFER: u32 = 0x8CA9;
 /// Vertex array actualmente enlazado.
 const GL_VERTEX_ARRAY_BINDING: u32 = 0x85B5;
 /// Buffer de vertices actualmente enlazado.
@@ -1342,7 +1325,7 @@ extern "C" fn hook_flush_text(this: *mut c_void) {
 ///
 /// Solo se pinta en el framebuffer del mundo (el que no es el de la ventana):
 /// ahi es donde el motor ha dibujado la escena y donde luego la compone.
-fn pintar_si_toca(origen: &str) {
+fn pintar_si_toca(_origen: &str) {
     // El hook sirve para dos cosas: pintar el cubo 3D y mandar la imagen real
     // del juego al visor. Cada una puede estar activada por separado.
     let quiere_3d = ACTIVO.load(Ordering::Relaxed) != 0;
@@ -1380,6 +1363,10 @@ fn pintar_si_toca(origen: &str) {
         return;
     }
 
+    // El framebuffer del mundo: es donde el motor compone la escena (y lo
+    // que hay que leer para tener el frame completo).
+    FB_MUNDO.store(fb as u64, Ordering::Relaxed);
+
     if DIAG_GL.swap(1, Ordering::Relaxed) == 0 {
         let muestras = gl_int(gl, GL_SAMPLES);
         log::info(&format!(
@@ -1392,52 +1379,8 @@ fn pintar_si_toca(origen: &str) {
         dibujar_cajas(gl, &vp);
     }
     capturar_si_pide(gl, &vp);
-    transmitir_si_toca(gl, &vp, origen);
 }
 
-/// Manda el framebuffer del mundo al visor VR, si toca.
-///
-/// Antes de leer nada se pregunta al modulo de transmision si ya toca (limite
-/// de fps): leer el framebuffer del juego es lo caro, y el hilo de render no
-/// puede quedarse esperando.
-fn transmitir_si_toca(gl: &Gl, vp: &[i32; 4], origen: &str) {
-    if !crate::stream::toca_enviar() {
-        return;
-    }
-    let w = vp[2];
-    let h = vp[3];
-    if w <= 0 || h <= 0 {
-        return;
-    }
-    // El motor vuelve a dibujar el terreno por encima de lo que hemos
-    // pintado, asi que el cubo puede haber desaparecido del framebuffer
-    // entre una pasada y otra.  Para el frame que se manda se vuelve a
-    // pintar: asi el visor recibe SIEMPRE la imagen con el 3D dentro.
-    if ACTIVO.load(Ordering::Relaxed) != 0 {
-        dibujar_cajas(gl, vp);
-    }
-    match leer_framebuffer(gl, vp, origen) {
-        Some(()) => {
-            // El frame ya esta dentro del buffer del hilo: se manda.
-            let _ = ();
-        }
-        None => {
-            log::aviso("no se pudo leer el framebuffer para transmitirlo");
-        }
-    }
-}
-
-/// Lee el framebuffer que hay enlazado (RGBA, filas de abajo arriba) y lo
-/// manda al visor.
-///
-/// El buffer se reutiliza entre llamadas: leer 4 MB de pixeles en cada frame
-/// generaria mucha basura y el motor lo notaria.
-/// Lee los pixeles del framebuffer de DIBUJO.
-///
-/// El motor puede dejar el framebuffer de LECTURA apuntando a otro sitio (el
-/// de la ventana, por ejemplo) que el de DIBUJO: entonces lo que se lee no es
-/// lo que se ha pintado y el cubo 3D no sale nunca.  Aqui se enlaza el de
-/// lectura al de dibujo, se lee, y se devuelve el estado como estaba.
 fn leer_pixeles(gl: &Gl, w: i32, h: i32, buf: &mut [u8]) {
     let fb_dibujo = gl_int(gl, GL_DRAW_FRAMEBUFFER_BINDING);
     let fb_lectura = gl_int(gl, GL_READ_FRAMEBUFFER_BINDING);
@@ -1463,12 +1406,52 @@ fn leer_pixeles(gl: &Gl, w: i32, h: i32, buf: &mut [u8]) {
     }
 }
 
-fn leer_framebuffer(gl: &Gl, vp: &[i32; 4], origen: &str) -> Option<()> {
+
+/// Captura el frame COMPLETO y lo manda al visor.
+///
+/// Se llama al principio del frame siguiente: en ese momento el framebuffer
+/// del mundo todavia tiene el frame anterior COMPLETO (el motor lo vacia
+/// despues, cuando empieza a dibujar el siguiente).  Leyendolo en el flush
+/// era un error: el motor dibuja el mundo por trozos y muchas capturas
+/// salian a medio dibujar (el 40 % de los frames).
+///
+/// El ojo es el del frame que se esta capturando (el contador de frames se
+/// incrementa DESPUES de esta llamada).
+pub fn capturar_frame_completo() {
+    if !crate::stream::toca_enviar() {
+        return;
+    }
+    let fb = FB_MUNDO.load(Ordering::Relaxed) as u32;
+    if fb == 0 {
+        return;
+    }
+    let gl = match GL.get() {
+        Some(g) => g,
+        None => return,
+    };
+
+    // El ancho y el alto del framebuffer del mundo.
+    let mut vp = [0i32; 4];
+    unsafe { (gl.get_integerv)(GL_VIEWPORT, vp.as_mut_ptr()) };
     let w = vp[2];
     let h = vp[3];
-    if w <= 0 || h <= 0 {
-        return None;
+    if w <= 0 || h <= 0 || w > 4096 || h > 4096 {
+        return;
     }
+
+    // Guardar los framebuffers que hay puestos y leer del del mundo.
+    let fb_dibujo = gl_int(gl, GL_DRAW_FRAMEBUFFER_BINDING);
+    let fb_lectura = gl_int(gl, GL_READ_FRAMEBUFFER_BINDING);
+    unsafe {
+        (gl.bind_framebuffer)(GL_DRAW_FRAMEBUFFER, fb);
+        (gl.bind_framebuffer)(GL_READ_FRAMEBUFFER, fb);
+    }
+
+    // Los errores de GL son PEGAJOSOS: puede haber alguno de antes (del
+    // propio motor).  Se limpian antes de leer, para no atribuirlos a la
+    // lectura.
+    drenar_errores(gl, "antes de leer el frame");
+
     let bytes = (w as usize) * (h as usize) * 4;
     thread_local! {
         static BUFFER: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
@@ -1480,77 +1463,25 @@ fn leer_framebuffer(gl: &Gl, vp: &[i32; 4], origen: &str) -> Option<()> {
             buf.resize(bytes, 0);
         }
         leer_pixeles(gl, w, h, &mut buf);
-        if drenar_errores(gl, "leer el framebuffer") {
-            log::aviso("no se pudo leer el framebuffer");
-            return None;
+        // Se devuelven los framebuffers como estaban.
+        unsafe {
+            (gl.bind_framebuffer)(GL_DRAW_FRAMEBUFFER, fb_dibujo as u32);
+            (gl.bind_framebuffer)(GL_READ_FRAMEBUFFER, fb_lectura as u32);
+        }
+        if drenar_errores(gl, "leer el frame completo") {
+            // El frame se manda igual: puede que la lectura haya valido y el
+            // error sea de otra cosa (y perder el frame es peor).
+            log::aviso("hubo un error de GL al leer el frame (se manda igualmente)");
         }
         if crate::stream::enviar(&buf, w as u32, h as u32, ojo_actual()) {
             log::info(&format!(
-                "frame transmitido al visor: {w}x{h} (enviados={}, perdidos={})",
+                "frame completo transmitido: {w}x{h} (enviados={}, perdidos={})",
                 crate::stream::enviados(),
                 crate::stream::perdidos()
             ));
         }
-        // Diagnostico: cuantos pixeles del cubo hay en lo que se ha leido, y
-        // de que flush viene.  Si un flush los tiene y otro no, el cubo se
-        // borra entre medias (el motor vacia el framebuffer entre pasadas).
-        let idx = indice_origen(origen);
-        STAT_ORIGEN[idx].fetch_add(1, Ordering::Relaxed);
-        let pixeles = pixeles_del_cubo(&buf);
-        if pixeles > 0 {
-            STAT_ORIGEN_CUBO[idx].fetch_add(1, Ordering::Relaxed);
-        }
-        // Diagnostico: que se ve EXACTAMENTE en lo que se manda.  Es la
-        // unica forma de saber si el cubo esta en la imagen o no.
-        // Solo se guardan frames con contenido: al principio el motor dibuja
-        // en negro (carga) y no dicen nada.
-        {
-            static RUTA_PNG: OnceLock<String> = OnceLock::new();
-            let ruta = RUTA_PNG.get_or_init(|| {
-                match std::env::var("XFACTORVR_STREAM_DEBUG_PNG") {
-                    Ok(v) if !v.is_empty() => v,
-                    _ => String::new(),
-                }
-            });
-            if !ruta.is_empty() {
-                let contenido = crate::stream::fraccion_con_contenido(&buf);
-                let n = crate::stream::enviados();
-                if contenido > 0.05 && n % 20 == 1 {
-                    escribir_png(ruta, w as u32, h as u32, &buf);
-                    log::info(&format!(
-                        "PNG de diagnostico escrito en {ruta} (contenido {contenido:.2})"
-                    ));
-                }
-            }
-        }
-
-        let n = crate::stream::enviados();
-        if n % 100 == 0 {
-            for (i, nombre) in ["sprites", "instanced", "primitives", "text"].iter().enumerate() {
-                let f = STAT_ORIGEN[i].load(Ordering::Relaxed);
-                let c = STAT_ORIGEN_CUBO[i].load(Ordering::Relaxed);
-                log::info(&format!(
-                    "diagnostico stream: {nombre}: {f} frames, {c} con el cubo"
-                ));
-            }
-            // Si el framebuffer de LECTURA no es el de DIBUJO, lo que se lee
-            // no es lo que se ha pintado (y el cubo no sale nunca).
-            let fb_dibujo = gl_int(gl, GL_DRAW_FRAMEBUFFER_BINDING);
-            let fb_lectura = gl_int(gl, GL_READ_FRAMEBUFFER_BINDING);
-            let mut caja = [0i32; 4];
-            unsafe { (gl.get_integerv)(GL_SCISSOR_BOX, caja.as_mut_ptr()) };
-            log::info(&format!(
-                "diagnostico stream: framebuffer dibujo={fb_dibujo} lectura={fb_lectura} pixeles_cubo={pixeles} recorte={:?}",
-                caja
-            ));
-        }
-        Some(())
-    })
+    });
 }
-
-// --------------------------------------------------------------------------
-// Dibujo del cubo
-// --------------------------------------------------------------------------
 
 /// Inclinacion del cubo respecto al suelo, en radianes (~31 grados).
 ///

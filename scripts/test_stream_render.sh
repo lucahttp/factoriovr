@@ -300,9 +300,10 @@ if [ "$CAMARA_DESPLAZAMIENTO" != "0" ]; then
     fi
     DIF=$(( X_IZQ > X_DER ? X_IZQ - X_DER : X_DER - X_IZQ ))
     # Lo esperado: la camara se desplaza +/-CAMARA_DESPLAZAMIENTO en el
-    # framebuffer de 1280; a la mitad (640) y entre los dos ojos, la
-    # diferencia es de unos 2*desplazamiento/4 pixeles.
-    ESPERADO=$(( CAMARA_DESPLAZAMIENTO / 2 ))
+    # framebuffer de 1280, o sea 2*desplazamiento entre las dos vistas; el
+    # frame se reduce a la mitad (640), asi que la diferencia es de
+    # CAMARA_DESPLAZAMIENTO pixeles.
+    ESPERADO=$(( CAMARA_DESPLAZAMIENTO ))
     if [ "$DIF" -lt 3 ]; then
         fail "las dos vistas son casi iguales (cubo izq=$X_IZQ der=$X_DER): la camara no se desplaza"
     fi

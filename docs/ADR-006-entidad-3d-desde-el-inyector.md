@@ -211,7 +211,44 @@ ha caído. El banco hace exactamente eso.
 * La captura es un PNG válido y comprobable.
 * El banco `scripts/test_modelo3d.sh` pasa de punta a punta.
 
-## 9. Lo que queda pendiente
+## 9. Bugs que costaron tiempo (y que ya no estan)
+
+Estos cuatro hicieron que el banco fallara aunque el codigo "pareciera" bien.
+Estan aqui para que no se repitan:
+
+1. **La mascara del inmediato del ADRP.** El inmediato de ADRP son 21 bits con
+   signo. Si la mascara se aplica sobre 32 bits (`imm21 | 0xFFE0_0000`) y luego
+   se desplaza 12 para calcular la pagina, los bits altos se salen de rango y
+   el ADRP reubicado apunta a una pagina inventada: el motor reubicado lee y
+   escribe en una direccion cualquiera.  La caja se detectaba bien (posicion y
+   tamano correctos) pero no se veia nada.
+   El signo se extiende **dentro** de los 21 bits:
+   `((((immhi << 2) | immlo) << 11) as i32) >> 11`.
+
+2. **El trampolin con saltos condicionales de 19 bits.** La reubicacion no
+   cubria `tbz`/`b.cond`: el destino del salto se reubicaba mal.  Ademas el
+   trampolin tiene que quedar a menos de 1 MB del destino (el alcance de un
+   salto condicional de 19 bits).
+
+3. **El hook de `SpriteDrawOrder::setup` tiene un prologo que no se puede
+   reubicar.** Se cambio por `DrawQueue::draw`, cuyo prologo es limpio y que
+   da la posicion, el tamano y la camara.
+
+4. **El banco validaba un `.so` viejo.** Los mtime del fuente y del binario no
+   cuadraban, cargo no recompilaba y el banco daba un fallo que parecia del
+   cubo cuando lo que estaba mal era que se estaba probando el binario
+   anterior.  Ahora el banco toca los fuentes para forzar la recompilacion.
+
+Ademas, dos cosas del banco que no son del codigo pero confunden:
+
+* La **captura son 3,6 MB** y cualquier copia por el socket de podman se
+  corta (688 KB, 3 MB...).  El PNG se valida **dentro** del contenedor y al
+  host se trae una version reducida (`scripts/reducir_captura.py`).
+* El **PNG se escribe a mano** (zlib "stored" + CRC propio): el Adler-32 del
+  stream son dos `u16` en big-endian (B primero) y cada bloque lleva su
+  CRC-32.  Hay un test que lo comprueba.
+
+## 10. Lo que queda pendiente
 
 * La **deformación de cámara** (warp) es un paso posterior: aquí no se toca.
 * El cubo tapa el sprite de la máquina pero el motor sigue encolándolo: si se

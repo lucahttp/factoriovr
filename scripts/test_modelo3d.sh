@@ -265,24 +265,14 @@ else
     fail "el PNG de la captura no es valido o no tiene el cubo"
 fi
 
-# La imagen se deja en el contenedor; al host se trae en trozos (por si se
-# quiere mirar).
-"$PODMAN" exec "$CONTAINER" bash -c "gzip -c '$CAPTURA_CONT' > /tmp/xfv_captura.gz" >/dev/null 2>&1 || true
-TROZOS=0
-while [ "$TROZOS" -lt 40 ]; do
-    "$PODMAN" exec "$CONTAINER" bash -c \
-        "dd if=/tmp/xfv_captura.gz bs=262144 skip=$TROZOS count=1 2>/dev/null" \
-        >> "$LOG_DIR/cubo_3d.png.gz" 2>/dev/null || true
-    TROZOS=$((TROZOS + 1))
-    if ! "$PODMAN" exec "$CONTAINER" bash -c \
-        "dd if=/tmp/xfv_captura.gz bs=262144 skip=$TROZOS count=1 2>/dev/null | head -c 1" \
-        2>/dev/null | grep -q .; then
-        break
-    fi
-done
-if [ -s "$LOG_DIR/cubo_3d.png.gz" ]; then
-    gunzip -f "$LOG_DIR/cubo_3d.png.gz" 2>/dev/null || true
-fi
+# La imagen grande (3,6 MB) no sale del contenedor: cualquier copia por el
+# socket de podman se corta (688 KB, 3 MB...).  Se deja una version
+# reducida, que si cabe, para poder mirarla.
+"$PODMAN" exec -i "$CONTAINER" sh -c 'cat > /tmp/reducir_captura.py' < "$PROJECT_ROOT/scripts/reducir_captura.py" >/dev/null 2>&1 || true
+"$PODMAN" exec "$CONTAINER" python3 /tmp/reducir_captura.py \
+    "$CAPTURA_CONT" /factorio/cubo_3d_small.png >/dev/null 2>&1 || true
+"$PODMAN" exec "$CONTAINER" cat /factorio/cubo_3d_small.png > "$LOG_DIR/cubo_3d_small.png" 2>/dev/null || true
+ok "captura reducida en $LOG_DIR/cubo_3d_small.png"
 
 say ""
 say "OK: el banco 3D paso. Captura en $LOG_DIR/cubo_3d.png"

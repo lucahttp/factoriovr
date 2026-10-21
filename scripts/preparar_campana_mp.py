@@ -226,8 +226,7 @@ end
 -- [XFactorVR-MP] ==================================================================
 '''
 
-# Se inyecta despues de la ultima linea de `require` del principio del archivo.
-REQUIRES_RE = None  # (se resuelve con regex en el modulo)
+# El stub se inyecta despues de la ultima linea de `require` del principio.
 
 
 def parche_init(texto: str):
@@ -264,7 +263,13 @@ def parche_stub(texto: str):
     if ultimo is None:
         print("  AVISO: no hay `require` donde colgar el stub")
         return texto, False
-    nuevas = lineas[: ultimo + 1] + STUB_JUGADOR.strip("\n").split("\n") + lineas[ultimo + 1 :]
+    nuevas = (
+        lineas[: ultimo + 1]
+        + [""]
+        + STUB_JUGADOR.strip("\n").split("\n")
+        + [""]
+        + lineas[ultimo + 1 :]
+    )
     return "\n".join(nuevas), True
 
 
@@ -287,8 +292,11 @@ def parchear(control_lua: str) -> bool:
 
     texto, c1 = parche_init(original)
     texto, c2 = parche_dialog(texto)
-    texto, c3 = parche_stub(texto)
+    # OJO: la sustitucion de referencias va ANTES de inyectar el stub, para
+    # que el stub no se reescriba a si mismo (menciona game.players[1] en sus
+    # comentarios).
     texto, c4 = parche_referencias(texto)
+    texto, c3 = parche_stub(texto)
 
     if not (c1 or c2 or c3 or c4):
         print(f"  ya parcheado: {control_lua}")

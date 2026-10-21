@@ -7,7 +7,9 @@
 //! solo libresolv, libm y libc). Si nuestro .so deja esos simbolos sin
 //! resolver, el cargador dinamico falla al cargarlo:
 //!
-//!     ./factorio: symbol lookup error: /injector.so: undefined symbol: _Unwind_Resume
+//! ```text
+//! ./factorio: symbol lookup error: /injector.so: undefined symbol: _Unwind_Resume
+//! ```
 //!
 //! Como el inyector se compila con `panic = "abort"`, nunca hay desenrollado:
 //! un panic aborta el proceso directamente. Estos stubs existen solo para que

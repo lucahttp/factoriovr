@@ -128,18 +128,26 @@ check-updates=false
 CFG
 fi
 
-# En modo CAMPANA el auto_pause debe ser TRUE: el servidor congela el mapa
-# hasta que llega el jugador, porque si no el nivel de campana muere antes
-# (usa game.players[1] en su init). Verificado en el banco MP.
+# En modo CAMPANA el auto_pause va DESACTIVADO.
+#
+# Antes ponia true porque el nivel de campana espera a game.players[1] (que
+# solo existe si hay un cliente grafico conectado) y sin congelar el mapa el
+# nivel se moria antes de que llegara.  Ahora el mod crea un JUGADOR VIRTUAL
+# (una entidad "character" con el tag xfactorvr_player) y el escenario
+# parcheado usa ese jugador, asi que el nivel ya no espera a nadie: si el
+# mapa esta congelado, el tutorial no avanza nunca.
+#
+# Con auto_pause=false el nivel avanza solo desde el primer tick, y el
+# jugador virtual lo juega desde el visor por RCON.
 if [ -n "${SCENARIO:-}" ]; then
-    log "Modo campana: auto_pause=true (el mapa espera al jugador)"
+    log "Modo campana: auto_pause=false (el jugador virtual permite avanzar)"
     cat > "$SETTINGS_FILE" <<'JSON'
 {
   "name": "XFactorVR",
   "description": "Factorio para Realidad Mixta",
   "visibility": { "public": false, "lan": true },
   "require_user_verification": false,
-  "auto_pause": true,
+  "auto_pause": false,
   "auto_pause_when_players_connect": false,
   "autosave_interval": 10,
   "autosave_slots": 3

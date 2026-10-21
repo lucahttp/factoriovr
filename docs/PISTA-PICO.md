@@ -39,13 +39,33 @@ En el log del visor (`adb logcat -s XFactorVR_Launcher:V libxfactorvr:V`):
 
 | Línea | Significa |
 |---|---|
-| `Initialised OpenGL: zink Vulkan ...` | Zink arranca. **Ojo**: en esta Pico sale siempre con lavapipe (Vulkan por software), no con el Adreno (ver §3). |
+| `Conexion RCON con Factorio ESTABLECIDA` | el visor habla con el motor real |
 | `hook vivo: N frames` | el inyector está enganchado dentro del juego |
 | `Starting RCON interface at IP ADDR` | el servidor tiene el RCON (el puente del mod) |
-| `PlayerJoinGame ... mode(create)` | el cliente creó al jugador que la campaña exige |
+| `Jugador virtual 'VR' creado en ...` | el mod ha creado al jugador (campaña sin cliente gráfico) |
+| `PlayerJoinGame ... mode(create)` | el cliente gráfico creó al jugador (campaña con cliente) |
 
 Y en el juego: la campaña cargada, con el jugador presente, y el terreno y las máquinas
 dibujados por nuestra app.
+
+## 2 bis. La campaña ya se juega SIN cliente gráfico
+
+El nivel de campaña usa `game.players[1]` en su `init`, así que en un servidor
+headless sin cliente gráfico nunca arrancaba. Ahora el **mod crea un jugador
+virtual** (una entidad de tipo `character`, que en la API de Factorio es un
+`LuaControl` igual que un jugador) y el escenario parcheado usa ese jugador en
+vez de `game.players[1]`.
+
+Consecuencia práctica: **no hace falta Termux:X11 para jugar la campaña** (la
+vía del cliente gráfico queda como opcional, para tener el render real del
+juego). El banco `scripts/test_jugador_virtual.sh` levanta el motor sin
+cliente gráfico y comprueba que el nivel avanza.
+
+En el modo campaña el servidor va con `auto_pause=false`: con `true` el mapa
+quedaría congelado (el auto_pause congela cuando no hay jugadores
+*conectados*, y el jugador virtual no lo está).
+
+Ver `docs/ADR-007-jugador-virtual-campana.md`.
 
 ## 3. Lo que se ha descubierto en el dispositivo (Pico 4 Ultra, Android 14)
 
@@ -53,7 +73,7 @@ Estas cuatro cosas no se ven en el banco y son las que más tiempo han costado:
 
 | Hallazgo | Por qué importa | Qué se hizo |
 |---|---|---|
-| **La app no puede ejecutar un ELF desde su sandbox** (`execv` → `Permission denied`) | El motor no se puede lanzar desde el directorio privado de la app | El motor se lanza desde `/data/local/tmp` (contexto del shell). El sandbox de la app solo sirve para lo que la app carga con `dlopen` (su propio `libxfactorvr.so`) |
+| **La app no puede ejecutar un ELF desde su sandbox** (`execv` → `Permission denied`) | El motor no se puede lanzar desde el directorio privado de la app | El motor lo arranca el shell (`scripts/deploy_pico.sh`); la app solo se conecta por RCON. La copia del motor al sandbox se eliminó y el launcher pasó de 700 a 285 líneas |
 | **Un proceso del shell no puede hacer `dlopen`** de una `.so` en `/data/local/tmp` (`shell_data_file`) | El cliente gráfico hace `dlopen` de Mesa para crear el contexto GL → `Could not initialize OpenGL / GLES library` | Sin root no hay arreglo: el cliente gráfico necesita un contexto con `execute_no_trans` (el de Termux o root). El **servidor headless** no lo necesita (no usa GL) y sí funciona |
 | **El driver Vulkan del Adreno es bionic** (`/vendor/lib64/hw/vulkan.adreno.so`, depende de `libc.so`, `liblog.so`, `libllvm-glnext.so` y librerías HIDL) | El cliente de Factorio es **glibc**: cargar un driver bionic dentro de un proceso glibc mete dos libc en el mismo proceso y revienta | El cliente va con **lavapipe** (Vulkan por software, dentro del payload de Mesa). Se puede forzar el ICD del fabricante con `XFACTORVR_USE_ADRENO_ICD=1`, pero es Weekly unsafe: no lo hagas |
 | **No hay `/etc/resolv.conf`** (Android resuelve por netd/binder) | El motor es glibc y busca ese fichero: dentro del motor **no se resuelve ningún nombre** | `resolver-linux/`: shim LD_PRELOAD con un mini-resolver DNS por UDP, redirección de `/etc/resolv.conf` y un **proxy CONNECT local** |

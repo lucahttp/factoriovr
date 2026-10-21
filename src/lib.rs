@@ -860,6 +860,75 @@ pub unsafe extern "C" fn xfactorvr_get_terrain_variant_count(nombre: *const std:
     assets::terrain_variant_count(n) as i32
 }
 
+/// Pone un item en la barra rapida del jugador (virtual o real).
+///
+/// El tutorial de la campana tiene un nodo que pide filtrar un mineral: para
+/// eso el item tiene que estar en la barra rapida.  Con el jugador real lo
+/// haria la GUI; con el jugador virtual (sin GUI) lo hace el mod.
+#[no_mangle]
+pub unsafe extern "C" fn xfactorvr_set_quick_bar(
+    page: u32,
+    slot: u32,
+    item_name: *const std::os::raw::c_char,
+) -> bool {
+    if item_name.is_null() {
+        return false;
+    }
+    let nombre = match std::ffi::CStr::from_ptr(item_name).to_str() {
+        Ok(s) if !s.is_empty() => s.to_string(),
+        _ => return false,
+    };
+    if let Ok(world) = game_bridge::get_simulation_world().read() {
+        if world.is_connected_to_rcon {
+            let cmd = format!(
+                "/silent-command remote.call('xfactorvr', 'set_quick_bar', {}, {}, '{}')",
+                page.max(1),
+                slot.max(1),
+                nombre
+            );
+            if let Ok(mut rcon) = game_bridge::get_rcon_client().lock() {
+                rcon.execute(&cmd);
+            }
+            return true;
+        }
+    }
+    false
+}
+
+/// Pone un item en un inventario concreto (la del horno, por ejemplo).
+///
+/// `inv_index` es el indice del inventario (1 = principal, 2 = ...) y el
+/// nombre del item, como lo espera el mod.
+#[no_mangle]
+pub unsafe extern "C" fn xfactorvr_insert_item(
+    x: f32,
+    y: f32,
+    item_name: *const std::os::raw::c_char,
+    count: u32,
+    inv_index: u32,
+) -> bool {
+    if item_name.is_null() {
+        return false;
+    }
+    let nombre = match std::ffi::CStr::from_ptr(item_name).to_str() {
+        Ok(s) if !s.is_empty() => s.to_string(),
+        _ => return false,
+    };
+    if let Ok(world) = game_bridge::get_simulation_world().read() {
+        if world.is_connected_to_rcon {
+            let cmd = format!(
+                "/silent-command remote.call('xfactorvr', 'insert_item', {:.2}, {:.2}, '{}', {}, {})",
+                x, y, nombre, count.max(1), inv_index.max(1)
+            );
+            if let Ok(mut rcon) = game_bridge::get_rcon_client().lock() {
+                rcon.execute(&cmd);
+            }
+            return true;
+        }
+    }
+    false
+}
+
 /// Rectangulo de una variante del suelo dentro del atlas.
 ///
 /// out recibe: x, y, ancho, alto y pagina (en ese orden).

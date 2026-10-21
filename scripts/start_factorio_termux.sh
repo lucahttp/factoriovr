@@ -40,6 +40,10 @@ set -u
 PREFIX="/data/data/com.termux/files/usr"
 HOME_DIR="$PREFIX/home"
 RAIZ="$HOME_DIR/factorio"
+# Donde deja el motor el despliegue.  /sdcard es noexec, asi que el motor se
+# copia al home de Termux (el proceso de Termux tampoco puede leer
+# /data/local/tmp por SELinux).
+ORIGEN="/sdcard/XFactorVR/ligero"
 MESA_LIB="$PREFIX/glibc/lib"
 LOADER="$MESA_LIB/ld-linux-aarch64.so.1"
 BIN="$RAIZ/bin/arm64/factorio"
@@ -55,13 +59,13 @@ mkdir -p "$LOG_DIR" "$MODS" "$RAIZ/saves"
 
 # --- 1. El motor tiene que estar dentro de Termux -------------------------
 if [ ! -x "$BIN" ]; then
-    if [ -f /sdcard/XFactorVR/factorio/bin/arm64/factorio ]; then
+    if [ -f "$ORIGEN/bin/arm64/factorio" ]; then
         log "Copiando el motor desde /sdcard (la primera vez tarda un poco)..."
         mkdir -p "$RAIZ"
-        cp -R /sdcard/XFactorVR/factorio/. "$RAIZ/"
+        cp -R "$ORIGEN/." "$RAIZ/"
         chmod 755 "$BIN"
     else
-        log "ERROR: no hay motor. Deja el juego en /sdcard/XFactorVR/factorio"
+        log "ERROR: no hay motor. Deja el juego en $ORIGEN"
         log "       (lo pone el despliegue: bash scripts/deploy_pico.sh --campana)"
         exit 1
     fi

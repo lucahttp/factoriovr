@@ -267,6 +267,14 @@ if [ "$MODO_CLIENT" -eq 1 ]; then
         exit 1
     fi
     echo "    Zink presente en el visor."
+    # El motor tambien a /sdcard: es donde lo puede leer Termux (el proceso
+    # de Termux no puede leer /data/local/tmp por SELinux, y /sdcard es
+    # noexec, asi que el script de Termux lo copia a su home).
+    if [ -d "$REMOTE_CLIENT/../factorio" ] || [ -f /data/local/tmp/factorio/bin/arm64/factorio ]; then
+        "$ADB" shell "mkdir -p /sdcard/XFactorVR && rm -rf /sdcard/XFactorVR/ligero && cp -R /data/local/tmp/factorio /sdcard/XFactorVR/ligero && echo listo" >/dev/null 2>&1
+        "$ADB" push "$PROJECT_ROOT/scripts/start_factorio_termux.sh" /sdcard/XFactorVR/start_factorio_termux.sh >/dev/null 2>&1
+        echo "    motor en /sdcard/XFactorVR (para Termux)."
+    fi
     if [ -f "$LOCAL_INJECTOR" ]; then
         "$ADB" push "$LOCAL_INJECTOR" "$REMOTE_INJECTOR"
         "$ADB" shell "chmod 755 $REMOTE_INJECTOR"

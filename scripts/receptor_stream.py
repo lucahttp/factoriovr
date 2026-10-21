@@ -141,8 +141,11 @@ def recibir(conn, resumen, maximo):
             if del_cubo > 0:
                 # La posicion del cubo por ojo: si la camara esta desplazada,
                 # el cubo sale mas a la izquierda en un ojo que en el otro.
-                resumen["cubo_x_izq"] = cx1 if ojo == 0 else resumen["cubo_x_izq"]
-                resumen["cubo_x_der"] = cx0 if ojo == 1 else resumen["cubo_x_der"]
+                # El CENTRO del cubo: con los bordes el dato se va cuando
+                # el cubo toca el borde de la pantalla.
+                centro = (cx0 + cx1) // 2
+                resumen["cubo_centro_izq"] = centro if ojo == 0 else resumen["cubo_centro_izq"]
+                resumen["cubo_centro_der"] = centro if ojo == 1 else resumen["cubo_centro_der"]
                 # El frame con MAS pixeles del cubo se guarda para verlo (a
                 # times el cubo sale partido en el borde de la pantalla).
                 if del_cubo > resumen["max_pixeles_cubo"]:
@@ -184,8 +187,8 @@ def main():
         "frames_con_color": 0,
         "frames_izq": 0,
         "frames_der": 0,
-        "cubo_x_izq": None,
-        "cubo_x_der": None,
+        "cubo_centro_izq": None,
+        "cubo_centro_der": None,
         "conexiones": 0,
         "error": "",
         "_salida": args.salida,

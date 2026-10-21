@@ -292,17 +292,24 @@ ok "$con_cubo frames con el cubo 3D dentro (maximo $max_cubo pixeles)"
 
 # Con la camara desplazada, las dos vistas tienen que diferir: el cubo sale
 # mas a la izquierda en una que en la otra.  Es el paralaje real.
-X_IZQ=$(python3 -c "import json;v=json.load(open('$RESUMEN_LOCAL')).get('cubo_x_izq');print(v if v is not None else -1)" 2>/dev/null || echo -1)
-X_DER=$(python3 -c "import json;v=json.load(open('$RESUMEN_LOCAL')).get('cubo_x_der');print(v if v is not None else -1)" 2>/dev/null || echo -1)
+X_IZQ=$(python3 -c "import json;v=json.load(open('$RESUMEN_LOCAL')).get('cubo_centro_izq');print(v if v is not None else -1)" 2>/dev/null || echo -1)
+X_DER=$(python3 -c "import json;v=json.load(open('$RESUMEN_LOCAL')).get('cubo_centro_der');print(v if v is not None else -1)" 2>/dev/null || echo -1)
 if [ "$CAMARA_DESPLAZAMIENTO" != "0" ]; then
     if [ "$X_IZQ" = "-1" ] || [ "$X_DER" = "-1" ]; then
         fail "no hay frames de los dos ojos (izq=$X_IZQ der=$X_DER)"
     fi
     DIF=$(( X_IZQ > X_DER ? X_IZQ - X_DER : X_DER - X_IZQ ))
-    if [ "$DIF" -lt 5 ]; then
+    # Lo esperado: la camara se desplaza +/-CAMARA_DESPLAZAMIENTO en el
+    # framebuffer de 1280; a la mitad (640) y entre los dos ojos, la
+    # diferencia es de unos 2*desplazamiento/4 pixeles.
+    ESPERADO=$(( CAMARA_DESPLAZAMIENTO / 2 ))
+    if [ "$DIF" -lt 3 ]; then
         fail "las dos vistas son casi iguales (cubo izq=$X_IZQ der=$X_DER): la camara no se desplaza"
     fi
-    ok "paralaje real: el cubo sale en x=$X_IZQ (izq) y x=$X_DER (der), diferencia $DIF px"
+    if [ "$DIF" -gt $(( ESPERADO * 4 + 20 )) ]; then
+        fail "la diferencia es de $DIF px, mucho mas de lo esperado (~$ESPERADO): algo mas se esta moviendo"
+    fi
+    ok "paralaje real: el cubo sale en x=$X_IZQ (izq) y x=$X_DER (der), diferencia $DIF px (esperado ~$ESPERADO)"
 fi
 
 # El frame con mas pixeles del cubo (lo guarda el receptor).

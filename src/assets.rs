@@ -107,10 +107,36 @@ pub struct AssetManifest {
     pub version: String,
     #[serde(default)]
     pub atlas: Option<AtlasInfo>,
+    /// Atlas del suelo: las celdas de 32x32 de cada tipo de terreno.
+    #[serde(default)]
+    pub terrain_atlas: Option<TerrainAtlasInfo>,
     #[serde(default)]
     pub entities: HashMap<String, AssetEntity>,
     #[serde(default)]
     pub icons: HashMap<String, String>,
+}
+
+/// Atlas con el suelo del mapa.
+#[derive(Debug, Clone, Deserialize)]
+pub struct TerrainAtlasInfo {
+    /// Lado de cada pagina en pixeles.
+    #[serde(default)]
+    pub page_size: u32,
+    /// Lado de una celda de terreno en pixeles (32 = una casilla del juego).
+    #[serde(default)]
+    pub tile_size: u32,
+    #[serde(default)]
+    pub pages: Vec<AtlasPage>,
+    /// Tipo de terreno -> variantes guardadas.
+    #[serde(default)]
+    pub tiles: HashMap<String, TerrainTileSet>,
+}
+
+/// Variantes de un tipo de terreno.
+#[derive(Debug, Clone, Deserialize)]
+pub struct TerrainTileSet {
+    #[serde(default)]
+    pub variants: Vec<AtlasRect>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -318,6 +344,89 @@ pub fn atlas_file() -> Option<PathBuf> {
         atlas.file.clone()
     };
     Some(assets_dir().join(file))
+}
+
+// ---------------------------------------------------------------------------
+// Atlas del suelo
+// ---------------------------------------------------------------------------
+
+/// Atlas del suelo (si el extractor lo genero).
+pub fn terrain_atlas() -> Option<&'static TerrainAtlasInfo> {
+    manifest()?.terrain_atlas.as_ref()
+}
+
+/// Numero de paginas del atlas de suelo.
+pub fn terrain_page_count() -> usize {
+    terrain_atlas().map(|t| t.pages.len()).unwrap_or(0)
+}
+
+static TERRAIN_PIXELS: OnceLock<Option<Vec<(Vec<u8>, u32, u32)>>> = OnceLock::new();
+
+/// Pixeles de las paginas del suelo, en RGBA8 crudo.
+///
+/// Igual que el atlas de sprites, en crudo: Android no decodifica PNG.
+pub fn terrain_pages() -> Option<&'static Vec<(Vec<u8>, u32, u32)>> {
+    TERRAIN_PIXELS
+        .get_or_init(|| {
+            let t = terrain_atlas()?;
+            let dir = assets_dir();
+            let mut out = Vec::new();
+            for page in &t.pages {
+                let path = dir.join(&page.file);
+                let data = match std::fs::read(&path) {
+                    Ok(d) => d,
+                    Err(e) => {
+                        log::warn!("Pagina de suelo {} ilegible: {}", page.file, e);
+                        return None;
+                    }
+                };
+                let expected = (page.width as usize) * (page.height as usize) * 4;
+                if data.len() != expected {
+                    log::warn!(
+                        "Pagina de suelo {} con tamano inesperado ({} != {} bytes)",
+                        page.file,
+                        data.len(),
+                        expected
+                    );
+                    return None;
+                }
+                out.push((data, page.width, page.height));
+            }
+            if out.is_empty() {
+                None
+            } else {
+                Some(out)
+            }
+        })
+        .as_ref()
+}
+
+/// Pixeles de una pagina del atlas de suelo.
+pub fn terrain_page_pixels(page: u32) -> Option<&'static (Vec<u8>, u32, u32)> {
+    terrain_pages()?.get(page as usize)
+}
+
+/// Rectangulo de una variante del suelo.
+///
+/// `variant` es el indice de la variante (0 = la primera).  El juego elige la
+/// variante de cada casilla con un hash de la posicion, asi que el indice se
+/// puede calcular igual en el motor y aqui.
+pub fn terrain_tile(nombre: &str, variant: u32) -> Option<AtlasRect> {
+    let t = terrain_atlas()?;
+    let set = t.tiles.get(nombre)?;
+    if set.variants.is_empty() {
+        return None;
+    }
+    let idx = (variant as usize) % set.variants.len();
+    set.variants.get(idx).copied()
+}
+
+/// Numero de variantes guardadas de un tipo de terreno.
+pub fn terrain_variant_count(nombre: &str) -> u32 {
+    terrain_atlas()
+        .and_then(|t| t.tiles.get(nombre))
+        .map(|s| s.variants.len() as u32)
+        .unwrap_or(0)
 }
 
 static ATLAS_PIXELS: OnceLock<Option<Vec<(Vec<u8>, u32, u32)>>> = OnceLock::new();

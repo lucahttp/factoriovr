@@ -788,6 +788,106 @@ pub unsafe extern "C" fn xfactorvr_get_atlas_page_size(page: u32, out_w: *mut i3
     }
 }
 
+// ---------------------------------------------------------------------------
+// Atlas del suelo
+// ---------------------------------------------------------------------------
+
+/// Numero de paginas del atlas de suelo.
+#[no_mangle]
+pub unsafe extern "C" fn xfactorvr_get_terrain_page_count() -> i32 {
+    assets::terrain_page_count() as i32
+}
+
+/// Tamano de una pagina del atlas de suelo.
+#[no_mangle]
+pub unsafe extern "C" fn xfactorvr_get_terrain_page_size(
+    page: u32,
+    out_w: *mut i32,
+    out_h: *mut i32,
+) -> bool {
+    if out_w.is_null() || out_h.is_null() {
+        return false;
+    }
+    match assets::terrain_page_pixels(page) {
+        Some((_, w, h)) => {
+            *out_w = *w as i32;
+            *out_h = *h as i32;
+            true
+        }
+        None => false,
+    }
+}
+
+/// Pixeles de una pagina del atlas de suelo (RGBA8 crudo).
+#[no_mangle]
+pub unsafe extern "C" fn xfactorvr_get_terrain_page_pixels(
+    page: u32,
+    out: *mut u8,
+    max_len: i32,
+) -> i32 {
+    if out.is_null() || max_len <= 0 {
+        return 0;
+    }
+    match assets::terrain_page_pixels(page) {
+        Some((data, _, _)) => {
+            if (data.len() as i64) > max_len as i64 {
+                return 0;
+            }
+            std::ptr::copy_nonoverlapping(data.as_ptr(), out, data.len());
+            data.len() as i32
+        }
+        None => 0,
+    }
+}
+
+/// Lado de una celda de terreno en pixeles (32 = una casilla del juego).
+#[no_mangle]
+pub unsafe extern "C" fn xfactorvr_get_terrain_tile_size() -> i32 {
+    assets::terrain_atlas().map(|t| t.tile_size as i32).unwrap_or(0)
+}
+
+/// Numero de variantes guardadas de un tipo de terreno.
+#[no_mangle]
+pub unsafe extern "C" fn xfactorvr_get_terrain_variant_count(nombre: *const std::os::raw::c_char) -> i32 {
+    if nombre.is_null() {
+        return 0;
+    }
+    let n = match std::ffi::CStr::from_ptr(nombre).to_str() {
+        Ok(s) => s,
+        Err(_) => return 0,
+    };
+    assets::terrain_variant_count(n) as i32
+}
+
+/// Rectangulo de una variante del suelo dentro del atlas.
+///
+/// out recibe: x, y, ancho, alto y pagina (en ese orden).
+#[no_mangle]
+pub unsafe extern "C" fn xfactorvr_get_terrain_tile(
+    nombre: *const std::os::raw::c_char,
+    variant: u32,
+    out: *mut f32,
+) -> bool {
+    if nombre.is_null() || out.is_null() {
+        return false;
+    }
+    let n = match std::ffi::CStr::from_ptr(nombre).to_str() {
+        Ok(s) => s,
+        Err(_) => return false,
+    };
+    match assets::terrain_tile(n, variant) {
+        Some(r) => {
+            *out = r.x;
+            *out.add(1) = r.y;
+            *out.add(2) = r.w;
+            *out.add(3) = r.h;
+            *out.add(4) = r.page as f32;
+            true
+        }
+        None => false,
+    }
+}
+
 /// Pixeles de una pagina del atlas en RGBA8 crudo, listos para subir a la GPU.
 ///
 /// El atlas se parte en paginas porque una textura de mas de 4096 px de alto no

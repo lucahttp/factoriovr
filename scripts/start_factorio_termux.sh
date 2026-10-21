@@ -117,10 +117,42 @@ if [ "${1:-}" != "cliente" ]; then
 fi
 
 # --- 5. Cliente grafico: es el que aporta el jugador que la campana exige -
+#
+# El cliente lleva el INYECTOR: es el proceso donde se engancha el modulo 3D
+# (el cubo de las entidades) y el que manda el render real del juego al
+# visor VR por TCP (protocolo XFV1).  El APK escucha en 127.0.0.1:27020.
+INYECTOR="$HOME_DIR/libxfactorvr_injector.so"
+if [ ! -f "$INYECTOR" ]; then
+    if [ -f "/sdcard/XFactorVR/libxfactorvr_injector.so" ]; then
+        log "Copiando el inyector desde /sdcard..."
+        cp "/sdcard/XFactorVR/libxfactorvr_injector.so" "$INYECTOR"
+    else
+        log "AVISO: no hay inyector en /sdcard/XFactorVR: no habra 3D ni render real"
+    fi
+fi
+
+export XFACTORVR_HOOK_TARGET="${XFACTORVR_HOOK_TARGET:-GameRenderer::render}"
+export XFACTORVR_HOOK_EVERY="${XFACTORVR_HOOK_EVERY:-60}"
+export XFACTORVR_3D="${XFACTORVR_3D:-1}"
+# El visor VR (el APK) escucha en 127.0.0.1:27020 y pinta lo que llega.
+export XFACTORVR_STREAM="${XFACTORVR_STREAM:-127.0.0.1:27020}"
+export XFACTORVR_STREAM_ANCHO="${XFACTORVR_STREAM_ANCHO:-640}"
+export XFACTORVR_STREAM_ALTO="${XFACTORVR_STREAM_ALTO:-360}"
+export XFACTORVR_STREAM_FPS="${XFACTORVR_STREAM_FPS:-10}"
+
 log "Arrancando el cliente grafico (el jugador del nivel de campana)..."
-"$LOADER" --library-path "$MESA_LIB" "$BIN" \
-    --config "$CFG" \
-    --window-size 1280x720 \
-    --mp-connect "127.0.0.1:$SERVER_PORT" \
-    >>"$LOG_DIR/client.log" 2>&1 &
+if [ -f "$INYECTOR" ]; then
+    log "inyector: $INYECTOR (render real al visor en $XFACTORVR_STREAM)"
+    LD_PRELOAD="$INYECTOR" "$LOADER" --library-path "$MESA_LIB" "$BIN" \
+        --config "$CFG" \
+        --window-size 1280x720 \
+        --mp-connect "127.0.0.1:$SERVER_PORT" \
+        >>"$LOG_DIR/client.log" 2>&1 &
+else
+    "$LOADER" --library-path "$MESA_LIB" "$BIN" \
+        --config "$CFG" \
+        --window-size 1280x720 \
+        --mp-connect "127.0.0.1:$SERVER_PORT" \
+        >>"$LOG_DIR/client.log" 2>&1 &
+fi
 log "Cliente lanzado. Log en $LOG_DIR/client.log"

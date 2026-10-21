@@ -279,6 +279,10 @@ if [ "$MODO_CLIENT" -eq 1 ]; then
         "$ADB" push "$LOCAL_INJECTOR" "$REMOTE_INJECTOR"
         "$ADB" shell "chmod 755 $REMOTE_INJECTOR"
         echo "    inyector: $REMOTE_INJECTOR"
+        # El inyector tambien a /sdcard: el proceso de Termux no puede leer
+        # /data/local/tmp (SELinux) y lo necesita para el modulo 3D y para
+        # mandar el render real al visor.
+        "$ADB" shell "mkdir -p /sdcard/XFactorVR && cp -f $REMOTE_INJECTOR /sdcard/XFactorVR/libxfactorvr_injector.so" >/dev/null 2>&1 || true
     else
         echo "    AVISO: sin inyector compilado."
     fi

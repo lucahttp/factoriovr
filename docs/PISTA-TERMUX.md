@@ -60,7 +60,17 @@ El script (`scripts/start_factorio_termux.sh` en el repo) hace:
 2. arranca el **servidor headless** (el del RCON) si no está;
 3. arranca el **cliente gráfico** con `--mp-connect 127.0.0.1:34197`, que es
    el que aporta el jugador que la campaña exige;
-4. deja los logs en `~/logs/`.
+4. lo arranca **con el inyector** (`LD_PRELOAD`): es el proceso donde se
+   engancha el módulo 3D (el cubo de las entidades) y el que **manda el render
+   real del juego al visor** por TCP (protocolo XFV1 → `127.0.0.1:27020`, que
+   es donde escucha el APK). El inyector se copia de
+   `/sdcard/XFactorVR/libxfactorvr_injector.so` (el despliegue lo deja ahí
+   porque el proceso de Termux no puede leer `/data/local/tmp`);
+5. deja los logs en `~/logs/`.
+
+Con esto, en el visor se ve **el render real del juego** (el panel del fondo
+de la mesa), no solo el diorama reconstruido con sprites. Detalle del protocolo
+y del panel en `docs/ADR-009-render-real-al-visor.md`.
 
 ## Mientras tanto: jugar sin cliente gráfico
 
@@ -69,13 +79,15 @@ RCON (`Conexion RCON con Factorio ESTABLECIDA` en el logcat). Con eso se ve el
 diorama 3D en MR y se pueden mandar órdenes al juego (mover al jugador,
 interactuar, minar, fabricar).
 
-Lo que no hay es el **jugador de verdad**, y por eso el nivel de campaña no
-avanza: es `game.players[1]`.
+**Y la campaña ya se juega entera sin cliente gráfico**: el mod crea un
+*jugador virtual* (una entidad `character`) y el nivel de campaña se parchea
+para usar ese jugador en vez de `game.players[1]`. El banco
+`scripts/test_jugador_virtual.sh` lo valida (6 fases, 0 fallos) y llega al
+nodo `victory`. Ver `docs/ADR-007-jugador-virtual-campana.md`.
 
-La alternativa sin Termux es que el **mod** cree un *jugador virtual* (un
-personaje de la fuerza) y que el nivel se parchee para usarlo en vez de
-`game.players[1]`. Es viable (el nivel del tutorial usa 24 métodos distintos
-de la API de jugador, casi todos no-ops) y está pendiente.
+Lo que **no** hay sin cliente gráfico es el **render real**: el panel del fondo
+muestra lo que compone el motor, y sin cliente gráfico el motor no pinta nada.
+Ahí es donde entra Termux.
 
 ## Resumen de lo que hay que mirar
 

@@ -11,6 +11,7 @@ pub mod renderer;
 pub mod symbols;
 pub mod tabletop;
 pub mod terreno;
+mod gnu_unwind;
 
 use anyhow::Result;
 use std::sync::{OnceLock, RwLock};

@@ -2634,6 +2634,7 @@ static void* game_receiver_thread(void* /*arg*/) {
             }
             LOGI("El juego se ha conectado: empieza el render real");
             std::vector<uint8_t> cab(16);
+            std::vector<uint8_t> pix;
             while (s_game_corriendo.load()) {
                 if (!leer_exacto(cli, cab.data(), cab.size())) break;
                 uint32_t magic = 0, numero = 0;
@@ -2649,7 +2650,10 @@ static void* game_receiver_thread(void* /*arg*/) {
                 }
                 if (w == 0 || h == 0 || formato != 0) break;
                 const size_t tam = (size_t)w * (size_t)h * 4;
-                std::vector<uint8_t> pix(tam);
+                // El buffer se reutiliza: al intercambiarlo con el frame
+                // guardado, el siguiente frame vuelve con la capacidad ya
+                // reservada (900 KB por frame es mucha basura).
+                pix.resize(tam);
                 if (!leer_exacto(cli, pix.data(), tam)) break;
                 {
                     std::lock_guard<std::mutex> lock(s_game_mutex);
@@ -2703,17 +2707,20 @@ static void construir_panel_juego() {
 
 /// Sube a la textura el frame mas reciente (si hay uno nuevo).
 static void subir_frame_juego() {
-    std::vector<uint8_t> pix;
+    // El buffer del hilo de render y el del hilo receptor se intercambian:
+    // asi los dos buffers (900 KB cada uno) van y vienen en vez de estar
+    // reservandose y liberandose en cada frame.
+    static std::vector<uint8_t> s_pix;
     uint16_t w = 0, h = 0;
     {
         std::lock_guard<std::mutex> lock(s_game_mutex);
         if (!s_game_frame.nuevo) return;
-        pix.swap(s_game_frame.pix);
+        s_pix.swap(s_game_frame.pix);
         w = s_game_frame.w;
         h = s_game_frame.h;
         s_game_frame.nuevo = false;
     }
-    if (w == 0 || h == 0 || pix.empty()) return;
+    if (w == 0 || h == 0 || s_pix.empty()) return;
 
     if (s_tex_juego == 0) {
         glGenTextures(1, &s_tex_juego);
@@ -2725,11 +2732,11 @@ static void subir_frame_juego() {
     }
     glBindTexture(GL_TEXTURE_2D, s_tex_juego);
     if (w != s_tex_juego_w || h != s_tex_juego_h) {
-        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, pix.data());
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, s_pix.data());
         s_tex_juego_w = w;
         s_tex_juego_h = h;
     } else {
-        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, w, h, GL_RGBA, GL_UNSIGNED_BYTE, pix.data());
+        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, w, h, GL_RGBA, GL_UNSIGNED_BYTE, s_pix.data());
     }
     glBindTexture(GL_TEXTURE_2D, 0);
 }

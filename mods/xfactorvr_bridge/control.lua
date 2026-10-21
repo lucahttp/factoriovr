@@ -243,11 +243,17 @@ local function ensure_virtual_character()
     end
     if not ent then return nil end
 
-    -- El "tag" de un jugador no existe en una entidad: el nombre visible es
-    -- la mejor aproximacion y es lo que se ve en el mapa.
+    -- Nombre visible (el "tag" de un jugador no existe en una entidad: el
+    -- nombre visible es la mejor aproximacion y es lo que se ve en el mapa).
     pcall(function() ent.name_tag = VIRTUAL_NAME end)
 
     state().xfactorvr_character = ent
+
+    local pos = ent.position or { x = 0, y = 0 }
+    log("[XFactorVR] Jugador virtual '" .. VIRTUAL_NAME .. "' creado en " ..
+        tostring(pos.x) .. "," .. tostring(pos.y) .. " (unidad " ..
+        tostring(ent.unit_number) .. ")")
+
     return ent
 end
 
@@ -289,14 +295,83 @@ local function virtual_inventory()
     return st.xfactorvr_inventory
 end
 
+--- Numero de unidad del actor (para no confundirse con el al buscar
+--- entidades cerca: el propio personaje esta ahi mismo).
+local function actor_unit_number(a)
+    if not a then return nil end
+    local ok, un = pcall(function() return a.unit_number end)
+    if ok and un then return un end
+    local ok2, ch = pcall(function() return a.character end)
+    if ok2 and ch then
+        local ok3, un2 = pcall(function() return ch.unit_number end)
+        if ok3 then return un2 end
+    end
+    return nil
+end
+
+--- La entidad valida mas cercana al punto, SIN contar el propio actor.
+--- Sin esto, interactuar "en la posicion del jugador" se encontraba al
+--- propio personaje y le vaciaba su propio inventario.
+local function entidad_mas_cercana(found, x, y, actor_un)
+    local mejor, mejor_dist = nil, nil
+    for _, e in ipairs(found) do
+        if e.valid then
+            local mismo = false
+            if actor_un then
+                local ok, un = pcall(function() return e.unit_number end)
+                if ok and un == actor_un then mismo = true end
+            end
+            if not mismo then
+                local dx = e.position.x - x
+                local dy = e.position.y - y
+                local d = dx * dx + dy * dy
+                if not mejor_dist or d < mejor_dist then
+                    mejor, mejor_dist = e, d
+                end
+            end
+        end
+    end
+    return mejor
+end
+
+--- Normaliza el contenido de un inventario a una lista de
+--- {name, count, quality}.
+--- OJO: en Factorio 2.0 `LuaInventory.get_contents` devuelve una LISTA de
+--- ItemWithQualityCount, no un mapa nombre -> cantidad. Recorrerlo con
+--- `for name, value in pairs(...)` mete en el inventario items con el nombre
+--- del indice (1, 2, 3...), que es justo lo que pasaba antes: los items
+--- saqueados se perdian. Se soportan las dos formas por si acaso.
+local function inventory_contents(inv)
+    local lista = {}
+    if not inv then return lista end
+    local ok, contents = pcall(function() return inv.get_contents() end)
+    if not (ok and contents) then return lista end
+    for key, value in pairs(contents) do
+        if type(value) == "table" then
+            if value.name and value.count then
+                table.insert(lista, {
+                    name = value.name,
+                    count = value.count,
+                    quality = value.quality,
+                })
+            end
+        elseif type(key) == "string" and type(value) == "number" then
+            table.insert(lista, { name = key, count = value })
+        end
+    end
+    return lista
+end
+
 --- Quita `count` items de un inventario concreto.
 --- En Factorio 2.0 `LuaInventory.remove` espera un ItemStackIdentification
 --- ({name=, count=}); la forma antigua (nombre, cantidad) se deja como
 --- respaldo porque hay builds que la aceptan.
-local function inv_take(inv, name, count)
+local function inv_take(inv, name, count, quality)
     if not inv or count <= 0 then return 0 end
+    local spec = { name = name, count = count }
+    if quality then spec.quality = quality end
     local ok, removed = pcall(function()
-        return inv.remove({ name = name, count = count })
+        return inv.remove(spec)
     end)
     if ok and removed and removed > 0 then return removed end
     local ok2, removed2 = pcall(function() return inv.remove(name, count) end)
@@ -318,12 +393,14 @@ local function inv_get(name)
 end
 
 --- Anade items al inventario activo. Devuelve cuantos se pudieron agregar.
-local function inv_add(name, count)
+local function inv_add(name, count, quality)
     if count <= 0 then return 0 end
     local inv = actor_inventory()
     if inv then
+        local spec = { name = name, count = count }
+        if quality then spec.quality = quality end
         local ok, inserted = pcall(function()
-            return inv.insert({ name = name, count = count })
+            return inv.insert(spec)
         end)
         if ok and inserted then return inserted end
     end
@@ -369,18 +446,13 @@ end
 --- Devuelve cuantos items se han movido.
 local function loot_inventory(inv)
     local cogido = 0
-    if not inv then return 0 end
-    local ok_contents, contents = pcall(function() return inv.get_contents() end)
-    if not (ok_contents and contents) then return 0 end
-    for name, value in pairs(contents) do
-        local amount = value
-        if type(value) == "table" then amount = value.count end
-        if type(amount) == "number" and amount > 0 then
-            local taken = inv_add(name, amount)
+    for _, stack in ipairs(inventory_contents(inv)) do
+        if stack.count and stack.count > 0 then
+            local taken = inv_add(stack.name, stack.count, stack.quality)
             if taken > 0 then
                 cogido = cogido + taken
                 -- Del origen solo se quitan los items que se han llevado.
-                inv_take(inv, name, taken)
+                inv_take(inv, stack.name, taken, stack.quality)
             end
         end
     end
@@ -789,57 +861,56 @@ remote.add_interface("xfactorvr", {
             radius = 1.0,
         })
 
-        for _, e in ipairs(found) do
-            if e.valid then
-                local looted = 0
+        -- La entidad mas cercana al punto (sin contar al propio actor).
+        local e = entidad_mas_cercana(found, x, y, actor_unit_number(actor()))
+        if e then
+            local looted = 0
 
-                -- 1. Recoger todo lo producido.
-                local ok_out, out_inv = pcall(function() return e.get_output_inventory() end)
-                if ok_out and out_inv then
-                    local ok_contents, contents = pcall(function() return out_inv.get_contents() end)
-                    if ok_contents and contents then
-                        for name, value in pairs(contents) do
-                            local amount = value
-                            if type(value) == "table" then amount = value.count end
-                            if type(amount) == "number" and amount > 0 then
-                                inv_add(name, amount)
-                                looted = looted + amount
-                                pcall(function() out_inv.clear() end)
-                            end
+            -- 1. Recoger todo lo producido.
+            local ok_out, out_inv = pcall(function() return e.get_output_inventory() end)
+            if ok_out and out_inv then
+                for _, stack in ipairs(inventory_contents(out_inv)) do
+                    if stack.count and stack.count > 0 then
+                        local taken = inv_add(stack.name, stack.count, stack.quality)
+                        looted = looted + taken
+                        if taken > 0 then
+                            pcall(function()
+                                out_inv.remove({ name = stack.name, count = taken })
+                            end)
                         end
                     end
                 end
-
-                -- 2. Abastecer de combustible (solo hornos de combustible).
-                local ok_fuel, fuel_inv = pcall(function() return e.get_fuel_inventory() end)
-                if ok_fuel and fuel_inv then
-                    if fuel_inv.get_item_count("coal") < 1 and inv_get("coal") > 0 then
-                        inv_remove("coal", 1)
-                        pcall(function() fuel_inv.insert({ name = "coal", count = 1 }) end)
-                    end
-                end
-
-                -- 3. Sin nada que recoger: la ensambladora rota de receta.
-                if looted == 0 and e.type == "assembling-machine" then
-                    -- En 2.0 la receta actual se lee con `get_recipe()`.
-                    local current = nil
-                    pcall(function()
-                        local r = e.get_recipe()
-                        if r then current = r.name end
-                    end)
-                    local next_recipe = RECIPE_ROTATION[1]
-                    for i, r in ipairs(RECIPE_ROTATION) do
-                        if r == current then
-                            next_recipe = RECIPE_ROTATION[(i % #RECIPE_ROTATION) + 1]
-                            break
-                        end
-                    end
-                    pcall(function() e.set_recipe(next_recipe) end)
-                end
-
-                rcon.print(tostring(looted))
-                return looted
             end
+
+            -- 2. Abastecer de combustible (solo hornos de combustible).
+            local ok_fuel, fuel_inv = pcall(function() return e.get_fuel_inventory() end)
+            if ok_fuel and fuel_inv then
+                if fuel_inv.get_item_count("coal") < 1 and inv_get("coal") > 0 then
+                    inv_remove("coal", 1)
+                    pcall(function() fuel_inv.insert({ name = "coal", count = 1 }) end)
+                end
+            end
+
+            -- 3. Sin nada que recoger: la ensambladora rota de receta.
+            if looted == 0 and e.type == "assembling-machine" then
+                -- En 2.0 la receta actual se lee con `get_recipe()`.
+                local current = nil
+                pcall(function()
+                    local r = e.get_recipe()
+                    if r then current = r.name end
+                end)
+                local next_recipe = RECIPE_ROTATION[1]
+                for i, r in ipairs(RECIPE_ROTATION) do
+                    if r == current then
+                        next_recipe = RECIPE_ROTATION[(i % #RECIPE_ROTATION) + 1]
+                        break
+                    end
+                end
+                pcall(function() e.set_recipe(next_recipe) end)
+            end
+
+            rcon.print(tostring(looted))
+            return looted
         end
 
         rcon.print("0")
@@ -893,18 +964,8 @@ remote.add_interface("xfactorvr", {
             return false
         end
 
-        -- La entidad mas cercana al punto.
-        local mejor, mejor_dist = nil, nil
-        for _, e in ipairs(found) do
-            if e.valid then
-                local dx = e.position.x - x
-                local dy = e.position.y - y
-                local d = dx * dx + dy * dy
-                if not mejor_dist or d < mejor_dist then
-                    mejor, mejor_dist = e, d
-                end
-            end
-        end
+        -- La entidad mas cercana al punto (sin contar al propio actor).
+        local mejor = entidad_mas_cercana(found, x, y, actor_unit_number(p))
         if not mejor then
             rcon.print("ERR|no_entity")
             return false
@@ -947,17 +1008,12 @@ remote.add_interface("xfactorvr", {
 
         local inv = actor_inventory()
         if inv then
-            local ok, contents = pcall(function() return inv.get_contents() end)
-            if ok and contents then
-                for name, value in pairs(contents) do
-                    local amount = value
-                    if type(value) == "table" then amount = value.count end
-                    if type(amount) == "number" and amount > 0 then
-                        local id = ITEM_IDS_MAP[name]
-                        if id and id > 0 and not seen[name] then
-                            seen[name] = true
-                            table.insert(items, string.format('{"id":%d,"count":%d}', id, amount))
-                        end
+            for _, stack in ipairs(inventory_contents(inv)) do
+                if stack.count and stack.count > 0 then
+                    local id = ITEM_IDS_MAP[stack.name]
+                    if id and id > 0 and not seen[stack.name] then
+                        seen[stack.name] = true
+                        table.insert(items, string.format('{"id":%d,"count":%d}', id, stack.count))
                     end
                 end
             end
@@ -1171,14 +1227,11 @@ remote.add_interface("xfactorvr", {
 
 script.on_init(function()
     virtual_inventory()
-    -- En un servidor headless no hay jugador: se crea el personaje virtual
-    -- para que el nivel de campana pueda arrancar (ver docs/ADR-007).
-    local c = ensure_virtual_character()
-    if c then
-        local pos = c.position or { x = 0, y = 0 }
-        log("[XFactorVR] Jugador virtual '" .. VIRTUAL_NAME .. "' creado en " ..
-            tostring(pos.x) .. "," .. tostring(pos.y))
-    end
+    -- En un servidor headless no hay jugador: se intenta crear el personaje
+    -- virtual para que el nivel de campana pueda arrancar (ver docs/ADR-007).
+    -- Puede que todavia no haya superficie (se crea mas tarde, cuando el
+    -- escenario lo pide por el remoto).
+    ensure_virtual_character()
     -- La version real del motor se lee del mod "core"; no hay una API directa
     -- y "2.0" a pelo mentia en cuanto el visor corre Factorio 2.1.
     local version = "?"

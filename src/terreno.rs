@@ -139,4 +139,13 @@ mod tests {
         let vacio = TerrainSnapshot::default();
         assert!(terrain_quads(&vacio, 2048).is_empty());
     }
+
+    #[test]
+    fn el_ffi_devuelve_la_malla() {
+        // El camino completo: el FFI que usa el motor C++ para pintar el suelo.
+        // Sin el atlas desplegado no hay nada que devolver, pero tampoco
+        // debe petar.
+        let celdas = unsafe { crate::xfactorvr_get_terrain_mesh(std::ptr::null_mut(), 0) };
+        assert_eq!(celdas, 0, "sin buffer no se devuelven celdas");
+    }
 }

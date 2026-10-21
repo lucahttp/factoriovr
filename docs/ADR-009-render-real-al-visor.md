@@ -48,8 +48,18 @@ de UV por ojo.**
   buena.
 - **El cubo se vuelve a pintar justo antes de leer.** El motor redibuja el
   terreno por encima de lo que hemos pintado, así que el cubo 3D puede haber
-  desaparecido del framebuffer entre una pasada y otra: sin esto, solo 1 de
-  cada 30 frames que se mandaban llevaba el 3D dentro.
+  desaparecido del framebuffer entre una pasada y otra.
+- **El cubo se dibuja sin el recorte (scissor) del motor.** El motor pinta el
+  mundo por trozos con el scissor activado: con el recorte puesto, el cubo
+  solo salía en el trozo que se estuviera pintando en ese momento (1 de cada
+  30 frames). Se desactiva mientras se dibuja el cubo y se devuelve el estado
+  al motor después.
+- **La lectura sale del framebuffer de DIBUJO.** El motor deja el framebuffer
+  de *lectura* apuntando a otro sitio (el de la ventana, a veces), así que lo
+  que se leía no era lo que se había pintado. Se enlaza el de lectura al de
+  dibujo antes de leer y se devuelve el estado al motor después (hace falta
+  `glBindFramebuffer`, que no estaba en la lista de funciones GL del
+  inyector).
 
 Variables de entorno:
 

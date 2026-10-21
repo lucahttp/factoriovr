@@ -122,6 +122,10 @@ t = re.sub(r'-Clink-arg=-L/[^"]*/link', f'-Clink-arg=-L{sysroot}/link', t)
 open(cfg, "w", encoding="utf-8").write(t)
 PY
 
+# Se toca el fuente para que cargo recompile siempre: si el .so quedo mas
+# nuevo que el fuente (por un mtime que no cuadra), cargo lo daria por
+# bueno y el banco validaria un binario viejo.
+touch "$INJECTOR_DIR/src/modelo3d.rs" "$INJECTOR_DIR/src/detour.rs" 2>/dev/null || true
 ( cd "$INJECTOR_DIR" && cargo build --release --target aarch64-unknown-linux-gnu ) || {
     cp "$CFG.bak" "$CFG"; fail "no se pudo compilar el inyector"; }
 cp "$CFG.bak" "$CFG"; rm -f "$CFG.bak"

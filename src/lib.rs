@@ -10,6 +10,7 @@ pub mod openxr;
 pub mod renderer;
 pub mod symbols;
 pub mod tabletop;
+pub mod terreno;
 
 use anyhow::Result;
 use std::sync::{OnceLock, RwLock};
@@ -886,6 +887,39 @@ pub unsafe extern "C" fn xfactorvr_get_terrain_tile(
         }
         None => false,
     }
+}
+
+/// La malla del suelo, ya con las UV puestas.
+///
+/// Cada vertice: tile_x, tile_y, u0, v0, u1, v1, pagina.  La geometria se
+/// calcula en Rust (asi se puede probar sin el visor) y el motor C++ solo
+/// la pinta.
+#[no_mangle]
+pub unsafe extern "C" fn xfactorvr_get_terrain_mesh(out: *mut f32, max_verts: i32) -> i32 {
+    if out.is_null() || max_verts <= 0 {
+        return 0;
+    }
+    let atlas = match assets::terrain_atlas() {
+        Some(a) => a,
+        None => return 0,
+    };
+    let mundo = match game_bridge::get_simulation_world().read() {
+        Ok(m) => m,
+        Err(_) => return 0,
+    };
+    let quads = terreno::terrain_quads(&mundo.terrain, atlas.page_size);
+    let n = quads.len().min(max_verts as usize / 7);
+    for (i, q) in quads.iter().take(n).enumerate() {
+        let base = i * 7;
+        *out.add(base) = q.tile_x as f32;
+        *out.add(base + 1) = q.tile_y as f32;
+        *out.add(base + 2) = q.u0;
+        *out.add(base + 3) = q.v0;
+        *out.add(base + 4) = q.u1;
+        *out.add(base + 5) = q.v1;
+        *out.add(base + 6) = q.page as f32;
+    }
+    n as i32
 }
 
 /// Area de terreno visible: casilla origen y tamaño.

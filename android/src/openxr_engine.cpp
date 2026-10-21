@@ -576,8 +576,7 @@ typedef int  (*pfn_xfactorvr_get_terrain_page_pixels)(uint32_t page, uint8_t* ou
 typedef int  (*pfn_xfactorvr_get_terrain_tile_size)();
 typedef int  (*pfn_xfactorvr_get_terrain_variant_count)(const char* nombre);
 typedef bool (*pfn_xfactorvr_get_terrain_tile)(const char* nombre, uint32_t variant, float* out);
-typedef bool (*pfn_xfactorvr_get_terrain_area)(int* x0, int* y0, int* w, int* h);
-typedef bool (*pfn_xfactorvr_get_terrain_at)(int rel_x, int rel_y, char* out_name, int out_len);
+typedef int  (*pfn_xfactorvr_get_terrain_mesh)(float* out, int max_verts);
 
 static pfn_xfactorvr_get_terrain_page_count    s_get_terrain_page_count    = nullptr;
 static pfn_xfactorvr_get_terrain_page_size     s_get_terrain_page_size     = nullptr;
@@ -585,8 +584,7 @@ static pfn_xfactorvr_get_terrain_page_pixels   s_get_terrain_page_pixels   = nul
 static pfn_xfactorvr_get_terrain_tile_size     s_get_terrain_tile_size     = nullptr;
 static pfn_xfactorvr_get_terrain_variant_count s_get_terrain_variant_count = nullptr;
 static pfn_xfactorvr_get_terrain_tile          s_get_terrain_tile          = nullptr;
-static pfn_xfactorvr_get_terrain_area          s_get_terrain_area          = nullptr;
-static pfn_xfactorvr_get_terrain_at            s_get_terrain_at            = nullptr;
+static pfn_xfactorvr_get_terrain_mesh           s_get_terrain_mesh           = nullptr;
 
 static GLuint s_tex_terrain[XFACTORVR_MAX_ATLAS_PAGES] = {0};
 static int    s_terrain_page_w[XFACTORVR_MAX_ATLAS_PAGES] = {0};
@@ -1225,58 +1223,36 @@ static void draw_sprite_batch(SpriteBatch& batch, uint32_t page,
 
 // Malla del suelo real: un quad por casilla con la textura del terreno.
 //
-// El area la manda el mod (el tile dominante y las celdas que difieren), asi
-// que aqui solo hay que traducir cada casilla a su rect del atlas.  La
-// variante se elige con un hash de la posicion, igual que hace el juego, para
-// que las casillas contiguas no se repitan.
+// La geometria la calcula Rust (src/terreno.rs), que es donde estan el
+// snapshot del terreno y el atlas: asi se puede probar con cargo test sin
+// necesitar el visor.  Aqui solo se pinta.
 static void build_terrain_mesh(float pan_x, float pan_y) {
     for (int p = 0; p < XFACTORVR_MAX_ATLAS_PAGES; ++p) {
         s_terrain_batches[p].verts.clear();
     }
-    if (!s_get_terrain_area || !s_get_terrain_at || !s_get_terrain_tile) return;
-    if (!ensure_terrain_texture()) return;
+    if (!s_get_terrain_mesh || !ensure_terrain_texture()) return;
 
-    int x0 = 0, y0 = 0, w = 0, h = 0;
-    if (!s_get_terrain_area(&x0, &y0, &w, &h) || w <= 0 || h <= 0) return;
-    // Tope de seguridad: el area visible no deberia pasar de esto.
-    if ((long)w * (long)h > 256L * 256L) return;
+    // Cada celda: tile_x, tile_y, u0, v0, u1, v1, pagina.
+    const int MAX_CELLS = 256 * 256;
+    std::vector<float> datos((size_t)MAX_CELLS * 7);
+    int celdas = s_get_terrain_mesh(datos.data(), (int)datos.size());
+    if (celdas <= 0) return;
 
-    char nombre[64];
-    for (int ry = 0; ry < h; ++ry) {
-        for (int rx = 0; rx < w; ++rx) {
-            if (!s_get_terrain_at(rx, ry, nombre, (int)sizeof(nombre))) continue;
-            int variantes = s_get_terrain_variant_count
-                ? s_get_terrain_variant_count(nombre)
-                : 0;
-            if (variantes <= 0) continue;
-
-            int tx = x0 + rx;
-            int ty = y0 + ry;
-            uint32_t hash = (uint32_t)(tx * 73856093) ^ (uint32_t)(ty * 19349663);
-            uint32_t variante = hash % (uint32_t)variantes;
-
-            float rect[5];
-            if (!s_get_terrain_tile(nombre, variante, rect)) continue;
-            int page = (int)rect[4];
-            if (page < 0 || page >= XFACTORVR_MAX_ATLAS_PAGES) continue;
-            float pw = (float)s_terrain_page_w[page];
-            float ph = (float)s_terrain_page_h[page];
-            if (pw <= 0.0f || ph <= 0.0f) continue;
-
-            float u0 = rect[0] / pw;
-            float v0 = rect[1] / ph;
-            float u1 = (rect[0] + rect[2]) / pw;
-            float v1 = (rect[1] + rect[3]) / ph;
-            // Una casilla son 32 px en el juego y 0.04 m en la mesa.
-            float mx = (tx - pan_x) * 0.04f;
-            float mz = (ty - pan_y) * 0.04f;
-            // El suelo va justo encima del suelo de concreto de la mesa.
-            add_sprite_quad(s_terrain_batches[page].verts, mx, mz, 0.0009f,
-                            0.02f, 0.02f, u0, v0, u1, v1,
-                            1.0f, 1.0f, 1.0f, 1.0f);
-        }
+    for (int i = 0; i < celdas; ++i) {
+        const float* v = &datos[(size_t)i * 7];
+        int page = (int)v[6];
+        if (page < 0 || page >= XFACTORVR_MAX_ATLAS_PAGES) continue;
+        if (s_terrain_page_w[page] <= 0 || s_terrain_page_h[page] <= 0) continue;
+        // Una casilla son 32 px en el juego y 0.04 m en la mesa.
+        float mx = (v[0] - pan_x) * 0.04f;
+        float mz = (v[1] - pan_y) * 0.04f;
+        // El suelo va justo encima del suelo de concreto de la mesa.
+        add_sprite_quad(s_terrain_batches[page].verts, mx, mz, 0.0009f,
+                        0.02f, 0.02f, v[2], v[3], v[4], v[5],
+                        1.0f, 1.0f, 1.0f, 1.0f);
     }
 }
+
 
 static void init_glb_loader() {
     if (s_load_glb && s_get_live_entities) return;
@@ -1309,8 +1285,7 @@ static void init_glb_loader() {
     s_get_terrain_tile_size = (pfn_xfactorvr_get_terrain_tile_size)dlsym(handle, "xfactorvr_get_terrain_tile_size");
     s_get_terrain_variant_count = (pfn_xfactorvr_get_terrain_variant_count)dlsym(handle, "xfactorvr_get_terrain_variant_count");
     s_get_terrain_tile = (pfn_xfactorvr_get_terrain_tile)dlsym(handle, "xfactorvr_get_terrain_tile");
-    s_get_terrain_area = (pfn_xfactorvr_get_terrain_area)dlsym(handle, "xfactorvr_get_terrain_area");
-    s_get_terrain_at = (pfn_xfactorvr_get_terrain_at)dlsym(handle, "xfactorvr_get_terrain_at");
+    s_get_terrain_mesh = (pfn_xfactorvr_get_terrain_mesh)dlsym(handle, "xfactorvr_get_terrain_mesh");
 
     if (!s_load_glb || !s_get_live_entities) {
         void* mod_handle = dlopen("libxfactorvr.so", RTLD_NOW | RTLD_GLOBAL);

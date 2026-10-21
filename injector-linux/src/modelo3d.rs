@@ -2054,3 +2054,86 @@ pub fn configurar() {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// El PNG que escribe la captura tiene que ser valido: el stream zlib
+    /// lleva su Adler-32 y cada bloque del PNG lleva su CRC-32.  Si uno de los
+    /// dos esta mal, el fichero no lo puede leer nadie (y el banco no puede
+    /// comprobar si el cubo esta).
+    #[test]
+    fn el_png_que_escribimos_es_valido() {
+        let w = 7u32;
+        let h = 5u32;
+        let mut pix = Vec::with_capacity((w * h * 4) as usize);
+        for i in 0..(w * h * 4) {
+            pix.push((i * 7 % 251) as u8);
+        }
+        let ruta = std::env::temp_dir().join("xfv_prueba_png.png");
+        assert!(escribir_png(ruta.to_str().unwrap(), w, h, &pix));
+
+        let datos = std::fs::read(&ruta).expect("no se pudo leer el PNG");
+        assert_eq!(&datos[..8], &[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]);
+
+        // Recorrer los bloques y comprobar el CRC de cada uno.
+        let mut pos = 8usize;
+        let mut idat = Vec::new();
+        let mut visto_iend = false;
+        while pos + 8 <= datos.len() {
+            let largo = u32::from_be_bytes([
+                datos[pos], datos[pos + 1], datos[pos + 2], datos[pos + 3],
+            ]) as usize;
+            let tipo = &datos[pos + 4..pos + 8];
+            let contenido = &datos[pos + 8..pos + 8 + largo];
+            let crc_leido = u32::from_be_bytes([
+                datos[pos + 8 + largo],
+                datos[pos + 9 + largo],
+                datos[pos + 10 + largo],
+                datos[pos + 11 + largo],
+            ]);
+            let mut para_crc = tipo.to_vec();
+            para_crc.extend_from_slice(contenido);
+            assert_eq!(
+                crc32(&para_crc),
+                crc_leido,
+                "CRC malo en el bloque {:?}",
+                String::from_utf8_lossy(tipo)
+            );
+            if tipo == b"IDAT" {
+                idat = contenido.to_vec();
+            }
+            if tipo == b"IEND" {
+                visto_iend = true;
+            }
+            pos += 12 + largo;
+        }
+        assert!(visto_iend, "falta el bloque IEND");
+
+        // El Adler-32 del final del stream zlib tiene que ser el de los datos.
+        let (mut a, mut b) = (1u32, 0u32);
+        let mut p = 2usize; // cabecera zlib
+        while p < idat.len() {
+            let fin = idat[p];
+            p += 1;
+            let n = u16::from_le_bytes([idat[p], idat[p + 1]]) as usize;
+            p += 4; // LEN + NLEN
+            for &byte in &idat[p..p + n] {
+                a = (a + byte as u32) % 65521;
+                b = (b + a) % 65521;
+            }
+            p += n;
+            if fin == 1 {
+                break;
+            }
+        }
+        let esperado = ((b << 16) | a).to_be_bytes();
+        assert_eq!(
+            &idat[idat.len() - 4..],
+            &esperado,
+            "el Adler-32 del stream zlib no cuadra"
+        );
+        let _ = std::fs::remove_file(&ruta);
+    }
+}

@@ -97,6 +97,9 @@ write-data=$RAIZ
 
 [other]
 check-updates=false
+
+[sound]
+sound-enabled=false
 EOF
 
 # --- 4. Servidor headless (el que tiene el RCON) --------------------------

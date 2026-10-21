@@ -106,7 +106,6 @@ use crate::log;
 use crate::resolver;
 
 /// Direccion del trampolin de `AssemblingMachine::draw`.
-static TRAMPOLIN: AtomicUsize = AtomicUsize::new(0);
 
 /// Numero de veces que ha entrado el hook de dibujado de la entidad.
 static LLAMADAS: AtomicU64 = AtomicU64::new(0);
@@ -158,9 +157,6 @@ static DESPLAZAMIENTO_CAMARA: AtomicU64 = AtomicU64::new(0);
 
 /// Numero de frame del motor (lo lleva la cuenta el hook de render).
 static FRAME: AtomicU64 = AtomicU64::new(0);
-
-/// Frame en el que se capturo la camara BASE (sin desplazar).
-static FRAME_CAMARA: AtomicU64 = AtomicU64::new(u64::MAX);
 
 /// La camara BASE (sin desplazar) del frame actual.
 static CAMARA_BASE: Mutex<(u64, f64)> = Mutex::new((u64::MAX, 0.0));
@@ -921,8 +917,39 @@ type HookFlushSimple = unsafe extern "C" fn(*mut c_void);
 /// Trampolin de `bindUniformBuffer`.
 static TRAMPOLIN_UB: AtomicUsize = AtomicUsize::new(0);
 
+
+/// Tipos de entidad a los que se engancha el 3D.
+///
+/// Todos tienen `draw(DrawQueue&)` (la misma firma que la de la maquina de
+/// montar), asi que el hook es el mismo: lo que cambia es el simbolo donde
+/// se engancha y el trampolin que hay que llamar.
+///
+/// Se han elegido las estructuras que definen una fabrica.  Los objetos con
+/// MUCHOS sprites (cintas, insertores, tuberias) NO se enganchan: el hook
+/// averigua el tamano del sprite por la posicion, y con varias clases de
+/// sprite por entidad el tamano sale mal (cajas gigantes).
+const TIPOS_3D: &[(&str, &str)] = &[
+    ("_ZNK17AssemblingMachine4drawER9DrawQueue", "AssemblingMachine"),
+    ("_ZNK7Furnace4drawER9DrawQueue", "Furnace"),
+    ("_ZNK11MiningDrill4drawER9DrawQueue", "MiningDrill"),
+    ("_ZNK17LogisticContainer4drawER9DrawQueue", "LogisticContainer"),
+    ("_ZNK11Accumulator4drawER9DrawQueue", "Accumulator"),
+    ("_ZNK11StorageTank4drawER9DrawQueue", "StorageTank"),
+    ("_ZNK12CargoStation4drawER9DrawQueue", "CargoStation"),
+    ("_ZNK10RocketSilo4drawER9DrawQueue", "RocketSilo"),
+    ("_ZNK3Lab4drawER9DrawQueue", "Lab"),
+    ("_ZNK6Boiler4drawER9DrawQueue", "Boiler"),
+];
+
+/// Maximo de tipos de entidad con 3D (tamano de los arrays de trampolines).
+const MAX_TIPOS_3D: usize = 16;
+
 /// Trampolin de `DrawQueue::draw`.
 static TRAMPOLIN_DQ: AtomicUsize = AtomicUsize::new(0);
+
+/// Trampolines de los hooks de entidad (uno por tipo): cada tipo enganchado
+/// necesita el suyo, porque el original es distinto en cada caso.
+static TRAMPOLIN_ENT: [AtomicUsize; MAX_TIPOS_3D] = [const { AtomicUsize::new(0) }; MAX_TIPOS_3D];
 
 /// Trampolin de `flushSpritesBatch`.
 static TRAMPOLIN_FLUSH: AtomicUsize = AtomicUsize::new(0);
@@ -941,10 +968,45 @@ static TRAMPOLIN_FLUSH_TEXT: AtomicUsize = AtomicUsize::new(0);
 /// Recibe `this` (la entidad) en x0 y la cola de dibujado en x1.
 #[no_mangle]
 pub extern "C" fn xfv_hook_draw_asm(this: *mut c_void, queue: *mut c_void) {
-    hook_draw_asm(this, queue)
+    hook_draw_asm(this, queue, 0)
 }
 
-extern "C" fn hook_draw_asm(this: *mut c_void, queue: *mut c_void) {
+/// Un hook por tipo de entidad: cada uno llama a su trampolin.
+macro_rules! hook_de_entidad {
+    ($nombre:ident, $indice:expr) => {
+        #[no_mangle]
+        pub extern "C" fn $nombre(this: *mut c_void, queue: *mut c_void) {
+            hook_draw_asm(this, queue, $indice)
+        }
+    };
+}
+
+hook_de_entidad!(xfv_hook_ent_0, 0);
+hook_de_entidad!(xfv_hook_ent_1, 1);
+hook_de_entidad!(xfv_hook_ent_2, 2);
+hook_de_entidad!(xfv_hook_ent_3, 3);
+hook_de_entidad!(xfv_hook_ent_4, 4);
+hook_de_entidad!(xfv_hook_ent_5, 5);
+hook_de_entidad!(xfv_hook_ent_6, 6);
+hook_de_entidad!(xfv_hook_ent_7, 7);
+hook_de_entidad!(xfv_hook_ent_8, 8);
+hook_de_entidad!(xfv_hook_ent_9, 9);
+
+/// Los hooks por tipo, en el mismo orden que `TIPOS_3D`.
+static HOOKS_ENT: [unsafe extern "C" fn(*mut c_void, *mut c_void); 10] = [
+    xfv_hook_ent_0,
+    xfv_hook_ent_1,
+    xfv_hook_ent_2,
+    xfv_hook_ent_3,
+    xfv_hook_ent_4,
+    xfv_hook_ent_5,
+    xfv_hook_ent_6,
+    xfv_hook_ent_7,
+    xfv_hook_ent_8,
+    xfv_hook_ent_9,
+];
+
+extern "C" fn hook_draw_asm(this: *mut c_void, queue: *mut c_void, indice: usize) {
     let n = LLAMADAS.fetch_add(1, Ordering::Relaxed) + 1;
 
     // Guardar la posicion de mapa de la entidad: con ella se identifica su
@@ -967,7 +1029,11 @@ extern "C" fn hook_draw_asm(this: *mut c_void, queue: *mut c_void) {
     // El original SIEMPRE: el motor necesita que su `draw` termine bien
     // (encola el sprite de la entidad). En modo 2D no se dibuja el cubo, y
     // en modo 3D el cubo se dibuja encima, pero el sprite sigue encolado.
-    let tramp = TRAMPOLIN.load(Ordering::Relaxed);
+    let tramp = if indice < MAX_TIPOS_3D {
+        TRAMPOLIN_ENT[indice].load(Ordering::Relaxed)
+    } else {
+        0
+    };
     if tramp != 0 {
         // SAFETY: el trampolin repone los argumentos intactos.
         unsafe {
@@ -2084,19 +2150,56 @@ pub fn instalar(simbolos: &resolver::Simbolos) {
     // direcciones que salen en las trazas de crash del motor.
     log::info(&format!("base de la .so: 0x{:x}", base_de_la_so()));
 
-    // --- hook de la entidad ---
-    const MANGLE: &str = "_ZNK17AssemblingMachine4drawER9DrawQueue";
-    let encontrado = match simbolos.resolver_exacto(MANGLE) {
-        Some(r) => r,
-        None => {
-            log::error("no se encontro AssemblingMachine::draw en el symtab");
-            return;
+    // --- hooks de las entidades con 3D ---
+    //
+    // Cada tipo tiene su propio simbolo (y su propio trampolin).  Si uno no
+    // existe en esta version del motor, se sigue con los demas.
+    let mut enganchados = 0usize;
+    for (i, (mangle, nombre)) in TIPOS_3D.iter().enumerate() {
+        if i >= MAX_TIPOS_3D || i >= HOOKS_ENT.len() {
+            break;
         }
-    };
-    log::info(&format!(
-        "resuelto: AssemblingMachine::draw() -> 0x{:x} (mangled {})",
-        encontrado.direccion, encontrado.mangled
-    ));
+        let encontrado = match simbolos.resolver_exacto(mangle) {
+            Some(r) => r,
+            None => {
+                log::aviso(&format!("no se encontro {nombre}::draw: ese tipo no lleva 3D"));
+                continue;
+            }
+        };
+        log::info(&format!(
+            "resuelto: {nombre}::draw() -> 0x{:x} (mangled {})",
+            encontrado.direccion, encontrado.mangled
+        ));
+
+        // Direccion de ejecucion del hook (dlsym, para no coger la de enlace).
+        let simbolo_hook = format!("xfv_hook_ent_{i}");
+        let hook_addr = match direccion_de_ejecucion_de(&simbolo_hook) {
+            Some(a) => a,
+            None => {
+                log::aviso(&format!("dlsym no devolvio el hook de {nombre}; se usa la direccion de enlace"));
+                HOOKS_ENT[i] as *const () as u64
+            }
+        };
+
+        match detour::instalar(encontrado.direccion, hook_addr, None, encontrado.tamano) {
+            Ok(d) => {
+                TRAMPOLIN_ENT[i].store(d.trampolin as usize, Ordering::SeqCst);
+                enganchados += 1;
+                log::info(&format!(
+                    "detour instalado sobre {nombre}::draw(): trampolin en 0x{:x}",
+                    d.trampolin
+                ));
+            }
+            Err(e) => {
+                log::error(&format!("no se pudo instalar el detour de {nombre}::draw: {e}"));
+            }
+        }
+    }
+    if enganchados == 0 {
+        log::error("no se pudo enganchar ninguna entidad: no habra 3D");
+        return;
+    }
+    log::info(&format!("3D: {enganchados} tipos de entidad enganchados"));
 
     // Las funciones GL del motor: solo se resuelven sus direcciones; los
     // punteros los carga GLAD mas tarde (ver `preparar_gl`).
@@ -2107,28 +2210,6 @@ pub fn instalar(simbolos: &resolver::Simbolos) {
         }
         None => {
             log::aviso("no se encontraron todas las funciones GL: no se dibujaran cubos");
-        }
-    }
-
-    // Direccion de ejecucion del hook (dlsym, para no coger la de enlace).
-    let hook_addr = match direccion_de_ejecucion_de("xfv_hook_draw_asm") {
-        Some(a) => a,
-        None => {
-            log::aviso("dlsym no devolvio el hook de draw; se usa la direccion de enlace");
-            xfv_hook_draw_asm as *const () as u64
-        }
-    };
-
-    match detour::instalar(encontrado.direccion, hook_addr, None, encontrado.tamano) {
-        Ok(d) => {
-            TRAMPOLIN.store(d.trampolin as usize, Ordering::SeqCst);
-            log::info(&format!(
-                "detour instalado sobre AssemblingMachine::draw(): trampolin en 0x{:x}",
-                d.trampolin
-            ));
-        }
-        Err(e) => {
-            log::error(&format!("no se pudo instalar el detour de draw: {e}"));
         }
     }
 

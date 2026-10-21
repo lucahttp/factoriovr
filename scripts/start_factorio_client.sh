@@ -252,6 +252,16 @@ check-updates=false
 CFG
 fi
 
+# El motor abre un dialogo MODAL ("Audio error: Couldn't initialize audio:
+# Audio device open failed") cuando no puede abrir el dispositivo de audio.
+# Ese dialogo se come el teclado: ni la consola del juego ni el raton
+# funcionan.  En el visor el sonido lo pone el motor del APK, asi que el
+# cliente va sin audio (ademas el paquete ligero no trae audio).
+if ! grep -q "^sound-enabled" "$CLIENT_CONFIG" 2>/dev/null; then
+    log "Desactivando el audio del cliente (evita el dialogo modal de error)..."
+    printf '\n[sound]\nsound-enabled=false\n' >> "$CLIENT_CONFIG"
+fi
+
 # --- 6. Arranque ------------------------------------------------------------
 GAME_BIN="$GAME_DIR/bin/arm64/factorio"
 

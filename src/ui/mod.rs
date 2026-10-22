@@ -46,7 +46,7 @@ pub use estados::{EstadoGatillo, Estados, EventoGatillo, Modo};
 pub use items::nombre_item;
 pub use tabla::{
     ancho_texto, celdas_5x7, glifo, primitivas_de_controles, Accion, Celda, Color, Control,
-    ItemResumen, Primitiva, Rect, Receta, Rol, Tabla,
+    Estado, ItemResumen, Primitiva, Rect, Receta, Rol, Tabla,
 };
 pub use ventanas::{Agarre, Anclaje, IdVentana, Limites, Mano, Plano, Ventana, Ventanas};
 
@@ -159,9 +159,6 @@ impl Hud {
     /// que el dibujo y el hit-test sean coherentes.
     pub fn sincronizar_estados(&mut self) {
         let hover = self.estados.hover_actual();
-        for ventana in IdVentana::TODAS {
-            self.tabla.limpiar_hover(ventana, hover.map(|(v, _)| v).filter(|v| *v == ventana).and_then(|_| hover.map(|(_, id)| id)));
-        }
         let sel = self.estados.control_seleccionado;
         let ids: Vec<(IdVentana, u32)> = self
             .tabla
@@ -335,7 +332,7 @@ mod tests {
     #[test]
     fn test_pista_del_modo_actual() {
         let mut h = hud();
-        assert_eq!(h.pista(), Modo::Normal.pista());
+        assert_eq!(h.pista(), Estados::pista_de(Modo::Normal));
         h.estados.set_modo(Modo::Construir);
         assert_eq!(h.pista(), "Modo construir: elige una maquina y colocala con el gatillo");
         h.estados.set_modo(Modo::Fabricar);
@@ -471,9 +468,20 @@ mod tests {
             .controles_de(IdVentana::Construir)
             .map(|c| (c.rect.x, c.rect.y, c.rect.w, c.rect.h))
             .collect();
+        // El marco (fondo + barra de título) es lo único que no viene de la
+        // tabla de controles; todo lo demás tiene que salir de ella.
+        let marco: Vec<(i32, i32, i32, i32)> = ventanas::primitivas_marco(
+            h.ventanas.ventana(IdVentana::Construir).unwrap(),
+        )
+        .iter()
+        .filter_map(|p| match p {
+            Primitiva::Rect { x, y, w, h, .. } => Some((*x, *y, *w, *h)),
+            _ => None,
+        })
+        .collect();
         for r in &rects {
             assert!(
-                de_tabla.contains(r) || *r == (0, 0, 512, 320),
+                de_tabla.contains(r) || marco.contains(r),
                 "rectángulo {:?} que no viene de la tabla ni del marco",
                 r
             );

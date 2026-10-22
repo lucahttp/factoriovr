@@ -821,7 +821,7 @@ pub fn glifo(c: char) -> Option<[u8; 7]> {
         'ó' | 'ò' | 'ö' => glifo('O').unwrap(),
         'ú' | 'ù' | 'ü' => glifo('U').unwrap(),
         'ñ' => glifo('Ñ').unwrap(),
-        'x' | 'X' => glifo('X').unwrap(),
+        'x' => glifo('X').unwrap(),
         _ => return None,
     })
 }
@@ -910,8 +910,10 @@ pub fn primitivas_de_controles(controles: &[&Control]) -> Vec<Primitiva> {
         };
         let color = match c.estado {
             Estado::Desactivado => Color::rgba(120, 128, 136, 255),
-            Rol::Seccion | Rol::Info => Color::TEXTO_TENUE,
-            _ => Color::TEXTO,
+            _ => match c.rol {
+                Rol::Seccion | Rol::Info => Color::TEXTO_TENUE,
+                _ => Color::TEXTO,
+            },
         };
         let texto = c.etiqueta.to_uppercase();
         if texto.is_empty() {
@@ -924,7 +926,7 @@ pub fn primitivas_de_controles(controles: &[&Control]) -> Vec<Primitiva> {
             None => c.rect.w - 16,
         };
         let texto = if ancho > ancho_disponible {
-            recortar(&texto, (ancho_disponible.max(20)) / (6 * escala))
+            recortar(&texto, (ancho_disponible.max(20) / (6 * escala)).max(1) as usize)
         } else {
             texto
         };

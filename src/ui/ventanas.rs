@@ -322,11 +322,12 @@ impl Ventanas {
         if !distancia.is_finite() || distancia <= 0.0 {
             return;
         }
+        let base_ancho_m = v.ancho_m;
         self.set_agarre(
             id,
             Agarre::DosManos {
                 base_distancia: distancia,
-                base_ancho_m: v.ancho_m,
+                base_ancho_m,
                 base_centro: centro,
             },
         );
@@ -337,13 +338,14 @@ impl Ventanas {
     ///
     /// Devuelve el nuevo ancho en metros.
     pub fn actualizar_dos_manos(&mut self, id: IdVentana, distancia: f32, centro: Vec3) -> f32 {
+        let agarres = self.agarre(id);
+        let (min_m, max_m) = (self.limites.ancho_min_m, self.limites.ancho_max_m);
         let Some(v) = self.ventana_mut(id) else { return 0.0 };
-        let Some(agarre) = self.agarre(id) else { return v.ancho_m };
         let Agarre::DosManos {
             base_distancia,
             base_ancho_m,
             base_centro,
-        } = agarre
+        } = agarres
         else {
             return v.ancho_m;
         };
@@ -351,7 +353,7 @@ impl Ventanas {
             return v.ancho_m;
         }
         let factor = distancia / base_distancia;
-        let ancho = (base_ancho_m * factor).clamp(self.limites.ancho_min_m, self.limites.ancho_max_m);
+        let ancho = (base_ancho_m * factor).clamp(min_m, max_m);
         v.ancho_m = ancho;
         // La ventana sigue al centro de las manos, manteniendo el desplazamiento
         // que tenía respecto al centro en el momento de la captura.
@@ -362,8 +364,9 @@ impl Ventanas {
 
     /// Actualiza el agarre con una mano: mueve la ventana con la mano.
     pub fn actualizar_una_mano(&mut self, id: IdVentana, posicion_mano: Vec3) {
+        let agarres = self.agarre(id);
         let Some(v) = self.ventana_mut(id) else { return };
-        let Agarre::UnaMano { desplazamiento, .. } = self.agarre(id) else {
+        let Agarre::UnaMano { desplazamiento, .. } = agarres else {
             return;
         };
         v.plano.posicion = posicion_mano + desplazamiento;

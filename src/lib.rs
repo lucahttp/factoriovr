@@ -10,6 +10,9 @@ pub mod openxr;
 pub mod symbols;
 pub mod tabletop;
 pub mod terreno;
+// El HUD de VR: tabla de controles unica, ventanas espaciales y estados.
+// Ver src/ui/README.md para la API.
+pub mod ui;
 mod gnu_unwind;
 
 use anyhow::Result;
@@ -1349,6 +1352,16 @@ fn ejecutar_accion_vr(accion: &openxr::actions::VrAction) -> bool {
 /// clic de raton).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn xfactorvr_vr_hand_action(tile_x: f32, tile_y: f32, hand: u32) -> bool {
+    // Sin motor real conectado no se arma NADA: el gatillo tiene que seguir
+    // siendo el raton de siempre.  (Con el gesto diferido, armar es todavia
+    // una promesa de accion, y una promesa sin motor no vale nada.)
+    let hay_motor = game_bridge::get_simulation_world()
+        .read()
+        .map(|w| w.is_connected_to_rcon)
+        .unwrap_or(false);
+    if !hay_motor {
+        return false;
+    }
     let live = get_live_entities_lock()
         .read()
         .map(|v| v.clone())
@@ -1584,8 +1597,12 @@ mod tests {
         assert!(!unsafe { xfactorvr_take_from_container(1.0, 1.0, std::ptr::null(), 1) });
         assert!(!unsafe { xfactorvr_insert_carried_item(1.0, 1.0, std::ptr::null(), 1, 1) });
         // La caja de la fabrica de ejemplo esta en (-10.5, -1.5): aun asi no
-        // se manda nada, porque no hay RCON.
+        // se arma nada, porque no hay RCON (y sin motor el gatillo tiene que
+        // seguir siendo el raton).
         assert!(!unsafe { xfactorvr_vr_hand_action(-10.5, -1.5, 0) });
+        assert!(!unsafe { xfactorvr_vr_hand_armed() });
+        // Y soltar tampoco manda nada.
+        assert!(!unsafe { xfactorvr_vr_hand_release(0) });
     }
 
     #[test]

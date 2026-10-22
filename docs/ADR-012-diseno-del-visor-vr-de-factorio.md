@@ -173,6 +173,25 @@ buscaban en `/sdcard`, que no existe en el escritorio y es lento en la Pico.
 Pendiente de validar en el dispositivo: el aspecto de los modelos 3D, las
 ventanas del HUD y el gesto diferido en MR.
 
+### 4.2 El SDK de PICO, revisado
+
+`/Volumes/X10Pro/Downloads/PICO OpenXR SDK 3.0.0-20250422.zip` (848 entradas):
+
+- **El loader que ya usamos es el de PICO**: `libopenxr_loader.so` de arm64-v8a
+  mide 731.328 bytes, los mismos que el de `android/lib/arm64-v8a/`.  No hay
+  que cambiar nada.
+- `OpenXR/pico/` trae **extensiones experimentales y pre-release de PICO**
+  (las que usa GZH-XR, como la de colocar el tablero sobre la mesa real).  Son
+  experimentales: usarlas ataría el visor al runtime de PICO.  La colocación
+  manual con rayo y el agarre con las manos ya funcionan en cualquier
+  dispositivo, así que no hacen falta.
+- `Samples/framework/src/gui/` trae un **renderer de GUI VR con ImGui**
+  (`ImGuiRenderer`, `GuiWindow`).  Es la vía para tener texto con fuente de
+  verdad y widgets de verdad en el HUD, en vez de la fuente bitmap 5x7 que
+  hay ahora.  Es trabajo grande (ImGui + backend OpenXR) y solo tiene sentido
+  cuando se pueda validar en el dispositivo, así que queda como mejora
+  pendiente, no como parte de este trabajo.
+
 ---
 
 ## 5. Cómo se valida

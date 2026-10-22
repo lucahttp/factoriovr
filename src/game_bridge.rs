@@ -397,8 +397,12 @@ impl SimulationWorld {
                 arm_angle: e.arm_angle,
                 sprite_id,
                 anim_frame: e.anim_frame,
+                // Id del modelo 3D (0 si este prototipo no tiene modelo).
+                model_id: crate::modelos3d::id_de_prototipo(&prototipo),
             });
         }
+        // La geometria 3D cacheada depende de las entidades: se invalida.
+        crate::modelos3d::invalidar_geometria();
 
         self.patches = snap
             .patches
@@ -1653,9 +1657,9 @@ mod tests {
             arm_angle: 0.0,
             sprite_id: 0,
             anim_frame: 0,
+            model_id: 0,
         }
     }
-
     #[test]
     fn test_simulation_world_mechanics() {
         let mut world = SimulationWorld::new();

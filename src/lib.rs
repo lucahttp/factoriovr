@@ -5,6 +5,7 @@
 
 pub mod assets;
 pub mod game_bridge;
+pub mod modelos3d;
 pub mod offsets;
 pub mod openxr;
 pub mod symbols;
@@ -282,7 +283,7 @@ pub unsafe extern "C" fn xfactorvr_place_or_update_entity(
                 health_ratio: 1.0,
                 arm_angle: 0.0,
                 sprite_id: 0,
-                anim_frame: 0,
+                anim_frame: 0, model_id: 0,
             });
         }
         true
@@ -1160,7 +1161,7 @@ pub unsafe extern "C" fn xfactorvr_on_entity_draw(
                 health_ratio: 1.0,
                 arm_angle: 0.0,
                 sprite_id: 0,
-                anim_frame: 0,
+                anim_frame: 0, model_id: 0,
             });
         }
     }
@@ -1421,6 +1422,253 @@ pub extern "C" fn xfactorvr_vr_hand_armed() -> bool {
     MANO_ARMADA.lock().map(|e| e.is_some()).unwrap_or(false)
 }
 
+// ============================================================================
+// HUD DE VR: DEL LOGO DE DISENO A GEOMETRIA
+// ============================================================================
+//
+// El modulo `ui` (src/ui/) sabe COMO se ve el HUD: que controles hay, donde,
+// con que estado, y incluso tiene la fuente bitmap 5x7 para el texto.  Pero el
+// motor de VR (C++) solo sabe pintar triangulos.
+//
+// Estas funciones hacen de puente: el HUD se convierte en la misma geometria
+// que el diorama (DioramaVertex), y el C++ la sube a su buffer dinamico y la
+// dibuja con el shader que ya tiene.  El texto se compone de un quad por
+// pixel encendido de la fuente, asi que no hace falta ninguna fuente del
+// sistema.
+//
+// Las ventanas se colocan en el ESPACIO DE LA MESA (como el resto del
+// diorama), que es donde el motor de VR ya sabe aplicar la matriz de la mesa.
+
+static HUD: OnceLock<std::sync::Mutex<ui::Hud>> = OnceLock::new();
+
+/// El HUD global. Se construye con el inventario real del jugador.
+fn hud() -> &'static std::sync::Mutex<ui::Hud> {
+    HUD.get_or_init(|| {
+        let inventario = game_bridge::get_simulation_world()
+            .read()
+            .map(|w| w.player_inventory.clone())
+            .unwrap_or_default();
+        let items: Vec<ui::ItemResumen> = inventario
+            .iter()
+            .map(|(item_id, cantidad)| ui::ItemResumen {
+                item_id: *item_id,
+                nombre: String::new(),
+                cantidad: *cantidad,
+            })
+            .collect();
+        std::sync::Mutex::new(ui::Hud::nuevo(&items, &[]))
+    })
+}
+
+/// Añade un quad (dos triángulos) con el color en los vertices.
+fn push_quad(
+    out: &mut Vec<tabletop::DioramaVertex>,
+    centro: glam::Vec3,
+    eje_x: glam::Vec3,
+    eje_y: glam::Vec3,
+    ancho: f32,
+    alto: f32,
+    color: ui::tabla::Color,
+) {
+    let hx = eje_x * (ancho * 0.5);
+    let hy = eje_y * (alto * 0.5);
+    let c = [
+        color.r as f32 / 255.0,
+        color.g as f32 / 255.0,
+        color.b as f32 / 255.0,
+        color.a as f32 / 255.0,
+    ];
+    let normal = {
+        let n = eje_x.cross(eje_y).normalize_or_zero();
+        [n.x, n.y, n.z]
+    };
+    let puntos = [
+        centro - hx - hy,
+        centro + hx - hy,
+        centro + hx + hy,
+        centro - hx - hy,
+        centro + hx + hy,
+        centro - hx + hy,
+    ];
+    for p in puntos {
+        out.push(tabletop::DioramaVertex {
+            x: p.x,
+            y: p.y,
+            z: p.z,
+            nx: normal[0],
+            ny: normal[1],
+            nz: normal[2],
+            u: 0.0,
+            v: 0.0,
+            r: c[0],
+            g: c[1],
+            b: c[2],
+            a: c[3],
+        });
+    }
+}
+
+/// Geometria del HUD lista para dibujar. Devuelve cuantos vertices escribio.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn xfactorvr_ui_vertices(
+    out: *mut tabletop::DioramaVertex,
+    max: i32,
+) -> i32 {
+    if out.is_null() || max <= 0 {
+        return 0;
+    }
+    let buffer = std::slice::from_raw_parts_mut(out, max as usize);
+    let mut verts: Vec<tabletop::DioramaVertex> = Vec::new();
+
+    {
+        let h = hud().lock().unwrap_or_else(|e| e.into_inner());
+        for ventana_id in ui::ventanas::IdVentana::TODAS {
+            let ventana = match h.ventanas.ventana(ventana_id) {
+                Some(v) => v,
+                None => continue,
+            };
+            // Escala: de pixeles de la ventana a metros.
+            let escala = if ventana.ancho_px > 0 {
+                ventana.ancho_m / ventana.ancho_px as f32
+            } else {
+                0.0
+            };
+            if escala <= 0.0 {
+                continue;
+            }
+            let rot = ventana.plano.rotacion;
+            let centro = ventana.plano.posicion;
+            // Ejes del plano de la ventana (la mira por su -Z local).
+            let eje_x = rot * glam::Vec3::X;
+            let eje_y = rot * glam::Vec3::Y;
+
+            // --- El cristal de la ventana -----------------------------------
+            let (ancho_px, alto_px) = (ventana.ancho_px, ventana.alto_px);
+            push_quad(
+                &mut verts,
+                centro,
+                eje_x,
+                eje_y,
+                ancho_px as f32 * escala,
+                alto_px as f32 * escala,
+                ui::tabla::Color::FONDO,
+            );
+
+            // --- Los controles ------------------------------------------------
+            for prim in h.render_ventana(ventana_id) {
+                match prim {
+                    ui::tabla::Primitiva::Rect { x, y, w, h: alto, color } => {
+                        let centro_px = (x as f32 + w as f32 * 0.5, y as f32 + alto as f32 * 0.5);
+                        let centro_local = (centro_px.0 - ancho_px as f32 * 0.5) * escala;
+                        let centro_local_y = (alto_px as f32 * 0.5 - centro_px.1) * escala;
+                        let p = centro
+                            + eje_x * centro_local
+                            + eje_y * centro_local_y;
+                        push_quad(
+                            &mut verts,
+                            p,
+                            eje_x,
+                            eje_y,
+                            w as f32 * escala,
+                            alto as f32 * escala,
+                            color,
+                        );
+                    }
+                    ui::tabla::Primitiva::Borde {
+                        x,
+                        y,
+                        w,
+                        h: alto,
+                        color,
+                        grosor,
+                    } => {
+                        // El borde se dibuja como cuatro tiras finas.
+                        let g = grosor.max(1) as f32 * escala;
+                        let lados = [
+                            (x, y, w, grosor),
+                            (x, y + alto - grosor, w, grosor),
+                            (x, y, grosor, alto),
+                            (x + w - grosor, y, grosor, alto),
+                        ];
+                        for (lx, ly, lw, lh) in lados {
+                            let cx = lx as f32 + lw as f32 * 0.5;
+                            let cy = ly as f32 + lh as f32 * 0.5;
+                            let local_x = (cx - ancho_px as f32 * 0.5) * escala;
+                            let local_y = (alto_px as f32 * 0.5 - cy) * escala;
+                            let p = centro + eje_x * local_x + eje_y * local_y;
+                            push_quad(&mut verts, p, eje_x, eje_y, lw as f32 * escala, lh as f32 * escala, color);
+                        }
+                    }
+                    ui::tabla::Primitiva::Badge { .. } => {
+                        // Los badges los dibuja el renderizador como rectangulo
+                        // con su numero; aqui se ignoran (el numero va en el
+                        // texto de la celda).
+                    }
+                    ui::tabla::Primitiva::Texto { celdas, escala: esc } => {
+                        // Cada pixel ENCENDIDO de la fuente 5x7 es un quad.
+                        let px = esc.max(1) as f32 * escala;
+                        for celda in celdas {
+                            for fila in 0..7usize {
+                                let bits = celda.filas[fila];
+                                for bit in 0..5usize {
+                                    if bits & (1 << (4 - bit)) == 0 {
+                                        continue;
+                                    }
+                                    let cx = celda.x as f32 + bit as f32 + 0.5;
+                                    let cy = celda.y as f32 + fila as f32 + 0.5;
+                                    let local_x = (cx - ancho_px as f32 * 0.5) * escala;
+                                    let local_y = (alto_px as f32 * 0.5 - cy) * escala;
+                                    let p = centro + eje_x * local_x + eje_y * local_y;
+                                    push_quad(&mut verts, p, eje_x, eje_y, px, px, celda.color);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let n = verts.len().min(max as usize);
+    buffer[..n].copy_from_slice(&verts[..n]);
+    n as i32
+}
+
+/// Hit-test del HUD: que control hay bajo el punto (u, v) de la ventana.
+///
+/// Devuelve el id del control o -1.
+#[unsafe(no_mangle)]
+pub extern "C" fn xfactorvr_ui_hit(ventana: u32, u: f32, v: f32) -> i64 {
+    let h = hud().lock().unwrap_or_else(|e| e.into_inner());
+    let id_ventana = match ventana {
+        0 => ui::ventanas::IdVentana::Construir,
+        1 => ui::ventanas::IdVentana::Inventario,
+        2 => ui::ventanas::IdVentana::Fabricar,
+        3 => ui::ventanas::IdVentana::Vista,
+        _ => return -1,
+    };
+    match h.hit_test(id_ventana, u, v) {
+        Some(id) => id as i64,
+        None => -1,
+    }
+}
+
+/// Pista de texto del modo actual (lo que el usuario debe hacer ahora).
+///
+/// La cadena se copia al buffer del llamante; devuelve su longitud.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn xfactorvr_ui_pista(out: *mut std::os::raw::c_char, max: i32) -> i32 {
+    if out.is_null() || max <= 0 {
+        return 0;
+    }
+    let h = hud().lock().unwrap_or_else(|e| e.into_inner());
+    let pista = h.pista().as_bytes();
+    let n = pista.len().min(max as usize - 1);
+    std::ptr::copy_nonoverlapping(pista.as_ptr(), out as *mut u8, n);
+    *out.add(n) = 0;
+    n as i32
+}
+
 /// Ejecuta la accion de inventario que decide la mano de VR.
 ///
 /// `hand`: 0 = gatillo (coger), 1 = gripo (meter). Decide lo MISMO que la
@@ -1500,8 +1748,7 @@ mod tests {
             health_ratio: 0.0,
             arm_angle: 0.0,
             sprite_id: 0,
-            anim_frame: 0,
-        }; 64];
+            anim_frame: 0, model_id: 0 }; 64];
         let mut count = 0;
 
         // 1. Obtener entidades iniciales
@@ -1542,8 +1789,7 @@ mod tests {
             health_ratio: 0.0,
             arm_angle: 0.0,
             sprite_id: 0,
-            anim_frame: 0,
-        }; 64];
+            anim_frame: 0, model_id: 0 }; 64];
         let mut count = 0;
 
         // Probar hook de Factorio C++
@@ -1606,8 +1852,37 @@ mod tests {
     }
 
     #[test]
-    fn test_early_game_progression_ffi() {
-        let _guard = lock_test_state();
+    fn test_hud_genera_geometria() {
+        // El HUD tiene que producir triangulos de verdad: sin esto, el motor
+        // de VR se queda con el HUD viejo y no se ve nada de lo nuevo.
+        let mut verts = vec![tabletop::DioramaVertex {
+            x: 0.0, y: 0.0, z: 0.0,
+            nx: 0.0, ny: 0.0, nz: 1.0,
+            u: 0.0, v: 0.0,
+            r: 0.0, g: 0.0, b: 0.0, a: 0.0,
+        }; 24000];
+        let n = unsafe { xfactorvr_ui_vertices(verts.as_mut_ptr(), verts.len() as i32) };
+        assert!(n > 0, "el HUD tiene que generar geometria");
+        assert!(n % 6 == 0, "la geometria va en triangulos: {n} vertices");
+        assert!(
+            n < verts.len() as i32,
+            "el HUD no debe llenarse el buffer (quedaria truncado): {n}"
+        );
+
+        // Y la pista del modo tiene que decir algo util.
+        let mut buffer = [0i8; 256];
+        let len = unsafe {
+            xfactorvr_ui_pista(buffer.as_mut_ptr() as *mut std::os::raw::c_char, buffer.len() as i32)
+        };
+        assert!(len > 0, "el HUD tiene que escribir la pista del modo");
+        let pista = unsafe {
+            std::ffi::CStr::from_ptr(buffer.as_ptr() as *const std::os::raw::c_char)
+        };
+        assert!(!pista.to_str().unwrap_or("").is_empty());
+    }
+
+    #[test]
+    fn test_early_game_progression_ffi() {        let _guard = lock_test_state();
         unsafe {
             // 1. Resetear mundo
             assert!(xfactorvr_reset_world(true));

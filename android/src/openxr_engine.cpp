@@ -512,6 +512,7 @@ struct LiveEntity {
     float arm_angle;   // angulo del brazo en radianes (solo insertadores)
     uint32_t sprite_id;  // sprite real de Factorio en el atlas (0 = sin sprite)
     uint32_t anim_frame;  // frame de animacion actual
+    uint32_t model_id;    // id del MODELO 3D de esta entidad (0 = sin modelo)
 };
 
 // Tabla de tipos de entidad. Debe coincidir con src/tabletop.rs y con el mod
@@ -639,6 +640,13 @@ typedef bool (*pfn_xfactorvr_get_view_center)(float* out_x, float* out_y);
 // comportamiento normal de raton).
 typedef bool (*pfn_xfactorvr_vr_hand_action)(float tile_x, float tile_y, uint32_t hand);
 typedef bool (*pfn_xfactorvr_vr_hand_release)(uint32_t hand);
+// HUD de VR: el modulo Rust convierte la tabla de controles y las ventanas
+// espaciales en la misma geometria que el diorama.
+typedef int (*pfn_xfactorvr_ui_vertices)(DioramaVertex* out, int max);
+typedef long long (*pfn_xfactorvr_ui_hit)(uint32_t ventana, float u, float v);
+// Geometria 3D de todas las entidades vivas que tienen modelo (la genera el
+// modulo Rust con los GLB del mod factorio-3d-mod).
+typedef int (*pfn_xfactorvr_modelo3d_geometria_viva)(DioramaVertex* out, int max);
 
 static pfn_xfactorvr_load_glb s_load_glb = nullptr;
 static pfn_xfactorvr_free_glb s_free_glb = nullptr;
@@ -660,6 +668,9 @@ static pfn_xfactorvr_pan_view s_pan_view = nullptr;
 static pfn_xfactorvr_get_view_center s_get_view_center = nullptr;
 static pfn_xfactorvr_vr_hand_action s_vr_hand_action = nullptr;
 static pfn_xfactorvr_vr_hand_release s_vr_hand_release = nullptr;
+static pfn_xfactorvr_ui_vertices s_ui_vertices = nullptr;
+static pfn_xfactorvr_ui_hit s_ui_hit = nullptr;
+static pfn_xfactorvr_modelo3d_geometria_viva s_modelo3d_viva = nullptr;
 
 // Estado de Minado Manual con Pico (mantener Trigger en vetas de mineral)
 static float s_manual_mining_timer = 0.0f;
@@ -1297,6 +1308,9 @@ static void init_glb_loader() {
     s_get_view_center = (pfn_xfactorvr_get_view_center)dlsym(handle, "xfactorvr_get_view_center");
     s_vr_hand_action = (pfn_xfactorvr_vr_hand_action)dlsym(handle, "xfactorvr_vr_hand_action");
     s_vr_hand_release = (pfn_xfactorvr_vr_hand_release)dlsym(handle, "xfactorvr_vr_hand_release");
+    s_ui_vertices = (pfn_xfactorvr_ui_vertices)dlsym(handle, "xfactorvr_ui_vertices");
+    s_ui_hit = (pfn_xfactorvr_ui_hit)dlsym(handle, "xfactorvr_ui_hit");
+    s_modelo3d_viva = (pfn_xfactorvr_modelo3d_geometria_viva)dlsym(handle, "xfactorvr_modelo3d_geometria_viva");
     s_get_atlas_page_count = (pfn_xfactorvr_get_atlas_page_count)dlsym(handle, "xfactorvr_get_atlas_page_count");
     s_get_atlas_page_size = (pfn_xfactorvr_get_atlas_page_size)dlsym(handle, "xfactorvr_get_atlas_page_size");
     s_get_atlas_page_pixels = (pfn_xfactorvr_get_atlas_page_pixels)dlsym(handle, "xfactorvr_get_atlas_page_pixels");
@@ -1332,6 +1346,9 @@ static void init_glb_loader() {
             s_get_view_center = (pfn_xfactorvr_get_view_center)dlsym(mod_handle, "xfactorvr_get_view_center");
             s_vr_hand_action = (pfn_xfactorvr_vr_hand_action)dlsym(mod_handle, "xfactorvr_vr_hand_action");
             s_vr_hand_release = (pfn_xfactorvr_vr_hand_release)dlsym(mod_handle, "xfactorvr_vr_hand_release");
+            s_ui_vertices = (pfn_xfactorvr_ui_vertices)dlsym(mod_handle, "xfactorvr_ui_vertices");
+            s_ui_hit = (pfn_xfactorvr_ui_hit)dlsym(mod_handle, "xfactorvr_ui_hit");
+            s_modelo3d_viva = (pfn_xfactorvr_modelo3d_geometria_viva)dlsym(mod_handle, "xfactorvr_modelo3d_geometria_viva");
         }
     }
     LOGI("openxr_engine: Cargador GLB y FFI Factorio enlazados (load=%p, get=%p, inv=%p, patches=%p, mine=%p, interact=%p)",
@@ -1809,11 +1826,15 @@ static void draw_tabletop_scene(const float* vp_mat,
         // vagonetas...).  Antes al reves: si habia sprite, se dibujaba el
         // sprite tumbado y NUNCA se llegaba a la malla.
         const ModelMesh& mesh = s_entity_meshes[ent.entity_type];
-        // Solo cuenta como 3D si la malla es un MODELO REAL.  La primitiva de
-        // reserva es un apaño: para esas entidades, el sprite del juego es mas
-        // fiel que una caja inventada.
-        const bool tiene_malla_3d =
-            (mesh.vao != 0 && mesh.vertex_count > 0 && mesh.desde_modelo);
+        // Una entidad se dibuja con su MODELO 3D de verdad si el puente le ha
+        // asignado uno (model_id != 0).  La geometria la genera el modulo de
+        // modelos en Rust con los GLB del mod factorio-3d-mod (optimizados y
+        // empaquetados en el APK) y se pinta mas abajo, de una vez.
+        //
+        // Si NO hay modelo (items del suelo, arbustos que no tienen GLB...),
+        // se dibuja el sprite real del atlas, que es mas fiel que una primitiva
+        // inventada.
+        const bool tiene_malla_3d = (ent.model_id != 0);
 
         if (!tiene_malla_3d && ent.sprite_id != 0 && s_get_sprite_frame && ensure_atlas_texture()) {
             float rect[10];
@@ -1842,38 +1863,18 @@ static void draw_tabletop_scene(const float* vp_mat,
 
         if (!tiene_malla_3d) continue;
 
+        // Posicion de la entidad en la mesa (la usan las particulas de las
+        // maquinas que se dibujan mas abajo).
         float mx = (ent.tile_x - s_view_pan_x) * 0.04f;
         float mz = (ent.tile_y - s_view_pan_y) * 0.04f;
 
-        float ent_trans[16], ent_rot[16], ent_local[16], ent_world[16], ent_mvp[16];
-        mat4_rotate_y(ent_rot, ent.orientation);
-        mat4_translate(ent_trans, mx, 0.0f, mz);
-        mat4_multiply(ent_trans, ent_rot, ent_local);
-        mat4_multiply(active_model, ent_local, ent_world);
-        mat4_multiply(vp_mat, ent_world, ent_mvp);
-
-        glUniformMatrix4fv(s_model_loc, 1, GL_FALSE, ent_world);
-        glUniformMatrix4fv(s_mvp_loc, 1, GL_FALSE, ent_mvp);
-
-        glBindVertexArray(mesh.vao);
-        glDrawArrays(GL_TRIANGLES, 0, mesh.vertex_count);
-
-        // Si es torreta, dibujar el cañón / torreta superior rotatoria
-        if (ent.entity_type == ENTITY_GUN_TURRET && s_turret_top_mesh.vao != 0) {
-            float top_trans[16], top_rot[16], top_local[16], top_world[16], top_mvp[16];
-            float turret_yaw = ent.orientation + sinf(anim_time * 0.8f + (float)i) * 0.65f;
-            mat4_rotate_y(top_rot, turret_yaw);
-            mat4_translate(top_trans, mx, 0.045f, mz);
-            mat4_multiply(top_trans, top_rot, top_local);
-            mat4_multiply(active_model, top_local, top_world);
-            mat4_multiply(vp_mat, top_world, top_mvp);
-
-            glUniformMatrix4fv(s_model_loc, 1, GL_FALSE, top_world);
-            glUniformMatrix4fv(s_mvp_loc, 1, GL_FALSE, top_mvp);
-
-            glBindVertexArray(s_turret_top_mesh.vao);
-            glDrawArrays(GL_TRIANGLES, 0, s_turret_top_mesh.vertex_count);
-        }
+        // La geometria 3D de verdad la pinta el modulo de modelos (Rust) con
+        // los GLB del mod factorio-3d-mod, ya transformada y en su sitio.  Se
+        // dibuja toda junta mas abajo, en un unico draw call, para no ir
+        // entidad por entidad.
+        // (Aqui ya no se instancia la malla antigua por tipo: la de verdad
+        // es la que trae el prototipo exacto, p.ej. cofre de madera frente a
+        // cofre de acero.)
 
         // Emisión de partículas periódicas por máquina activa (Fase 3)
         if (is_primary_eye) {
@@ -2678,10 +2679,72 @@ static void draw_tabletop_scene(const float* vp_mat,
         glDrawArrays(GL_TRIANGLES, 0, (GLsizei)dyn_verts.size());
     }
 
+    // LAS MAQUINAS CON MODELO 3D DE VERDAD.
+    //
+    // La geometria la genera el modulo de modelos en Rust con los GLB del mod
+    // factorio-3d-mod (optimizados: de 63,7 MB a 7,2 MB) y llega ya
+    // transformada y colocada en su casilla.  Se dibuja entera en un solo
+    // draw call, con la matriz de la mesa.
+    if (s_modelo3d_viva) {
+        static std::vector<DioramaVertex> modelo_verts(80000);
+        int n = s_modelo3d_viva(modelo_verts.data(), (int)modelo_verts.size());
+        if (n > 0) {
+            float mod_mvp[16];
+            mat4_multiply(vp_mat, active_model, mod_mvp);
+            glUniformMatrix4fv(s_model_loc, 1, GL_FALSE, active_model);
+            glUniformMatrix4fv(s_mvp_loc, 1, GL_FALSE, mod_mvp);
+            glUniform1f(s_enable_clipping_loc, s_observer_mode ? 0.0f : 1.0f);
+            glUniform1f(s_use_tex_loc, 0.0f);
+            glUniform1f(s_lit_loc, 1.0f);
+            glUniform3f(s_emissive_loc, 0.0f, 0.0f, 0.0f);
+
+            glBindVertexArray(s_dynamic_vao);
+            glBindBuffer(GL_ARRAY_BUFFER, s_dynamic_vbo);
+            glBufferSubData(GL_ARRAY_BUFFER, 0, (size_t)n * sizeof(DioramaVertex), modelo_verts.data());
+            glDrawArrays(GL_TRIANGLES, 0, (GLsizei)n);
+        }
+    }
+
     // El render real del juego (si el juego lo esta mandando) se pinta como un
     // panel al fondo de la mesa: es la imagen que compone el motor, con el
     // cubo 3D dentro. Va lo ultimo para que quede por encima de la mesa.
     draw_game_panel(vp_mat, active_model, is_primary_eye);
+
+    // HUD DE VR: las ventanas espaciales con la tabla de controles.
+    //
+    // El modulo Rust (src/ui/) decide que hay en cada ventana, con que estado
+    // y con que texto; aqui solo se pinta su geometria, que viene en el mismo
+    // formato que el diorama.  El texto son quads por pixel de la fuente 5x7,
+    // asi que no hace falta ninguna fuente del sistema.
+    if (s_ui_vertices) {
+        static std::vector<DioramaVertex> ui_verts(24000);
+        int n = s_ui_vertices(ui_verts.data(), (int)ui_verts.size());
+        if (n >= (int)ui_verts.size()) {
+            // El HUD ha crecido: se amplia el buffer y se pide otra vez.
+            ui_verts.resize(ui_verts.size() * 2);
+            n = s_ui_vertices(ui_verts.data(), (int)ui_verts.size());
+        }
+        if (n > 0) {
+            float ui_mvp[16];
+            mat4_multiply(vp_mat, active_model, ui_mvp);
+            glUniformMatrix4fv(s_model_loc, 1, GL_FALSE, active_model);
+            glUniformMatrix4fv(s_mvp_loc, 1, GL_FALSE, ui_mvp);
+            glUniform1f(s_enable_clipping_loc, 0.0f);
+            glUniform1f(s_use_tex_loc, 0.0f);
+            glUniform1f(s_lit_loc, 0.0f);
+            glUniform3f(s_emissive_loc, 1.0f, 1.0f, 1.0f);
+
+            glEnable(GL_BLEND);
+            glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+            glDepthMask(GL_FALSE);
+            glBindVertexArray(s_dynamic_vao);
+            glBindBuffer(GL_ARRAY_BUFFER, s_dynamic_vbo);
+            glBufferSubData(GL_ARRAY_BUFFER, 0, (size_t)n * sizeof(DioramaVertex), ui_verts.data());
+            glDrawArrays(GL_TRIANGLES, 0, (GLsizei)n);
+            glDepthMask(GL_TRUE);
+            glDisable(GL_BLEND);
+        }
+    }
 
     glBindVertexArray(0);
     glBindBuffer(GL_ARRAY_BUFFER, 0);

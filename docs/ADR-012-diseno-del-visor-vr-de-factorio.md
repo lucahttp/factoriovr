@@ -1,12 +1,16 @@
 # ADR-012 — El visor VR de Factorio: diseño objetivo (fidelidad al juego + UX)
 
-> **Estado**: especificación en curso. Este documento es la referencia que
-> reparten los trabajos: define QUÉ se quiere y QUÉ ficheros toca cada uno.
+> **Estado**: en curso. Este documento es la referencia que reparten los
+> trabajos: define QUÉ se quiere y QUÉ ficheros toca cada uno.
 >
 > Origen: el usuario pidió que el visor se parezca lo máximo posible al juego
 > original y que la jugabilidad no sea "mortal", tomando como referencia de
 > diseño el proyecto **Generals-Zero-Hour-XR** (Command & Conquer: Zero Hour
 > XR) y usando los **modelos 3D del mod factorio-3d-mod** de GDani31.
+>
+> **Progreso**: T1 (modelos 3D) y T2 (HUD) entregados y validados; T3 (el
+> modelo 3D tiene prioridad) y T4 (gesto diferido) implementados. Falta la
+> validación visual en la Pico (bloqueada por el cable USB).
 
 ---
 
@@ -151,6 +155,23 @@ Reglas de la casa: comentarios y documentación en **español**; nada de
 `rm` (usar `mavis-trash` o `os.remove`); lo pesado en `/Volumes/X10Pro/`; los
 bancos se validan contra el **motor real** del contenedor, nunca con datos de
 ejemplo.
+
+### 4.1 Lo que ya está hecho (2026-10-22)
+
+| Trabajo | Estado | Detalle |
+|---|---|---|
+| T1 | **hecho** | `src/modelos3d.rs` (tabla, caché, geometría), `src/bin/optimizar_glb.rs`, 26 GLB en `android/src/main/assets/models/`. **63,7 MB → 7,2 MB.** |
+| T2 | **hecho** | `src/ui/` (tabla de controles única, 4 ventanas, estados con pista, fuente 5x7). 11 tests. |
+| T3 | **hecho** | El modelo 3D real tiene prioridad sobre el sprite plano; los GLB salen del APK (se extraen al directorio interno de la app); `LiveEntity::model_id`; geometría viva en un draw call. |
+| T4 | **hecho** | Gesto diferido: `xfactorvr_vr_hand_action` **arma**, `xfactorvr_vr_hand_release` **ejecuta**, `xfactorvr_vr_hand_armed` para el feedback. El HUD se pinta con la geometría que genera `src/ui/`. |
+
+El punto que explain por que se veia igual que en el post de GitHub: **si la
+entidad tenia sprite del atlas, se dibujaba el sprite 2D tumbado y se hacia
+`continue`, de modo que la malla 3D nunca se llegaba a dibujar**. Y los GLB se
+buscaban en `/sdcard`, que no existe en el escritorio y es lento en la Pico.
+
+Pendiente de validar en el dispositivo: el aspecto de los modelos 3D, las
+ventanas del HUD y el gesto diferido en MR.
 
 ---
 

@@ -1,92 +1,107 @@
-# ADR-011 — El cliente RCON del APK no habla con el motor (problema abierto)
+# ADR-011 — El cliente RCON del APK: diagnóstico corregido y bugs reales
 
-## Qué se ha encontrado
+> **Estado**: el problema original ("el cliente RCON no habla con el motor")
+> **está RESUELTO**: era un diagnóstico falso. Pero al destaparlo han
+> aparecido dos bugs reales que sí importan. Este documento cuenta los dos.
 
-Al Trying de validar **el camino completo del visor** (el mismo código que
-lleva el APK en el dispositivo) contra un Factorio real en el contenedor, se
-vio que **el cliente RCON de Rust (`src/game_bridge.rs`) no recibe respuesta
-del servidor**, mientras que el sondeo en Python del banco
-(`scripts/rcon_probe.py`) sí la recibe.
+## El diagnóstico anterior era falso
 
-La prueba de control (un `rcon.print('hola')` a pelo, con el mismo servidor y
-el mismo binario) da:
+La versión anterior de este ADR decía que el cliente RCON de Rust
+(`src/game_bridge.rs`) no recibía respuesta del motor mientras que el sondeo
+en Python (`scripts/rcon_probe.py`) sí.
 
-```
-ok: conectado por RCON a 127.0.0.1:27021     <- la autenticacion SI funciona
-control: el RCON NO responde a un comando sencillo
-traza: el RCON no devolvio nada
-traza: el poll no traia snapshot
-ok: instantanea con 11 entidades y 0 items sueltos   <- las 11 son de la SIMULACION LOCAL
-```
+**Era una binario viejo.** El arreglo de la lectura ya estaba en el repo (commit
+`6f6ac17`, "la lectura para en el primer paquete con contenido"), pero el
+binario ARM64 que se copiaba al contenedor **no se había recompilado**: el
+banco avisa cuando el binario es más viejo que el fuente, pero no lo
+recompila (compilar el target musl tarda minutos).
 
-Las 11 entidades son las de la simulación local de reserva
-(`tabletop::init_default_factory_entities`), no las del juego.
-
-## Por qué importa
-
-**El visor nunca ha visto el juego real.** El diorama que se ve en MR siempre
-fue la simulación local de ejemplo, no la fábrica del servidor. Por eso el
-banco del visor (FASE 34, `scripts/test_visor_juega.sh`) nunca se pudo
-ejecutar: necesita el dispositivo, y contra el contenedor el cliente RCON no
-trae el mundo.
-
-Lo que **sí** está validado (con el sondeo en Python, que sí funciona):
-- los remotos del mod (coger, meter, sacar) ✓
-- la campaña entera en un servidor headless ✓
-- el snapshot del mod con su sección "loose" (items del suelo) ✓
-
-## Lo que se sabe del servidor
-
-Del log del propio motor (el que hay que leer cuando esto se atasca):
+Con el binario **fresco**, contra el motor real:
 
 ```
-[WARNING] Player <server> tried using the command "remote.call(...)".
-[WARNING] Using Lua console commands will disable achievements. Please repeat the command to proceed.
+[rcon] -> id=4 tipo=2 «/silent-command remote.call('xfactorvr','get_world_snapshot',32,0,0)»
+[rcon] <- id=4 tipo=0 cuerpo=41992 «{"entities":[{"t":"tree-05",...
+[rcon] poll: snapshot -> 41992 bytes
 ```
 
-**Factorio rechaza el PRIMER comando de consola de cada sesión.** El sondeo
-del banco lo sortea con un "calentamiento" (`rcon.print('listo')`) antes de
-cada consulta, y abre una conexión nueva para cada una.
+**El poll SÍ trae el snapshot.** El cliente RCON del crate habla con el motor.
 
-## Correcciones aplicadas (aún sin validar en conjunto)
+La traza se activa con `XFACTORVR_RCON_TRACE=1` (imprime cada paquete enviado y
+recibido por stderr). Es la forma de ver qué pasa por el socket sin meter un
+proxy por medio.
 
-En `src/game_bridge.rs`:
+## Bug real 1 — el snapshot llega, pero el diorama se queda vacío
 
-1. **El timeout de lectura pasa de 400 ms a 3 s.** El sondeo en Python espera
-   5 s; el snapshot con el terreno (miles de tiles) tarda bastante más que el
-   inventario, y con 400 ms el cliente se cansaba antes de que llegara.
-2. **Ya no se quita el prefijo `/silent-command`** cuando el snapshot no trae
-   JSON. En modo silencioso, la salida del `rcon.print` del mod vuelve por el
-   RCON; **sin** el prefijo se imprime en la consola del *servidor* y el
-   cliente se queda sin nada. Ahora se repite el comando (con prefijo).
-3. **Se reconoce el aviso de rechazo** ("Please repeat the command to
-   proceed") y se repite el comando en vez de dar la respuesta por buena.
-4. **Calentamiento al conectar**, para gastar el rechazo del primer comando.
-5. **Reconexión** si el snapshot no llega.
+El poll trae el snapshot (41992 bytes, 99 entidades) y aun así el diorama se
+queda con **0 entidades**: el visor cae en la simulación local.
 
-Y en `scripts/test_inventario_vr.sh`: el banco **compila siempre** el binario
-ARM64 de las manos. Antes solo lo compilaba si no existía, así que validaba un
-binario viejo (esto hizo que varias pruebas pareciesen fallar sin estar probando
-el código nuevo).
+La causa está en el **acuerdo entre el mod y el cliente**:
 
-## Por qué sigue sin resolverse
+- El mod (`mods/xfactorvr_bridge/control.lua`, `serialize_entity`) calcula el
+  tipo canónico con `entity_type_of(e)`, que mira `e.type` ("tree",
+  "simple-entity", "unit"...). Para un árbol del escenario, `e.type == "tree"`
+  → tipo 12.
+- Pero al serializar manda **`e.name`** (el nombre del prototipo) en el campo
+  `"t"`: `"tree-05"`, `"tree-03"`, `"dry-tree"`, ...
+- El cliente (`entity_type_from_name` en `src/game_bridge.rs`) traduce ese
+  nombre al tipo del render. Su tabla solo conoce los nombres canónicos
+  (`"tree"`, `"stone-furnace"`, `"wooden-chest"`, ...), así que `"tree-05"` cae
+  en el `_ => 0` y la entidad **se descarta**.
 
-Con todo lo anterior a la vez, el control sigue dando "no responde". La
-diferencia que queda entre el cliente que funciona (Python) y el que no
-(Rust) está en la **lectura**: el Python lee `length - 8` bytes del cuerpo y el
-Rust `length - 10`.
+O sea: el mod sabe el tipo y lo tira; el cliente adivina el tipo por un nombre
+que no es el suyo.
 
-**Siguiente paso**: probar el cliente Rust con la lectura exactamente igual
-que la del sondeo (mismo `length`, mismos bucles de `recv`, mismos timeouts) y
-**una conexión nueva por consulta**, como hace el Python. Si eso funciona, la
-diferencia está en el reuse de la sesión y el arreglo es reiniciar la sesión
-(o el sondeo del banco, que es lo que hoy valida de verdad).
+El arreglo: el mod manda el **tipo canónico** en `"t"` y el **nombre del
+prototipo** en un campo nuevo `"n"`. El cliente usa `"t"` para el tipo y `"n"`
+para elegir el sprite real (el manifiesto de sprites tiene 43 nombres: cajas,
+hornos, cintas, "dry-tree"... pero no "tree-05", así que hace falta el
+repliegue al canónico).
+
+## Bug real 2 — el poll martillea al motor
+
+`poll_rcon_sync` **reinicia la sesión TCP en cada poll** (`rcon.connect` antes
+de cada consulta) y manda **dos comandos de consola** (inventario + snapshot).
+El poll se dispara cada `RCON_POLL_INTERVAL = 0,12 s`, o sea **unas 16
+comandos de consola por segundo y 8 conexiones TCP nuevas por segundo**
+contra el motor.
+
+En el log del motor se ve la avalancha:
+
+```
+12.090 New RCON connection from IP ADDR:({127.0.0.1:36792})
+12.295 New RCON connection from IP ADDR:({127.0.0.1:36802})
+12.399 New RCON connection from IP ADDR:({127.0.0.1:36812})
+12.500 New RCON connection from IP ADDR:({127.0.0.1:36816})
+12.598 New RCON connection from IP ADDR:({127.0.0.1:36824})
+```
+
+En la Pico eso es un martillo: el motor va a ir delaying y el render se va a
+sentir. Con el bug 1 arreglado, la sesión se puede reutilizar y el inventario
+no hace falta pedirlo a 8 Hz.
+
+## Bug latente — el reintento pide el snapshot con decimales
+
+El bloque de reintento del poll construye el comando con `{:.1}`:
+
+```rust
+let snap_cmd = format!("... get_world_snapshot', {}, {:.1}, {:.1})", ...);
+```
+
+Pero el comentario del propio código (y el banco) dice que **el centro tiene que
+ir como entero**: con decimales, `find_entities` con un área decimal no
+devuelve nada y el snapshot llega vacío. El camino principal usa `{:.0}`
+correcto; el reintento usa `{:.1}` y por eso, cuando se llega al reintento, el
+snapshot sale vacío.
 
 ## Cómo se comprueba
 
 ```bash
-bash scripts/test_inventario_vr.sh        # 12 fases de los remotos + el aviso
+# Traza del socket RCON (cada paquete enviado y recibido)
+XFACTORVR_RCON_TRACE=1 ./probar_manos 127.0.0.1:27015 xfactorvr
+
+# Snapshot real del motor, tal cual, para parsearlo fuera
+python3 scripts/extraer_snapshot.py 127.0.0.1:27015 xfactorvr /tmp/snapshot.json
 ```
 
-La fase "El camino completo del APK" deja aviso (no fallo) mientras esto siga
-abierto, y avisa de que el visor cae en la simulación local.
+Y el banco que valida el camino completo del visor contra el motor real:
+`scripts/test_visor_real.sh`.

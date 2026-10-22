@@ -70,6 +70,18 @@ const RCON_READ_TIMEOUT_MS: u64 = 3000;
 /// entidades puede pesar cientos de KB, asi que el limite debe ser holgado.
 const RCON_MAX_BODY: usize = 4 * 1024 * 1024;
 
+/// Traza del RCON por stderr. Solo con XFACTORVR_RCON_TRACE=1.
+///
+/// Sirve para ver QUE PASA POR EL SOCKET sin meter un proxy por medio: que
+/// comando se envia, que paquete vuelve y de que tipo. Sin esto, el fallo del
+/// ADR-011 (el poll no trae el snapshot pero el comando directo si) no se
+/// puede acotar.
+fn traza_rcon(mensaje: &str) {
+    if std::env::var("XFACTORVR_RCON_TRACE").as_deref() == Ok("1") {
+        eprintln!("[rcon] {mensaje}");
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct ResourcePatch {
     pub item_type: u32,
@@ -830,16 +842,16 @@ impl RconClient {
             return false;
         }
 
-        // Factorio RECHAZA el primer comando de consola de cada sesion con el
+        // Factorio RECHAZA el PRIMER comando de consola de cada sesion con el
         // aviso "Using Lua console commands will disable achievements. Please
-        // repeat the command to proceed" (sale en el log del servidor como
-        // [WARNING]).  Ese comando NO se ejecuta, asi que el primero que
-        // mande el cliente se pierde.
+        // repeat the command to proceed" y ese comando NO se ejecuta.
         //
-        // Se gasta el rechazo con un comando inocuo (un "calentamiento"), que
-        // es lo que hace el sondeo en Python del banco.  Su respuesta se lee y
-        // se tira, para no desfasar el protocolo.
-        let _ = self.execute_collect("/silent-command rcon.print('')", 2);
+        // OJO: hasta que no se repita y se acepte ese comando, el servidor
+        // NO ACEPTA NINGUN OTRO (se queda esperando el mismo).  Por eso aqui
+        // se manda un comando inocuo y se REPETE hasta que el servidor lo
+        // acepte (execute_collect_retry reconoce el aviso y lo repite).
+        // Es lo mismo que hace el sondeo en Python del banco.
+        let _ = self.execute_collect_retry("/silent-command rcon.print('listo')", 3);
 
         true
     }
@@ -867,6 +879,11 @@ impl RconClient {
         buf.push(0); // termina cadena
         buf.push(0); // relleno
 
+        traza_rcon(&format!(
+            "-> id={id} tipo={packet_type} cuerpo={} «{}»",
+            body_bytes.len(),
+            body
+        ));
         stream.write_all(&buf).is_ok()
     }
 
@@ -876,20 +893,37 @@ impl RconClient {
         let mut header = [0u8; 12];
         stream.read_exact(&mut header).ok()?;
         let length = i32::from_le_bytes(header[0..4].try_into().ok()?);
-        if length < 10 || length as usize > RCON_MAX_BODY {
+        let req_id = i32::from_le_bytes(header[4..8].try_into().ok()?);
+        if length as usize > RCON_MAX_BODY {
+            traza_rcon(&format!("<- id={req_id} PAQUETE DESCARTADO (length={length})"));
             return None;
         }
-        // El cuerpo del paquete: el `length` del RCON cuenta los 4 bytes del
-        // id, los 4 del tipo y los 2 del final de cadena (ver el sondeo en
-        // Python, scripts/rcon_probe.py).
-        let body_len = (length - 10) as usize;
+        // El cuerpo del paquete, IGUAL que lo lee el sondeo en Python
+        // (scripts/rcon_probe.py): `length - 8` bytes (el `length` cuenta los
+        // 4 del id, los 4 del tipo y los 2 del final de cadena).
+        //
+        // OJO: NO se descarta ningun paquete por su tamano.  Antes se
+        // apartaban los que tenian `length < 10` y se leian `length - 10`:
+        // un paquete con un aviso se apartaba SIN leerse su cuerpo y el
+        // comando siguiente leia basura.  Con esto el cliente habla con el
+        // motor (verificado con src/bin/rcon_minimo.rs, que es esta misma
+        // logica, y con src/bin/probar_manos.rs).
+        let body_len = (length - 8).max(0) as usize;
         let mut body = vec![0u8; body_len];
-        stream.read_exact(&mut body).ok()?;
+        if !body.is_empty() {
+            stream.read_exact(&mut body).ok()?;
+        }
         let ptype = i32::from_le_bytes(header[8..12].try_into().ok()?);
-        if body.len() >= 2 {
+        if body.len() >= 2 && body.ends_with(&[0u8, 0u8]) {
             body.truncate(body.len() - 2);
         }
-        Some((ptype, String::from_utf8_lossy(&body).to_string()))
+        let texto = String::from_utf8_lossy(&body).to_string();
+        let muestra: String = texto.chars().take(110).collect();
+        traza_rcon(&format!(
+            "<- id={req_id} tipo={ptype} cuerpo={} «{muestra}»",
+            texto.len()
+        ));
+        Some((ptype, texto))
     }
 
     /// Envia un comando y devuelve el cuerpo de la primera respuesta.
@@ -1195,18 +1229,57 @@ pub fn poll_rcon_sync(dt: f32, view_center: (f32, f32)) -> RconPoll {
     }
 
     // Pedir la instantanea del mundo alrededor del centro de la vista.
+    //
+    // OJO: el centro va como ENTERO.  Con decimales ("0.0") el motor no
+    // encuentra entidades en el area (find_entities con un area decimal no
+    // devuelve nada) y el snapshot llega VACIO: el visor se queda sin
+    // mundo.  Verificado contra el servidor real.
     let prefix = if verbose { "" } else { "/silent-command " };
     let snap_cmd = format!(
-        "{}remote.call('xfactorvr', 'get_world_snapshot', {}, {:.1}, {:.1})",
+        "{}remote.call('xfactorvr', 'get_world_snapshot', {}, {:.0}, {:.0})",
         prefix, RCON_SNAPSHOT_RADIUS, view_center.0, view_center.1
     );
     let inv_cmd = format!("{}remote.call('xfactorvr', 'get_inventory')", prefix);
 
-    // Factorio rechaza el primer comando de consola de la sesion (ver
-    // execute_collect_retry), asi que ambos comandos se lanzan con reintento.
-    let snapshot = rcon.execute_collect_retry(&snap_cmd, 3);
-    let inventory = rcon.execute_collect_retry(&inv_cmd, 2);
-
+    // Factorio rechaza el PRIMER comando de consola de cada sesion (ver
+    // execute_collect_retry) y ese comando NO se ejecuta.
+    //
+    // OJO: por eso va el INVENTARIO primero.  Si el primero es el snapshot,
+    // se pierde siempre y el visor se queda con la simulacion local (sin
+    // mundo).  Con el inventario delante, el snapshot ya es el segundo
+    // comando y se ejecuta.  Verificado contra el servidor real.
+    // OJO: hasta que el servidor no acepte el primer comando de la sesion
+    // (rechaza el primero y hay que repetirlo) NO ACEPTA NINGUN OTRO.  Por
+    // eso, antes de preguntar, se manda un comando inocuo y se repite hasta
+    // que el servidor lo acepte.  Es lo que hace el sondeo en Python del
+    // banco, que es el que si habla con el motor.
+    // OJO: la sesion se REINICIA antes de preguntar.  El motor deja de
+    // atender comandos nuevos despues de unos cuantos (el sondeo en Python
+    // del banco abre una conexion nueva en cada consulta y por eso siempre
+    // funciona).  Ademas, al reconectar, `connect` gasta el rechazo del
+    // primer comando con un calentamiento, de modo que el snapshot ya es el
+    // segundo comando y se ejecuta.
+    {
+        let addr = format!("{}:{}", read_host_override().unwrap_or_else(|| host.clone()), port);
+        traza_rcon(&format!("poll: reiniciando la sesion en {addr}"));
+        let _ = rcon.connect(&addr, &password);
+    }
+    let inventory = rcon.execute_collect(&inv_cmd, 2);
+    traza_rcon(&format!(
+        "poll: inventario -> {}",
+        match &inventory {
+            Some(c) => format!("{} bytes", c.len()),
+            None => "NADA".to_string(),
+        }
+    ));
+    let snapshot = rcon.execute_collect(&snap_cmd, 3);
+    traza_rcon(&format!(
+        "poll: snapshot -> {}",
+        match &snapshot {
+            Some(c) => format!("{} bytes", c.len()),
+            None => "NADA".to_string(),
+        }
+    ));
     // Si el snapshot no trae JSON, se REPITE el comando (no se quita el
     // prefijo /silent-command).
     //
@@ -1219,6 +1292,7 @@ pub fn poll_rcon_sync(dt: f32, view_center: (f32, f32)) -> RconPoll {
     let mut snapshot = snapshot;
     let mut inventory = inventory;
     if !verbose && (extract_json(snapshot.as_deref().unwrap_or("")).is_none()) {
+        traza_rcon("poll: el snapshot no trae JSON, se reintenta");
         // El snapshot no ha llegado.  Antes de rendirse, se RECONECTA y se
         // repite: el sondeo en Python abre una sesion nueva para cada
         // consulta y asi funciona siempre (el motor rechaza el primer
@@ -1230,12 +1304,26 @@ pub fn poll_rcon_sync(dt: f32, view_center: (f32, f32)) -> RconPoll {
         let inv_cmd = format!("{}remote.call('xfactorvr', 'get_inventory')", prefix);
         snapshot = rcon.execute_collect_retry(&snap_cmd, 3);
         inventory = rcon.execute_collect_retry(&inv_cmd, 2);
+        traza_rcon(&format!(
+            "poll: reintento -> snapshot {}",
+            match &snapshot {
+                Some(c) => format!("{} bytes", c.len()),
+                None => "NADA".to_string(),
+            }
+        ));
         if extract_json(snapshot.as_deref().unwrap_or("")).is_none() {
             let addr = format!("{}:{}", read_host_override().unwrap_or(host.clone()), port);
             if rcon.connect(&addr, &password) {
                 snapshot = rcon.execute_collect_retry(&snap_cmd, 3);
                 inventory = rcon.execute_collect_retry(&inv_cmd, 2);
             }
+            traza_rcon(&format!(
+                "poll: tras reconectar -> snapshot {}",
+                match &snapshot {
+                    Some(c) => format!("{} bytes", c.len()),
+                    None => "NADA".to_string(),
+                }
+            ));
         }
     }
 

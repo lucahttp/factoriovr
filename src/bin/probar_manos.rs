@@ -51,12 +51,74 @@ fn main() {
     }
     println!("ok: conectado por RCON a {}", host);
 
+    // PRUEBA DE CONTROL: un comando de consola sencillo.  Si esto vuelve, el
+    // cliente RCON funciona y el problema es solo con el snapshot.
+    {
+        let control = {
+            let mut rcon = game_bridge::get_rcon_client()
+                .lock()
+                .expect("no se pudo tomar el cliente RCON");
+            rcon.execute_collect("/silent-command rcon.print('hola')", 3)
+        };
+        match control {
+            Some(c) => println!("control: el RCON responde: {}", &c[..c.len().min(120)]),
+            None => println!("control: el RCON NO responde a un comando sencillo"),
+        }
+    }
+
     // --- 2. Instantanea del mundo -----------------------------------------
     // Esto es lo que hace el motor de VR en cada frame: pedir el estado al
     // servidor y llenar la lista de entidades (la que usa para clasificar lo
     // que hay bajo el rayo).
+    // Orden inverso: primero el INVENTARIO y luego el snapshot (que es lo
+    // que hace el poll del puente).  Si el snapshot vuelve vacio, el comando
+    // del inventario es lo que rompe la sesion.
+    {
+        let inv = {
+            let mut rcon = game_bridge::get_rcon_client()
+                .lock()
+                .expect("no se pudo tomar el cliente RCON");
+            rcon.execute_collect("/silent-command remote.call('xfactorvr', 'get_inventory')", 3)
+        };
+        println!("inventario: {}", match inv { Some(c) => format!("{} bytes", c.len()), None => "NO LLEGO NADA".to_string() });
+        let despues = {
+            let mut rcon = game_bridge::get_rcon_client()
+                .lock()
+                .expect("no se pudo tomar el cliente RCON");
+            rcon.execute_collect(
+                "/silent-command remote.call('xfactorvr', 'get_world_snapshot', 32, 0, 0)",
+                3,
+            )
+        };
+        match despues {
+            Some(c) => println!("snapshot tras inventario: {} entidades ({} bytes)", c.matches("\"t\":").count(), c.len()),
+            None => println!("snapshot tras inventario: NO LLEGO NADA"),
+        }
+    }
+
+    // El snapshot pedido DIRECTAMENTE (como hace el cliente minimo), sin
+    // pasar por el poll del puente: para seccionar si el problema es el
+    // poll o el cliente.
+    {
+        let directo = {
+            let mut rcon = game_bridge::get_rcon_client()
+                .lock()
+                .expect("no se pudo tomar el cliente RCON");
+            rcon.execute_collect(
+                "/silent-command remote.call('xfactorvr', 'get_world_snapshot', 32, 0, 0)",
+                3,
+            )
+        };
+        match directo {
+            Some(c) => {
+                let n = c.matches("\"t\":").count();
+                println!("directo: el snapshot tiene {n} entidades ({} bytes)", c.len());
+            }
+            None => println!("directo: NO LLEGO NADA"),
+        }
+    }
     for _ in 0..3 {
-        unsafe { xfactorvr::xfactorvr_update_simulation(0.2) };
+        unsafe { xfactorvr::xfactorvr_update_simulation(2.0) };
     }
     let rcon = game_bridge::poll_rcon_sync(3.0, (0.0, 0.0));
     if !rcon.connected {
@@ -79,21 +141,6 @@ fn main() {
         sueltos.len()
     );
 
-    // PRUEBA DE CONTROL: un comando de consola sencillo.  Si esto vuelve, el
-    // cliente RCON funciona y el problema es solo con el snapshot.
-    {
-        let control = {
-            let mut rcon = game_bridge::get_rcon_client()
-                .lock()
-                .expect("no se pudo tomar el cliente RCON");
-            rcon.execute_collect("/silent-command rcon.print('hola')", 3)
-        };
-        match control {
-            Some(c) => println!("control: el RCON responde: {}", &c[..c.len().min(120)]),
-            None => println!("control: el RCON NO responde a un comando sencillo"),
-        }
-    }
-
     // Traza: la respuesta CRUDA del RCON (que puede ser el aviso de
     // "repeat the command" con el que Factorio rechaza el primer comando).
     {
@@ -115,12 +162,14 @@ fn main() {
     // Traza: el snapshot EN CRUDO que devuelve el mod.  Con el comando
     // silencioso el RCON no devuelve nada, asi que se activa el repliegue
     // "verbose" (el mismo que usa el puente).
-    let rcon = {
-        if let Ok(mut cfg) = game_bridge::get_rcon_config().lock() {
-            cfg.verbose_fallback = true;
-        }
-        game_bridge::poll_rcon_sync(3.0, (0.0, 0.0))
-    };
+    let rcon = game_bridge::poll_rcon_sync(3.0, (0.0, 0.0));
+    {
+        let centro = game_bridge::get_simulation_world()
+            .read()
+            .map(|w| w.view_center)
+            .unwrap_or((-1.0, -1.0));
+        println!("traza: centro de vista {:?}  comando: /silent-command remote.call('xfactorvr', 'get_world_snapshot', 32, {}, {})", centro, centro.0 as i64, centro.1 as i64);
+    }
     if let Some(c) = rcon.snapshot.as_deref() {
         match c.find("\"loose\"") {
             Some(p) => {

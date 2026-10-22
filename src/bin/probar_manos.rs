@@ -245,35 +245,59 @@ fn main() {
 
     // --- 4. Actuar: el gatillo sobre la caja saca un item -----------------
     //
-    // Es EXACTAMENTE lo que hace el motor de VR al apretar el gatillo.
+    // Es EXACTAMENTE lo que hace el motor de VR: GESTO DIFERIDO.  Al apretar
+    // el gatillo la accion se ARMA; al soltar el dedo se EJECUTA.  Aqui se
+    // comprueban las dos mitades, que es lo que valida el diferido.
     let antes = sueltos.len();
-    let actuo = unsafe { xfactorvr::xfactorvr_vr_hand_action(cx, cy, 0) };
-    if !actuo {
-        panic!("el gatillo sobre la caja no hizo nada");
+    let armado = unsafe { xfactorvr::xfactorvr_vr_hand_action(cx, cy, 0) };
+    if !armado {
+        panic!("el gatillo sobre la caja no armo nada");
     }
-    println!("ok: el gatillo sobre la caja ({cx}, {cy}) ha actuado");
+    if !unsafe { xfactorvr::xfactorvr_vr_hand_armed() } {
+        panic!("la accion deberia estar ARMADA antes de soltar");
+    }
+    let actuo = unsafe { xfactorvr::xfactorvr_vr_hand_release(0) };
+    if !actuo {
+        panic!("el gatillo sobre la caja no hizo nada al soltar");
+    }
+    if unsafe { xfactorvr::xfactorvr_vr_hand_armed() } {
+        panic!("la accion deberia quedar DESARMADA despues de soltar");
+    }
+    println!("ok: el gatillo sobre la caja ({cx}, {cy}) ha actuado (armar -> soltar)");
 
     // Y el gripo mete el item que lleva el actor en la caja.
-    let actuo = unsafe { xfactorvr::xfactorvr_vr_hand_action(cx, cy, 1) };
-    if !actuo {
-        panic!("el gripo sobre la caja no hizo nada");
+    let armado = unsafe { xfactorvr::xfactorvr_vr_hand_action(cx, cy, 1) };
+    if !armado {
+        panic!("el gripo sobre la caja no armo nada");
     }
-    println!("ok: el gripo sobre la caja ({cx}, {cy}) ha actuado");
+    let actuo = unsafe { xfactorvr::xfactorvr_vr_hand_release(1) };
+    if !actuo {
+        panic!("el gripo sobre la caja no hizo nada al soltar");
+    }
+    println!("ok: el gripo sobre la caja ({cx}, {cy}) ha actuado (armar -> soltar)");
 
     // Y el gatillo sobre el item del suelo lo coge.
-    let actuo = unsafe { xfactorvr::xfactorvr_vr_hand_action(sx, sy, 0) };
+    let armado = unsafe { xfactorvr::xfactorvr_vr_hand_action(sx, sy, 0) };
     let _ = antes;
-    if !actuo {
-        panic!("el gatillo sobre el item del suelo no hizo nada");
+    if !armado {
+        panic!("el gatillo sobre el item del suelo no armo nada");
     }
-    println!("ok: el gatillo sobre el item del suelo ({sx}, {sy}) ha actuado");
+    let actuo = unsafe { xfactorvr::xfactorvr_vr_hand_release(0) };
+    if !actuo {
+        panic!("el gatillo sobre el item del suelo no hizo nada al soltar");
+    }
+    println!("ok: el gatillo sobre el item del suelo ({sx}, {sy}) ha actuado (armar -> soltar)");
 
     // Y el gatillo sobre el horno mete los ingredientes.
-    let actuo = unsafe { xfactorvr::xfactorvr_vr_hand_action(hx, hy, 0) };
-    if !actuo {
-        panic!("el gatillo sobre el horno no hizo nada");
+    let armado = unsafe { xfactorvr::xfactorvr_vr_hand_action(hx, hy, 0) };
+    if !armado {
+        panic!("el gatillo sobre el horno no armo nada");
     }
-    println!("ok: el gatillo sobre el horno ({hx}, {hy}) ha actuado");
+    let actuo = unsafe { xfactorvr::xfactorvr_vr_hand_release(0) };
+    if !actuo {
+        panic!("el gatillo sobre el horno no hizo nada al soltar");
+    }
+    println!("ok: el gatillo sobre el horno ({hx}, {hy}) ha actuado (armar -> soltar)");
 
     println!("RESULTADO: las manos VR funcionan contra el Factorio real");
 }

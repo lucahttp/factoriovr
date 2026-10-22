@@ -1289,14 +1289,64 @@ pub unsafe extern "C" fn xfactorvr_insert_carried_item(
     true
 }
 
-/// Ejecuta la accion de inventario que decide la mano de VR.
+/// La accion que una mano ha ARMADO, esperando a que el dedo se suelte.
 ///
-/// `hand`: 0 = gatillo (coger), 1 = gripo (meter). Decide lo MISMO que la
-/// logica de las manos (src/openxr/actions.rs): si bajo el rayo hay un item
-/// suelto, una caja o un horno, hace su accion; si no hay nada interactuable,
-/// NO hace nada (no es una accion destructiva).
+/// Es el gesto diferido de Generals-Zero-Hour-XR: al apretar el gatillo NO se
+/// emite la orden, se arma; la orden sale cuando el dedo se levanta.  Asi un
+/// roce, un movimiento de la mano o una perdida de tracking no ejecutan nada
+/// por accidente, y el usuario ve que la accion esta preparada antes de que
+/// ocurra.
+#[derive(Clone, Debug)]
+pub struct ManoArmada {
+    pub mano: openxr::actions::VrHand,
+    pub accion: openxr::actions::VrAction,
+}
+
+/// La mano que tiene una accion armada (si hay alguna).
+static MANO_ARMADA: std::sync::Mutex<Option<ManoArmada>> = std::sync::Mutex::new(None);
+
+/// Ejecuta la accion de VR contra el juego de verdad.
+fn ejecutar_accion_vr(accion: &openxr::actions::VrAction) -> bool {
+    match accion {
+        openxr::actions::VrAction::PickUpItem { tile_x, tile_y } => {
+            unsafe { xfactorvr_pick_up_item(*tile_x, *tile_y) }
+        }
+        openxr::actions::VrAction::TakeFromContainer {
+            tile_x,
+            tile_y,
+            item_name,
+            count,
+        } => {
+            let nombre = std::ffi::CString::new(item_name.clone()).unwrap_or_default();
+            unsafe { xfactorvr_take_from_container(*tile_x, *tile_y, nombre.as_ptr(), *count) }
+        }
+        openxr::actions::VrAction::InsertItem {
+            tile_x,
+            tile_y,
+            item_name,
+            count,
+            inv_index,
+        } => {
+            let nombre = std::ffi::CString::new(item_name.clone()).unwrap_or_default();
+            unsafe {
+                xfactorvr_insert_carried_item(
+                    *tile_x,
+                    *tile_y,
+                    nombre.as_ptr(),
+                    *count,
+                    *inv_index,
+                )
+            }
+        }
+    }
+}
+
+/// ARMA la accion de la mano: el gatillo se ha apretado pero todavia no se
+/// ejecuta nada.
 ///
-/// Es el gancho que el motor de VR llama con la casilla que apunta el rayo.
+/// Devuelve true si hay algo interactuable bajo el rayo (o sea, si la mano
+/// "ha cogido" algo y el motor de VR debe dejar de tratar el gatillo como un
+/// clic de raton).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn xfactorvr_vr_hand_action(tile_x: f32, tile_y: f32, hand: u32) -> bool {
     let live = get_live_entities_lock()
@@ -1314,28 +1364,76 @@ pub unsafe extern "C" fn xfactorvr_vr_hand_action(tile_x: f32, tile_y: f32, hand
         openxr::actions::VrHand::Grip
     };
     match openxr::actions::decide_vr_action(&target, tile_x, tile_y, mano) {
-        Some(openxr::actions::VrAction::PickUpItem { tile_x, tile_y }) => {
-            xfactorvr_pick_up_item(tile_x, tile_y)
+        Some(accion) => {
+            let mut estado = MANO_ARMADA.lock().unwrap_or_else(|e| e.into_inner());
+            *estado = Some(ManoArmada { mano, accion });
+            true
         }
-        Some(openxr::actions::VrAction::TakeFromContainer {
-            tile_x,
-            tile_y,
-            item_name,
-            count,
-        }) => {
-            let nombre = std::ffi::CString::new(item_name).unwrap_or_default();
-            xfactorvr_take_from_container(tile_x, tile_y, nombre.as_ptr(), count)
+        None => false,
+    }
+}
+
+/// SUELTA la mano: el dedo se levanta y la accion armada se ejecuta.
+///
+/// Es la segunda mitad del gesto diferido.  Si la accion no estaba armada (o
+/// es de la otra mano) no hace nada.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn xfactorvr_vr_hand_release(hand: u32) -> bool {
+    let mano = if hand == 0 {
+        openxr::actions::VrHand::Trigger
+    } else {
+        openxr::actions::VrHand::Grip
+    };
+    let armada = {
+        let mut estado = MANO_ARMADA.lock().unwrap_or_else(|e| e.into_inner());
+        match estado.take() {
+            Some(a) if a.mano == mano => Some(a),
+            otra => {
+                // No es la mano armada: se devuelve al estado para que otro
+                // dedo no la coja por error.
+                *estado = otra;
+                None
+            }
         }
-        Some(openxr::actions::VrAction::InsertItem {
-            tile_x,
-            tile_y,
-            item_name,
-            count,
-            inv_index,
-        }) => {
-            let nombre = std::ffi::CString::new(item_name).unwrap_or_default();
-            xfactorvr_insert_carried_item(tile_x, tile_y, nombre.as_ptr(), count, inv_index)
-        }
+    };
+    match armada {
+        Some(a) => ejecutar_accion_vr(&a.accion),
+        None => false,
+    }
+}
+
+/// Dice si hay una accion ARMADA (para que el visor pueda dar el feedback).
+#[unsafe(no_mangle)]
+pub extern "C" fn xfactorvr_vr_hand_armed() -> bool {
+    MANO_ARMADA.lock().map(|e| e.is_some()).unwrap_or(false)
+}
+
+/// Ejecuta la accion de inventario que decide la mano de VR.
+///
+/// `hand`: 0 = gatillo (coger), 1 = gripo (meter). Decide lo MISMO que la
+/// logica de las manos (src/openxr/actions.rs): si bajo el rayo hay un item
+/// suelto, una caja o un horno, hace su accion; si no hay nada interactuable,
+/// NO hace nada (no es una accion destructiva).
+///
+/// Es el gancho que el motor de VR llama con la casilla que apunta el rayo.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn xfactorvr_vr_hand_action_directo(tile_x: f32, tile_y: f32, hand: u32) -> bool {
+    let live = get_live_entities_lock()
+        .read()
+        .map(|v| v.clone())
+        .unwrap_or_default();
+    let loose = game_bridge::get_simulation_world()
+        .read()
+        .map(|w| w.loose_items.clone())
+        .unwrap_or_default();
+    let target = tabletop::classify_target(&live, &loose, tile_x, tile_y);
+    let mano = if hand == 0 {
+        openxr::actions::VrHand::Trigger
+    } else {
+        openxr::actions::VrHand::Grip
+    };
+    match openxr::actions::decide_vr_action(&target, tile_x, tile_y, mano) {
+        Some(accion) => ejecutar_accion_vr(&accion),
         None => false,
     }
 }

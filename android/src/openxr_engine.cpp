@@ -638,6 +638,7 @@ typedef bool (*pfn_xfactorvr_get_view_center)(float* out_x, float* out_y);
 // Devuelve false si no habia nada que hacer (entonces el motor sigue con su
 // comportamiento normal de raton).
 typedef bool (*pfn_xfactorvr_vr_hand_action)(float tile_x, float tile_y, uint32_t hand);
+typedef bool (*pfn_xfactorvr_vr_hand_release)(uint32_t hand);
 
 static pfn_xfactorvr_load_glb s_load_glb = nullptr;
 static pfn_xfactorvr_free_glb s_free_glb = nullptr;
@@ -658,6 +659,7 @@ static pfn_xfactorvr_get_carried_item s_get_carried_item = nullptr;
 static pfn_xfactorvr_pan_view s_pan_view = nullptr;
 static pfn_xfactorvr_get_view_center s_get_view_center = nullptr;
 static pfn_xfactorvr_vr_hand_action s_vr_hand_action = nullptr;
+static pfn_xfactorvr_vr_hand_release s_vr_hand_release = nullptr;
 
 // Estado de Minado Manual con Pico (mantener Trigger en vetas de mineral)
 static float s_manual_mining_timer = 0.0f;
@@ -1294,6 +1296,7 @@ static void init_glb_loader() {
     s_pan_view = (pfn_xfactorvr_pan_view)dlsym(handle, "xfactorvr_pan_view");
     s_get_view_center = (pfn_xfactorvr_get_view_center)dlsym(handle, "xfactorvr_get_view_center");
     s_vr_hand_action = (pfn_xfactorvr_vr_hand_action)dlsym(handle, "xfactorvr_vr_hand_action");
+    s_vr_hand_release = (pfn_xfactorvr_vr_hand_release)dlsym(handle, "xfactorvr_vr_hand_release");
     s_get_atlas_page_count = (pfn_xfactorvr_get_atlas_page_count)dlsym(handle, "xfactorvr_get_atlas_page_count");
     s_get_atlas_page_size = (pfn_xfactorvr_get_atlas_page_size)dlsym(handle, "xfactorvr_get_atlas_page_size");
     s_get_atlas_page_pixels = (pfn_xfactorvr_get_atlas_page_pixels)dlsym(handle, "xfactorvr_get_atlas_page_pixels");
@@ -1328,6 +1331,7 @@ static void init_glb_loader() {
             s_pan_view = (pfn_xfactorvr_pan_view)dlsym(mod_handle, "xfactorvr_pan_view");
             s_get_view_center = (pfn_xfactorvr_get_view_center)dlsym(mod_handle, "xfactorvr_get_view_center");
             s_vr_hand_action = (pfn_xfactorvr_vr_hand_action)dlsym(mod_handle, "xfactorvr_vr_hand_action");
+            s_vr_hand_release = (pfn_xfactorvr_vr_hand_release)dlsym(mod_handle, "xfactorvr_vr_hand_release");
         }
     }
     LOGI("openxr_engine: Cargador GLB y FFI Factorio enlazados (load=%p, get=%p, inv=%p, patches=%p, mine=%p, interact=%p)",
@@ -2502,12 +2506,17 @@ static void draw_tabletop_scene(const float* vp_mat,
                 //    horno o en la caja.  El decide (Rust) y ejecuta contra
                 //    el juego real.  Si no hay nada que hacer devuelve false y
                 //    el resto del gatillo sigue siendo el raton de siempre.
+                //
+                //    GESTO DIFERIDO: aqui solo se ARMA la accion; la ejecuta el
+                //    motor de VR cuando el dedo se levanta (xfactorvr_vr_hand_
+                //    release).  Devolver true aqui sigue teniendo el mismo
+                //    sentido: "la mano ha cogido este pulso".
                 bool mano_hecha = false;
                 if ((trigger_clicked || grip_clicked) && s_vr_hand_action) {
                     mano_hecha = s_vr_hand_action(hover_tile_x, hover_tile_y,
                                                    trigger_clicked ? 0u : 1u);
                     if (mano_hecha) {
-                        LOGI("Mano VR: accion de inventario en (%.1f, %.1f) [%s]",
+                        LOGI("Mano VR: accion ARMADA en (%.1f, %.1f) [%s]",
                              hover_tile_x, hover_tile_y, trigger_clicked ? "gatillo" : "gripo");
                         trigger_controller_haptics(session, haptic_action, 0.70f, 40.0f);
                         play_spatial_sound(SFX_CLICK, s_table_pos.x + snap_mx, s_table_pos.y, s_table_pos.z + snap_mz, 0.9f);
@@ -3582,14 +3591,29 @@ static void* openxr_thread_main(void* arg) {
         XrActionStateFloat trigState = { .type = XR_TYPE_ACTION_STATE_FLOAT };
         XrActionStateGetInfo getTrig = { .type = XR_TYPE_ACTION_STATE_GET_INFO, .action = rightTrigAction };
         xrGetActionStateFloat(session, &getTrig, &trigState);
-        bool trigger_clicked = (trigState.currentState > 0.5f) && !prev_trigger;
-        prev_trigger = (trigState.currentState > 0.5f);
+        bool trigger_pressed = (trigState.currentState > 0.5f);
+        bool trigger_clicked = trigger_pressed && !prev_trigger;
+        bool trigger_released = !trigger_pressed && prev_trigger;
+        prev_trigger = trigger_pressed;
 
         XrActionStateFloat gripState = { .type = XR_TYPE_ACTION_STATE_FLOAT };
         XrActionStateGetInfo getGrip = { .type = XR_TYPE_ACTION_STATE_GET_INFO, .action = rightGripAction };
         xrGetActionStateFloat(session, &getGrip, &gripState);
-        bool grip_clicked = (gripState.currentState > 0.5f) && !prev_grip;
-        prev_grip = (gripState.currentState > 0.5f);
+        bool grip_pressed = (gripState.currentState > 0.5f);
+        bool grip_clicked = grip_pressed && !prev_grip;
+        bool grip_released = !grip_pressed && prev_grip;
+        prev_grip = grip_pressed;
+
+        // GESTO DIFERIDO (patron de Generals-Zero-Hour-XR): al apretar el
+        // gatillo la accion se ARMA (eso lo hace el motor de VR cuando dibuja),
+        // y aqui, cuando el dedo se levanta, se EJECUTA.
+        //
+        // Asi un roce o un movimiento de la mano no hacen nada por error, y el
+        // usuario ve la accion preparada antes de que ocurra.
+        if (s_vr_hand_release) {
+            if (trigger_released) s_vr_hand_release(0u);
+            if (grip_released) s_vr_hand_release(1u);
+        }
 
         XrActionStateVector2f stickState = { .type = XR_TYPE_ACTION_STATE_VECTOR2F };
         XrActionStateGetInfo getStick = { .type = XR_TYPE_ACTION_STATE_GET_INFO, .action = rightStickAction };

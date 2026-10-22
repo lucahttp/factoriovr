@@ -1,8 +1,9 @@
 # ADR-011 — El cliente RCON del APK: diagnóstico corregido y bugs reales
 
-> **Estado**: el problema original ("el cliente RCON no habla con el motor")
-> **está RESUELTO**: era un diagnóstico falso. Pero al destaparlo han
-> aparecido dos bugs reales que sí importan. Este documento cuenta los dos.
+> **Estado**: RESUELTO. El problema original ("el cliente RCON no habla con el
+> motor") **no existía**: era un diagnóstico falso. Al destaparlo han
+> aparecido dos bugs reales, que también están arreglados. Este documento
+> cuenta los dos.
 
 ## El diagnóstico anterior era falso
 
@@ -10,7 +11,7 @@ La versión anterior de este ADR decía que el cliente RCON de Rust
 (`src/game_bridge.rs`) no recibía respuesta del motor mientras que el sondeo
 en Python (`scripts/rcon_probe.py`) sí.
 
-**Era una binario viejo.** El arreglo de la lectura ya estaba en el repo (commit
+**Era un binario viejo.** El arreglo de la lectura ya estaba en el repo (commit
 `6f6ac17`, "la lectura para en el primer paquete con contenido"), pero el
 binario ARM64 que se copiaba al contenedor **no se había recompilado**: el
 banco avisa cuando el binario es más viejo que el fuente, pero no lo
@@ -69,15 +70,15 @@ El cliente también acepta un snapshot **viejo** (sin `"c"`): entonces el tipo
 sale del prototipo, como siempre, y las entidades cuyo nombre no está en la
 tabla se descartan (como antes).
 
-## Bug real 2 — el poll martillea al motor
+## Bug real 2 — el poll martillea al motor (ARREGLADO)
 
-`poll_rcon_sync` **reinicia la sesión TCP en cada poll** (`rcon.connect` antes
-de cada consulta) y manda **dos comandos de consola** (inventario + snapshot).
+`poll_rcon_sync` **reiniciaba la sesión TCP en cada poll** (`rcon.connect` antes
+de cada consulta) y mandaba **dos comandos de consola** (inventario + snapshot).
 El poll se dispara cada `RCON_POLL_INTERVAL = 0,12 s`, o sea **unas 16
 comandos de consola por segundo y 8 conexiones TCP nuevas por segundo**
 contra el motor.
 
-En el log del motor se ve la avalancha:
+En el log del motor se veía la avalancha:
 
 ```
 12.090 New RCON connection from IP ADDR:({127.0.0.1:36792})
@@ -88,12 +89,16 @@ En el log del motor se ve la avalancha:
 ```
 
 En la Pico eso es un martillo: el motor va a ir delaying y el render se va a
-sentir. Con el bug 1 arreglado, la sesión se puede reutilizar y el inventario
-no hace falta pedirlo a 8 Hz.
+sentir.
 
-## Bug latente — el reintento pide el snapshot con decimales
+**Arreglo**: la sesión se **reutiliza** (solo se reconecta si no hay sesión o
+si un comando no responde, y **una** vez), el inventario se pide a **1 Hz** en
+vez de 8 Hz, y cada poll manda **un** comando. Medido contra el motor: de 8
+conexiones/s a **1 conexión en toda la ejecución**.
 
-El bloque de reintento del poll construye el comando con `{:.1}`:
+## Bug latente — el reintento pedía el snapshot con decimales (ARREGLADO)
+
+El bloque de reintento del poll construía el comando con `{:.1}`:
 
 ```rust
 let snap_cmd = format!("... get_world_snapshot', {}, {:.1}, {:.1})", ...);
@@ -101,9 +106,25 @@ let snap_cmd = format!("... get_world_snapshot', {}, {:.1}, {:.1})", ...);
 
 Pero el comentario del propio código (y el banco) dice que **el centro tiene que
 ir como entero**: con decimales, `find_entities` con un área decimal no
-devuelve nada y el snapshot llega vacío. El camino principal usa `{:.0}`
-correcto; el reintento usa `{:.1}` y por eso, cuando se llega al reintento, el
-snapshot sale vacío.
+devuelve nada y el snapshot llega vacío. El camino principal usaba `{:.0}`
+correcto; el reintento usaba `{:.1}` y por eso, cuando se llegaba al reintento,
+el snapshot salía vacío.
+
+**Arreglo**: un único constructor de comando (`comando_snapshot`) con el centro
+como entero, para el camino normal y para el reintento.
+
+## Bug extra — el visor se congelaba al usar las manos (ARREGLADO)
+
+Las acciones de las manos (`pick_up_item`, `take_from_container`,
+`insert_carried_item`, `craft`, `set_quick_bar`, `insert_item`) se quedaban con
+el `.read()` del mundo **vivo durante la llamada de red** al RCON. Como el
+bucle de render necesita un `.write()` del mundo para aplicar el snapshot, se
+quedaba esperando: el `RwLock` no deja pasar las escrituras mientras hay una
+lectura viva. Y la llamada al RCON puede tardar hasta 3 s (el timeout de
+lectura): en la Pico son tres segundos de visor congelado cada vez que la mano
+coge un item.
+
+**Arreglo**: el lock se suelta antes de la llamada de red.
 
 ## Cómo se comprueba
 
@@ -113,7 +134,16 @@ XFACTORVR_RCON_TRACE=1 ./probar_manos 127.0.0.1:27015 xfactorvr
 
 # Snapshot real del motor, tal cual, para parsearlo fuera
 python3 scripts/extraer_snapshot.py 127.0.0.1:27015 xfactorvr /tmp/snapshot.json
+
+# Banco del camino completo del visor contra el motor real
+bash scripts/test_visor_real.sh
 ```
 
-Y el banco que valida el camino completo del visor contra el motor real:
-`scripts/test_visor_real.sh`.
+Resultado actual del banco (6 pasos, 0 fallos):
+
+| Fase | Antes | Ahora |
+|---|---|---|
+| Tipo canónico en el snapshot | — | 99 de 99 entidades con `"c"` |
+| Entidades en el diorama | **0** (simulación local) | **101** del juego real |
+| Conexiones TCP por ejecución | 8 por segundo | **1** |
+| Manos VR sobre el Factorio real | no actuaban | actúan (caja, horno, item del suelo) |

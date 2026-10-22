@@ -538,12 +538,12 @@ if [ -n "$MANOS_BIN" ] && [ -f "$MANOS_BIN" ]; then
     if printf '%s' "$SALIDA_MANOS" | grep -q "RESULTADO: las manos VR funcionan contra el Factorio real"; then
         ok "las manos VR del visor funcionan contra el Factorio real (clasificar + actuar)"
     else
-        # AVISO, no fallo: el camino del APK tiene un problema ABIERTO con el
-        # RCON (ver docs/ADR-011-el-cliente-rcon-no-habla-con-el-motor.md).
-        # El banco sigue siendo valido: lo que se comprueba aqui es que los
-        # REMOTOS del mod funcionan (lo de arriba), que es otra cosa.
-        aviso "el camino del cliente RCON del APK sigue sin funcionar (ADR-011): el visor cae en la simulacion local"
-        printf '%s\n' "$SALIDA_MANOS" | sed 's/^/  | /' | head -8
+        # Esto ya NO es un problema abierto: el cliente RCON habla con el
+        # motor (ver docs/ADR-011-el-cliente-rcon-no-habla-con-el-motor.md) y
+        # el diorama trae las entidades de verdad. Si esto falla, es un fallo
+        # real (o el binario de las manos esta viejo, que se avisa antes).
+        fail "las manos VR del visor NO funcionan contra el Factorio real"
+        printf '%s\n' "$SALIDA_MANOS" | sed 's/^/  | /' | head -12
     fi
 else
     fail "no hay binario de las manos para ARM64"

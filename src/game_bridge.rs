@@ -916,10 +916,18 @@ impl RconClient {
                         }
                         out.push_str(&body);
                     }
-                    // El primer paquete que ya trae el JSON basta.
-                    if extract_json(&out).is_some() {
-                        break;
-                    }
+                    // El PRIMER paquete con contenido basta (igual que en
+                    // el sondeo en Python, scripts/rcon_probe.py).
+                    //
+                    // OJO: si se sigue leyendo esperando a que el cuerpo sea
+                    // JSON, se cuela la respuesta del comando siguiente y la
+                    // sesion se DESALINEA: a partir de ahi el cliente lee
+                    // basura y no vuelve a receber nada.  El caso tipico es el
+                    // aviso con el que Factorio rechaza el primer comando de
+                    // consola de la sesion ("Using Lua console commands will
+                    // disable achievements..."): ese paquete trae contenido
+                    // pero no es JSON.
+                    break;
                 }
                 None => break,
             }

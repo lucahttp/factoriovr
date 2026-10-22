@@ -124,11 +124,13 @@ fn main() {
     if !rcon.connected {
         panic!("el RCON no esta conectado");
     }
-    let mundo = match game_bridge::get_simulation_world().write() {
-        Ok(m) => m,
+    // OJO: el lock del mundo se suelta aqui.  Si se mantiene vivo mientras se
+    // llama a `xfactorvr_vr_hand_action` (que toma un `.read()` del mismo
+    // mutex) el proceso se CUELGA: el `RwLock` de Rust no es reentrante.
+    let sueltos = match game_bridge::get_simulation_world().read() {
+        Ok(w) => w.loose_items.clone(),
         Err(_) => panic!("no se pudo tomar el mundo"),
     };
-    let sueltos = mundo.loose_items.clone();
     // Las entidades vivas las lleva el puente en su propia lista (la que
     // consulta el motor de VR cuando el rayo apunta a algo).
     let entidades = xfactorvr::get_live_entities_lock()
@@ -241,7 +243,7 @@ fn main() {
     // --- 4. Actuar: el gatillo sobre la caja saca un item -----------------
     //
     // Es EXACTAMENTE lo que hace el motor de VR al apretar el gatillo.
-    let antes = mundo.loose_items.len();
+    let antes = sueltos.len();
     let actuo = unsafe { xfactorvr::xfactorvr_vr_hand_action(cx, cy, 0) };
     if !actuo {
         panic!("el gatillo sobre la caja no hizo nada");

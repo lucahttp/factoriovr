@@ -12,6 +12,8 @@
 #include <openxr/openxr.h>
 #include <openxr/openxr_platform.h>
 #include <android/log.h>
+#include <android/asset_manager.h>
+#include <sys/stat.h>
 #include <pthread.h>
 #include <unistd.h>
 #include <vector>
@@ -721,6 +723,10 @@ struct ModelMesh {
     GLuint vbo = 0;
     int vertex_count = 0;
     float width = 0.1f;
+    // true si la malla viene de un GLB de verdad; false si es la primitiva
+    // de reserva.  Importa: la primitiva es un apaño plano, y para esas
+    // entidades es mejor el sprite REAL del juego que una caja inventada.
+    bool desde_modelo = false;
 };
 
 static ModelMesh s_entity_meshes[ENTITY_TYPE_COUNT];
@@ -1339,14 +1345,107 @@ static void init_glb_loader() {
     load_tabletop_layout();
 }
 
-static bool load_mesh_from_glb(ModelMesh& out_mesh, const char* path, float target_width) {
+// ============================================================================
+// MODELOS 3D: DE DONDE SALEN
+// ============================================================================
+//
+// Los GLB del mod factorio-3d-mod pesan entre 200 KB (un poste) y 21 MB (una
+// ensambladora).  Meterlos en el APK y extraerlos al arrancar es lo unico que
+// funciona de forma fiable:
+//
+//   - /sdcard no siempre esta montado y es lento (el fichero de 21 MB tardaba
+//     segundos en leerse, con el APK el arranque no se nota),
+//   - el APK es de solo lectura, asi que hay que copiarlos al directorio
+//     interno de la app una vez.
+//
+// La copia es RECURSIVA sobre el directorio "models/" del APK: asi el visor
+// no necesita saber quantos modelos hay ni como se llaman, y anadir uno nuevo
+// es solo meterlo en assets/models/.
+
+static std::string s_models_dir;
+
+/// Crea un directorio y sus padres si no existen.
+static void asegurar_directorio(const std::string& ruta) {
+    std::string parcial;
+    for (size_t i = 0; i < ruta.size(); ++i) {
+        parcial += ruta[i];
+        if (ruta[i] == '/' && parcial.size() > 1) {
+            mkdir(parcial.c_str(), 0770);
+        }
+    }
+    if (!ruta.empty()) mkdir(ruta.c_str(), 0770);
+}
+
+/// Copia un asset del APK a disco. Devuelve false si no se pudo.
+static bool copiar_asset(AAssetManager* mgr, const char* asset_path, const std::string& destino) {
+    AAsset* asset = AAssetManager_open(mgr, asset_path, AASSET_MODE_STREAMING);
+    if (!asset) return false;
+    FILE* f = fopen(destino.c_str(), "wb");
+    if (!f) {
+        AAsset_close(asset);
+        return false;
+    }
+    char buffer[32768];
+    int leidos;
+    while ((leidos = AAsset_read(asset, buffer, sizeof(buffer))) > 0) {
+        if (fwrite(buffer, 1, (size_t)leidos, f) != (size_t)leidos) {
+            AAsset_close(asset);
+            fclose(f);
+            return false;
+        }
+    }
+    AAsset_close(asset);
+    fclose(f);
+    return true;
+}
+
+/// Copia un directorio entero del APK a disco, recursivo.
+static void copiar_arbol_assets(AAssetManager* mgr, const std::string& asset_dir,
+                                const std::string& destino_dir) {
+    AAssetDir* dir = AAssetManager_openDir(mgr, asset_dir.c_str());
+    if (!dir) return;
+    asegurar_directorio(destino_dir);
+    while (const char* nombre = AAssetDir_getNextFileName(dir)) {
+        std::string sub_asset = asset_dir.empty() ? nombre : (asset_dir + "/" + nombre);
+        std::string sub_destino = destino_dir + "/" + nombre;
+        size_t largo = strlen(nombre);
+        bool es_directorio = largo > 0 && nombre[largo - 1] == '/';
+        if (es_directorio) {
+            copiar_arbol_assets(mgr, sub_asset, sub_destino.substr(0, sub_destino.size() - 1));
+        } else if (!copiar_asset(mgr, sub_asset.c_str(), sub_destino)) {
+            LOGE("openxr_engine: no se pudo copiar el asset %s", sub_asset.c_str());
+        }
+    }
+    AAssetDir_close(dir);
+}
+
+/// Deja los modelos 3D del APK en el directorio interno de la app.
+static void preparar_modelos_3d() {
+    if (!s_models_dir.empty()) return;
+    if (!s_activity || !s_activity->assetManager || !s_activity->internalDataPath) {
+        LOGE("openxr_engine: sin Activity, los modelos 3D no se pueden extraer");
+        return;
+    }
+    s_models_dir = std::string(s_activity->internalDataPath) + "/models";
+    asegurar_directorio(s_models_dir);
+    copiar_arbol_assets(s_activity->assetManager, "models", s_models_dir);
+    LOGI("openxr_engine: modelos 3D extraidos del APK a %s", s_models_dir.c_str());
+}
+
+/// Ruta absoluta de un modelo dentro del APK ("" si no hay modelos).
+static std::string ruta_modelo(const char* relativo) {
+    if (s_models_dir.empty()) return std::string();
+    return s_models_dir + "/" + relativo;
+}
+
+static bool load_mesh_from_glb(ModelMesh& out_mesh, const std::string& path, float target_width) {
     init_glb_loader();
     if (!s_load_glb) return false;
 
     DioramaVertex* raw_verts = nullptr;
     int count = 0;
-    if (!s_load_glb(path, target_width, &raw_verts, &count) || !raw_verts || count <= 0) {
-        LOGE("openxr_engine: Fallo al cargar GLB: %s", path);
+    if (!s_load_glb(path.c_str(), target_width, &raw_verts, &count) || !raw_verts || count <= 0) {
+        LOGE("openxr_engine: Fallo al cargar GLB: %s", path.c_str());
         return false;
     }
 
@@ -1358,12 +1457,13 @@ static bool load_mesh_from_glb(ModelMesh& out_mesh, const char* path, float targ
     out_mesh.vao = create_mesh_vao(verts, out_mesh.vbo);
     out_mesh.vertex_count = (int)verts.size();
     out_mesh.width = target_width;
-    LOGI("openxr_engine: Modelo GLB cargado individualmente %s (%d verts)", path, count);
+    out_mesh.desde_modelo = true;
+    LOGI("openxr_engine: Modelo GLB cargado individualmente %s (%d verts)", path.c_str(), count);
     return true;
 }
 
-static void load_or_create_fallback(int type, const char* glb_path, float target_width) {
-    if (glb_path && load_mesh_from_glb(s_entity_meshes[type], glb_path, target_width)) {
+static void load_or_create_fallback(int type, const std::string& glb_path, float target_width) {
+    if (!glb_path.empty() && load_mesh_from_glb(s_entity_meshes[type], glb_path, target_width)) {
         return;
     }
     std::vector<DioramaVertex> verts;
@@ -1482,19 +1582,24 @@ static void init_tabletop_scene() {
     s_count_belt = (int)belt_verts.size();
 
     // E) Carga individual de Modelos 3D de factorio-3d-mod para Entidades Vivas
-    load_or_create_fallback(ENTITY_ASSEMBLING_MACHINE, "/sdcard/XFactorVR/models/ENTITIES/STRUCTURES/assembling-machine/static.glb", 0.18f);
-    load_or_create_fallback(ENTITY_MINING_DRILL, "/sdcard/XFactorVR/models/ENTITIES/STRUCTURES/electric-mining-drill/static.glb", 0.16f);
-    load_or_create_fallback(ENTITY_FURNACE, "/sdcard/XFactorVR/models/ENTITIES/STRUCTURES/steel-furnace/static.glb", 0.13f);
-    load_or_create_fallback(ENTITY_RADAR, "/sdcard/XFactorVR/models/ENTITIES/STRUCTURES/radar/static1.glb", 0.14f);
-    load_or_create_fallback(ENTITY_ROBOPORT, "/sdcard/XFactorVR/models/ENTITIES/STRUCTURES/roboport/static.glb", 0.18f);
-    load_or_create_fallback(ENTITY_GUN_TURRET, "/sdcard/XFactorVR/models/ENTITIES/STRUCTURES/gun-turret/static1.glb", 0.10f);
-    load_mesh_from_glb(s_turret_top_mesh, "/sdcard/XFactorVR/models/ENTITIES/STRUCTURES/gun-turret/static2.glb", 0.09f);
-    load_or_create_fallback(ENTITY_CHEST, "/sdcard/XFactorVR/models/ENTITIES/STRUCTURES/steel-chest/static.glb", 0.07f);
-    load_or_create_fallback(ENTITY_ELECTRIC_POLE, "/sdcard/XFactorVR/models/ENTITIES/STRUCTURES/medium-electric-pole/static.glb", 0.06f);
-    load_or_create_fallback(ENTITY_TRANSPORT_BELT, nullptr, 0.04f);
-    load_or_create_fallback(ENTITY_BITER, "/sdcard/XFactorVR/models/ENTITIES/ENEMIES/biters/biter_tier1.glb", 0.09f);
-    load_or_create_fallback(ENTITY_TREE, "/sdcard/XFactorVR/models/ENTITIES/FOLIAGE/tree1/static.glb", 0.13f);
-    load_or_create_fallback(ENTITY_PLAYER, "/sdcard/XFactorVR/models/ENTITIES/PLAYER/idle.glb", 0.075f);
+    //
+    // Los modelos vienen del APK (ver preparar_modelos_3d): se extraen al
+    // directorio interno de la app al arrancar.  Si no esta el modelo, se
+    // dibuja la primitiva de reserva, para que nunca se vea un hueco.
+    preparar_modelos_3d();
+    load_or_create_fallback(ENTITY_ASSEMBLING_MACHINE, ruta_modelo("ENTITIES/STRUCTURES/assembling-machine/static.glb"), 0.18f);
+    load_or_create_fallback(ENTITY_MINING_DRILL, ruta_modelo("ENTITIES/STRUCTURES/electric-mining-drill/static.glb"), 0.16f);
+    load_or_create_fallback(ENTITY_FURNACE, ruta_modelo("ENTITIES/STRUCTURES/steel-furnace/static.glb"), 0.13f);
+    load_or_create_fallback(ENTITY_RADAR, ruta_modelo("ENTITIES/STRUCTURES/radar/static1.glb"), 0.14f);
+    load_or_create_fallback(ENTITY_ROBOPORT, ruta_modelo("ENTITIES/STRUCTURES/roboport/static.glb"), 0.18f);
+    load_or_create_fallback(ENTITY_GUN_TURRET, ruta_modelo("ENTITIES/STRUCTURES/gun-turret/static1.glb"), 0.10f);
+    load_mesh_from_glb(s_turret_top_mesh, ruta_modelo("ENTITIES/STRUCTURES/gun-turret/static2.glb"), 0.09f);
+    load_or_create_fallback(ENTITY_CHEST, ruta_modelo("ENTITIES/STRUCTURES/steel-chest/static.glb"), 0.07f);
+    load_or_create_fallback(ENTITY_ELECTRIC_POLE, ruta_modelo("ENTITIES/STRUCTURES/medium-electric-pole/static.glb"), 0.06f);
+    load_or_create_fallback(ENTITY_TRANSPORT_BELT, std::string(), 0.04f);
+    load_or_create_fallback(ENTITY_BITER, ruta_modelo("ENTITIES/ENEMIES/biters/biter_tier1.glb"), 0.09f);
+    load_or_create_fallback(ENTITY_TREE, ruta_modelo("ENTITIES/FOLIAGE/tree1/static.glb"), 0.13f);
+    load_or_create_fallback(ENTITY_PLAYER, ruta_modelo("ENTITIES/PLAYER/idle.glb"), 0.075f);
 
     // F) Consola Holográfica Espacial y Quickbar 6DoF (Generals XR pattern)
     // Flotante y angulada hacia los ojos del jugador
@@ -1692,9 +1797,21 @@ static void draw_tabletop_scene(const float* vp_mat,
             electric_poles.push_back(ent);
         }
 
-        // Si el juego tiene sprite para este tipo, se dibuja el sprite REAL
-        // tumbado sobre la mesa en lugar de una primitiva inventada.
-        if (ent.sprite_id != 0 && s_get_sprite_frame && ensure_atlas_texture()) {
+        // Si la entidad tiene MODELO 3D, se dibuja la malla de verdad.
+        //
+        // Esto es lo que hace que la fabrica se vea en 3D y no como un
+        // pegote plano de sprites: el sprite del atlas es un recurso de
+        // reserva para lo que no tiene modelo (items del suelo, arbustos,
+        // vagonetas...).  Antes al reves: si habia sprite, se dibujaba el
+        // sprite tumbado y NUNCA se llegaba a la malla.
+        const ModelMesh& mesh = s_entity_meshes[ent.entity_type];
+        // Solo cuenta como 3D si la malla es un MODELO REAL.  La primitiva de
+        // reserva es un apaño: para esas entidades, el sprite del juego es mas
+        // fiel que una caja inventada.
+        const bool tiene_malla_3d =
+            (mesh.vao != 0 && mesh.vertex_count > 0 && mesh.desde_modelo);
+
+        if (!tiene_malla_3d && ent.sprite_id != 0 && s_get_sprite_frame && ensure_atlas_texture()) {
             float rect[10];
             if (s_get_sprite_frame(ent.sprite_id, ent.anim_frame, ent.orientation, rect)) {
                 int page = (int)rect[9];
@@ -1714,13 +1831,12 @@ static void draw_tabletop_scene(const float* vp_mat,
                     add_sprite_quad(s_sprite_batches[page].verts, mx, mz, 0.0012f,
                                     half, half, u0, v0, u1, v1,
                                     1.0f, 1.0f, 1.0f, 1.0f);
-                    continue;  // sprite real: no se dibuja la malla primitiva
+                    continue;  // sin modelo 3D: el sprite real hace de apaño
                 }
             }
         }
 
-        const ModelMesh& mesh = s_entity_meshes[ent.entity_type];
-        if (mesh.vao == 0 || mesh.vertex_count == 0) continue;
+        if (!tiene_malla_3d) continue;
 
         float mx = (ent.tile_x - s_view_pan_x) * 0.04f;
         float mz = (ent.tile_y - s_view_pan_y) * 0.04f;

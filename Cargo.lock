@@ -610,6 +610,7 @@ dependencies = [
  "env_logger",
  "glam",
  "gltf",
+ "image",
  "log",
  "object",
  "serde",

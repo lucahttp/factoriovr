@@ -67,6 +67,17 @@ echo "[3/4] Generando APK con aapt2..."
 # Agregar librerías nativas al paquete
 cd "$BUILD_DIR/apk"
 zip -u -r "$BUILD_DIR/unaligned.apk" lib/
+
+# Los assets (modelos 3D, texturas...) van en assets/ y se leen con el
+# AAssetManager del NativeActivity.  Sin esto, el visor no encuentra los
+# modelos 3D y dibuja las primitivas de reserva.
+if [ -d "$PROJECT_ROOT/android/src/main/assets" ]; then
+    mkdir -p "$BUILD_DIR/apk/assets"
+    # rsync sin --delete: lo que hay en el repo manda, lo que sobra se queda.
+    rsync -a "$PROJECT_ROOT/android/src/main/assets/" "$BUILD_DIR/apk/assets/"
+    zip -u -r "$BUILD_DIR/unaligned.apk" assets/
+    echo "    assets incluidos: $(find "$BUILD_DIR/apk/assets" -type f | wc -l | tr -d ' ') ficheros"
+fi
 cd "$PROJECT_ROOT"
 
 # 4. Alinear y firmar con debug keystore

@@ -879,10 +879,10 @@ impl RconClient {
         if length < 10 || length as usize > RCON_MAX_BODY {
             return None;
         }
-        // OJO: el cuerpo se lee como lo lee el sondeo en Python
-        // (scripts/rcon_probe.py), que es el unico que ha funcionado
-        // contra el servidor real: `length - 8` bytes, no `length - 10`.
-        let body_len = (length - 8) as usize;
+        // El cuerpo del paquete: el `length` del RCON cuenta los 4 bytes del
+        // id, los 4 del tipo y los 2 del final de cadena (ver el sondeo en
+        // Python, scripts/rcon_probe.py).
+        let body_len = (length - 10) as usize;
         let mut body = vec![0u8; body_len];
         stream.read_exact(&mut body).ok()?;
         let ptype = i32::from_le_bytes(header[8..12].try_into().ok()?);

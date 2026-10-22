@@ -516,10 +516,17 @@ printf '  RCON: %s\n' "$SALIDA_SUELTO"
 MANOS_BIN="$PROJECT_ROOT/target/aarch64-unknown-linux-musl/release/probar_manos"
 # Se compila SIEMPRE: si el binario se queda viejo, el banco valida un
 # codigo que ya no existe (y da falsos verdes o falsos rojos).
-say "  (compilando el binario ARM64 de las manos...)"
-if ! (cd "$PROJECT_ROOT" && cargo build --release --bin probar_manos --target aarch64-unknown-linux-musl) >/tmp/compilar_manos.log 2>&1; then
-    fail "no se pudo compilar el binario de las manos para ARM64 (ver /tmp/compilar_manos.log)"
-    MANOS_BIN=""
+# El binario tiene que ser MAS NUEVO que el codigo: si no, se avisa (y se
+# compila a mano) en vez de validar un binario viejo, que es como se
+# pasaron por alto varios arreglos.
+if [ -f "$MANOS_BIN" ]; then
+    if [ "$PROJECT_ROOT/src/bin/probar_manos.rs" -nt "$MANOS_BIN" ] || [ "$PROJECT_ROOT/src/game_bridge.rs" -nt "$MANOS_BIN" ]; then
+        aviso "el binario de las manos esta viejo: recompilalo con"
+        aviso "  cargo build --release --bin probar_manos --target aarch64-unknown-linux-musl"
+    fi
+else
+    aviso "no hay binario de las manos para ARM64: se compila con"
+    aviso "  cargo build --release --bin probar_manos --target aarch64-unknown-linux-musl"
 fi
 
 if [ -n "$MANOS_BIN" ] && [ -f "$MANOS_BIN" ]; then

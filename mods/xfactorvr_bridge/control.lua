@@ -46,6 +46,36 @@ local ENTITY_TYPES_MAP = {
     ["stack-inserter-1"] = 10,
 }
 
+-- Mapa INVERSO: id de entidad -> nombre CANONICO del tipo.
+--
+-- El campo "t" de la instantanea lleva el nombre del PROTOTIPO ("tree-05",
+-- "dry-tree", "stone-furnace"), que es lo que permite elegir el sprite real
+-- del atlas.  Pero el cliente necesita saber el TIPO canonico ("tree",
+-- "stone-furnace") y NO puede adivinarlo: si lo busca por el nombre del
+-- prototipo, "tree-05" no esta en su tabla y la entidad se descarta.
+--
+-- Por eso el mod manda el canonico aparte, en el campo "c".  Los ids son los
+-- de ENTITY_TYPES_MAP (1..10) mas los que devuelve entity_type_of (11 = unit,
+-- 12 = tree).  Todos estos nombres estan en la tabla entity_type_from_name
+-- del cliente (src/game_bridge.rs).
+--
+-- OJO: el campo "t" NO se toca: el banco de pruebas (scripts/test_inventario_vr.sh)
+-- lo parsea con Python y depende de el.
+local CANONICAL_TYPE_NAMES = {
+    [1] = "assembling-machine-1",
+    [2] = "electric-mining-drill",
+    [3] = "stone-furnace",
+    [4] = "gun-turret",
+    [5] = "radar",
+    [6] = "roboport",
+    [7] = "wooden-chest",
+    [8] = "small-electric-pole",
+    [9] = "transport-belt",
+    [10] = "inserter",
+    [11] = "unit",
+    [12] = "tree",
+}
+
 -- Ids de item: deben coincidir con las constantes ITEM_* de src/game_bridge.rs.
 local ITEM_IDS_MAP = {
     ["iron-ore"] = 1,
@@ -902,10 +932,16 @@ local function serialize_entity(e)
         if ok_f and f then frame = f end
     end
 
+    -- "t" es el PROTOTIPO (el nombre concreto: "dry-tree", "tree-05") y es
+    -- lo que usa el cliente para elegir el sprite real del atlas.
+    -- "c" es el TIPO CANONICO ("tree", "stone-furnace"): el cliente no puede
+    -- deducirlo del prototipo (no esta en su tabla) y sin el la entidad se
+    -- descartaba al aplicar la instantanea.
+    local canonical = CANONICAL_TYPE_NAMES[type_id] or ""
     local out = string.format(
-        '{"t":"%s","x":%.2f,"y":%.2f,"o":%.3f,"s":%d,"p":%.3f,"h":%.3f,"f":%d,"d":%d',
-        e.name, e.position.x, e.position.y, orientation, status_of(e), progress,
-        health_of(e), frame, e.direction or 0)
+        '{"t":"%s","c":"%s","x":%.2f,"y":%.2f,"o":%.3f,"s":%d,"p":%.3f,"h":%.3f,"f":%d,"d":%d',
+        e.name, canonical, e.position.x, e.position.y, orientation, status_of(e),
+        progress, health_of(e), frame, e.direction or 0)
     if type_id == 10 then
         out = out .. string.format(',"a":%.3f', arm_angle)
     end

@@ -57,6 +57,13 @@ const RCON_PASSWORD: &str = "xfactorvr";
 const RCON_HOST_FILE: &str = "/sdcard/XFactorVR/rcon_host.txt";
 const RCON_RECONNECT_INTERVAL: f32 = 3.0;
 const RCON_POLL_INTERVAL: f32 = 0.12;
+/// Cada cuanto se pide el INVENTARIO al motor.
+///
+/// El inventario cambia muy de tarde en tarde y cada comando de consola se
+/// nota en el motor (lo ejecuta en el hilo del juego) y en la Pico (delaying
+/// del render).  Antes se pedia en CADA poll, o sea unas 8 veces por segundo:
+/// ahora una vez por segundo.
+const RCON_INVENTORY_INTERVAL: f32 = 1.0;
 const RCON_SNAPSHOT_RADIUS: f32 = 32.0;
 const RCON_CONNECT_TIMEOUT_MS: u64 = 120;
 /// Espera maxima por respuesta del RCON.
@@ -304,6 +311,22 @@ impl SimulationWorld {
     /// La lista de entidades de la mesa se reemplaza por completo: Factorio es
     /// la unica fuente de verdad cuando el puente esta conectado.
     pub fn apply_snapshot(&mut self, entities: &mut Vec<LiveEntity>, raw: &str) {
+        self.apply_snapshot_con_sprites(entities, raw, crate::assets::sprite_id_for_type);
+    }
+
+    /// Igual que `apply_snapshot`, pero con el resolutor de sprites inyectado.
+    ///
+    /// En el visor el resolutor es el manifiesto del atlas; en las pruebas es
+    /// un mapa en memoria, para poder comprobar el repliegue al tipo canonico
+    /// sin depender del atlas desplegado.
+    pub fn apply_snapshot_con_sprites<F>(
+        &mut self,
+        entities: &mut Vec<LiveEntity>,
+        raw: &str,
+        sprite_de: F,
+    ) where
+        F: Fn(&str) -> u32,
+    {
         let snap: Snapshot = match serde_json::from_str(raw) {
             Ok(s) => s,
             Err(e) => {
@@ -315,22 +338,45 @@ impl SimulationWorld {
         entities.clear();
         entities.reserve(snap.entities.len());
         for e in snap.entities {
-            // El mod manda el nombre del prototipo; el id numerico solo
-            // aparece con despliegues antiguos del mod.
-            let (type_id, type_name) = match &e.entity_type {
-                SnapshotType::Name(n) => (entity_type_from_name(n), n.clone()),
+            // El mod manda DOS nombres: el PROTOTIPO ("t": "dry-tree",
+            // "tree-05") y el TIPO CANONICO ("c": "tree").
+            //
+            // El tipo sale del CANONICO: el prototipo es concreto y no esta en
+            // la tabla del cliente, asi que usarlo descartaba la entidad
+            // ("tree-05" caia en el "_ => 0" y la entidad se perdia).
+            // El sprite sale del PROTOTIPO, que es el que esta en el atlas.
+            let canonico = e.canonical_type.trim().to_string();
+            let (type_id, prototipo) = match &e.entity_type {
+                SnapshotType::Name(n) => {
+                    // Con "c" presente manda el canonico.  Si el mod es viejo
+                    // (no manda "c") se usa el prototipo, como siempre.
+                    let mut id = if canonico.is_empty() {
+                        0
+                    } else {
+                        entity_type_from_name(&canonico)
+                    };
+                    if id == 0 {
+                        id = entity_type_from_name(n);
+                    }
+                    (id, n.clone())
+                }
                 SnapshotType::Id(i) => (*i, String::new()),
             };
             if type_id == 0 {
                 continue;
             }
             // Id del sprite real en el atlas (0 si el manifiesto no esta
-            // desplegado o el tipo no tiene sprite).
-            let sprite_id = if type_name.is_empty() {
-                0
-            } else {
-                crate::assets::sprite_id_for_type(&type_name)
-            };
+            // desplegado o el tipo no tiene sprite).  Primero el prototipo
+            // ("dry-tree" si esta en el atlas) y, si no, el canonico
+            // ("tree", que no esta en el manifiesto pero es lo unico que
+            // queda).
+            let mut sprite_id = 0;
+            if !prototipo.is_empty() {
+                sprite_id = sprite_de(&prototipo);
+            }
+            if sprite_id == 0 && !canonico.is_empty() {
+                sprite_id = sprite_de(&canonico);
+            }
             entities.push(LiveEntity {
                 entity_type: type_id,
                 tile_x: e.x,
@@ -1104,6 +1150,9 @@ pub struct RconConfig {
     pub password: String,
     pub poll_timer: f32,
     pub connect_timer: f32,
+    /// Contador del inventario: se pide al motor con mucha menos frecuencia
+    /// que el snapshot (cambia muy de tarde en tarde).
+    pub inventory_timer: f32,
     /// Cuando el servidor no devuelve la carga con /silent-command, se reintenta
     /// con el comando normal (que imprime el valor de retorno en la consola).
     pub verbose_fallback: bool,
@@ -1120,6 +1169,7 @@ pub fn get_rcon_config() -> &'static Mutex<RconConfig> {
             password: RCON_PASSWORD.to_string(),
             poll_timer: 0.0,
             connect_timer: RCON_RECONNECT_INTERVAL,
+            inventory_timer: RCON_INVENTORY_INTERVAL,
             verbose_fallback: false,
             last_error: None,
         })
@@ -1154,7 +1204,7 @@ fn read_host_override() -> Option<String> {
 /// Sondea el servidor Factorio. La E/S de red ocurre SIN el lock del mundo
 /// para no congelar el renderizado de la mesa holografica.
 pub fn poll_rcon_sync(dt: f32, view_center: (f32, f32)) -> RconPoll {
-    let (host, port, password, do_poll, do_connect, verbose) = {
+    let (host, port, password, do_poll, do_connect, do_inventory, verbose) = {
         let mut cfg = match get_rcon_config().lock() {
             Ok(c) => c,
             Err(_) => {
@@ -1167,14 +1217,21 @@ pub fn poll_rcon_sync(dt: f32, view_center: (f32, f32)) -> RconPoll {
         };
         cfg.poll_timer += dt;
         cfg.connect_timer += dt;
+        cfg.inventory_timer += dt;
 
         let do_poll = cfg.poll_timer >= RCON_POLL_INTERVAL;
         if do_poll {
             cfg.poll_timer = 0.0;
         }
+        // Cada cuanto se reintenta la conexion cuando la sesion esta caida.
         let do_connect = cfg.connect_timer >= RCON_RECONNECT_INTERVAL;
         if do_connect {
             cfg.connect_timer = 0.0;
+        }
+        // El inventario se pide con mucha menos frecuencia que el snapshot.
+        let do_inventory = do_poll && cfg.inventory_timer >= RCON_INVENTORY_INTERVAL;
+        if do_inventory {
+            cfg.inventory_timer = 0.0;
         }
         (
             cfg.host.clone(),
@@ -1182,6 +1239,7 @@ pub fn poll_rcon_sync(dt: f32, view_center: (f32, f32)) -> RconPoll {
             cfg.password.clone(),
             do_poll,
             do_connect,
+            do_inventory,
             cfg.verbose_fallback,
         )
     };
@@ -1197,26 +1255,43 @@ pub fn poll_rcon_sync(dt: f32, view_center: (f32, f32)) -> RconPoll {
         }
     };
 
-    // Intento de conexion.
-    if do_connect || !rcon.is_connected() {
-        if !rcon.is_connected() {
-            let target_host = read_host_override().unwrap_or_else(|| host.clone());
-            let addr = format!("{}:{}", target_host, port);
-            if rcon.connect(&addr, &password) {
-                if let Ok(mut cfg) = get_rcon_config().lock() {
-                    cfg.last_error = None;
-                }
-            } else {
-                rcon.disconnect();
-                if let Ok(mut cfg) = get_rcon_config().lock() {
-                    cfg.last_error = Some(format!("no se pudo conectar a {}", addr));
-                }
-                return RconPoll {
-                    connected: false,
-                    snapshot: None,
-                    inventory: None,
-                };
+    // --- Sesion: se REUTILIZA, no se reinicia en cada poll ------------------
+    //
+    // Antes el poll abria una conexion TCP nueva en CADA consulta (unas 8
+    // por segundo) y mandaba DOS comandos de consola (inventario + snapshot):
+    // unos 16 comandos de consola por segundo contra el motor.  En la Pico
+    // eso es delaying puro (el motor va delaying y el render se resiente).
+    //
+    // Ahora la sesion se mantiene viva y solo se reconecta si no hay sesion
+    // o si un comando no responde (ver ejecutar_con_reconexion).
+    let addr = format!(
+        "{}:{}",
+        read_host_override().unwrap_or_else(|| host.clone()),
+        port
+    );
+    if !rcon.is_connected() {
+        if !do_connect {
+            // Todavia no toca reintentar: no se martillea al motor.
+            return RconPoll {
+                connected: false,
+                snapshot: None,
+                inventory: None,
+            };
+        }
+        traza_rcon(&format!("poll: conectando a {addr}"));
+        if !rcon.connect(&addr, &password) {
+            rcon.disconnect();
+            if let Ok(mut cfg) = get_rcon_config().lock() {
+                cfg.last_error = Some(format!("no se pudo conectar a {}", addr));
             }
+            return RconPoll {
+                connected: false,
+                snapshot: None,
+                inventory: None,
+            };
+        }
+        if let Ok(mut cfg) = get_rcon_config().lock() {
+            cfg.last_error = None;
         }
     }
 
@@ -1229,50 +1304,24 @@ pub fn poll_rcon_sync(dt: f32, view_center: (f32, f32)) -> RconPoll {
     }
 
     // Pedir la instantanea del mundo alrededor del centro de la vista.
-    //
-    // OJO: el centro va como ENTERO.  Con decimales ("0.0") el motor no
-    // encuentra entidades en el area (find_entities con un area decimal no
-    // devuelve nada) y el snapshot llega VACIO: el visor se queda sin
-    // mundo.  Verificado contra el servidor real.
     let prefix = if verbose { "" } else { "/silent-command " };
-    let snap_cmd = format!(
-        "{}remote.call('xfactorvr', 'get_world_snapshot', {}, {:.0}, {:.0})",
-        prefix, RCON_SNAPSHOT_RADIUS, view_center.0, view_center.1
-    );
-    let inv_cmd = format!("{}remote.call('xfactorvr', 'get_inventory')", prefix);
+    let snap_cmd = comando_snapshot(prefix, view_center.0, view_center.1);
 
-    // Factorio rechaza el PRIMER comando de consola de cada sesion (ver
-    // execute_collect_retry) y ese comando NO se ejecuta.
+    // Un comando por poll (antes eran dos).  Factorio rechaza el PRIMER
+    // comando de consola de cada sesion (ver execute_collect_retry) y ese
+    // comando NO se ejecuta; como la sesion se REUTILIZA, ese rechazo solo
+    // se produce al conectar (connect() lo gasta con un comando de
+    // calentamiento) y execute_collect_retry cubre el resto de casos.
     //
-    // OJO: por eso va el INVENTARIO primero.  Si el primero es el snapshot,
-    // se pierde siempre y el visor se queda con la simulacion local (sin
-    // mundo).  Con el inventario delante, el snapshot ya es el segundo
-    // comando y se ejecuta.  Verificado contra el servidor real.
-    // OJO: hasta que el servidor no acepte el primer comando de la sesion
-    // (rechaza el primero y hay que repetirlo) NO ACEPTA NINGUN OTRO.  Por
-    // eso, antes de preguntar, se manda un comando inocuo y se repite hasta
-    // que el servidor lo acepte.  Es lo que hace el sondeo en Python del
-    // banco, que es el que si habla con el motor.
-    // OJO: la sesion se REINICIA antes de preguntar.  El motor deja de
-    // atender comandos nuevos despues de unos cuantos (el sondeo en Python
-    // del banco abre una conexion nueva en cada consulta y por eso siempre
-    // funciona).  Ademas, al reconectar, `connect` gasta el rechazo del
-    // primer comando con un calentamiento, de modo que el snapshot ya es el
-    // segundo comando y se ejecuta.
-    {
-        let addr = format!("{}:{}", read_host_override().unwrap_or_else(|| host.clone()), port);
-        traza_rcon(&format!("poll: reiniciando la sesion en {addr}"));
-        let _ = rcon.connect(&addr, &password);
-    }
-    let inventory = rcon.execute_collect(&inv_cmd, 2);
-    traza_rcon(&format!(
-        "poll: inventario -> {}",
-        match &inventory {
-            Some(c) => format!("{} bytes", c.len()),
-            None => "NADA".to_string(),
-        }
-    ));
-    let snapshot = rcon.execute_collect(&snap_cmd, 3);
+    // En modo silencioso la respuesta trae el JSON (rcon.print vuelve por
+    // el RCON).  En modo verbose la salida va a la consola del SERVIDOR y el
+    // cliente no recibe el JSON, asi que no se puede usar como criterio de
+    // "la sesion responde".
+    let snapshot = if verbose {
+        ejecutar_con_reconexion(&mut rcon, &addr, &password, &snap_cmd, 3, |_| true)
+    } else {
+        ejecutar_con_reconexion(&mut rcon, &addr, &password, &snap_cmd, 3, trae_json)
+    };
     traza_rcon(&format!(
         "poll: snapshot -> {}",
         match &snapshot {
@@ -1280,58 +1329,95 @@ pub fn poll_rcon_sync(dt: f32, view_center: (f32, f32)) -> RconPoll {
             None => "NADA".to_string(),
         }
     ));
-    // Si el snapshot no trae JSON, se REPITE el comando (no se quita el
-    // prefijo /silent-command).
-    //
-    // OJO: quitar el prefijo es un error.  El mod imprime el snapshot con
-    // `rcon.print`, y en modo silencioso esa salida vuelve por el RCON; sin
-    // el prefijo se imprime en la consola del SERVIDOR y el cliente se
-    // queda sin nada.  Con el prefijo, repetir el comando es lo que funciona:
-    // Factorio rechaza el PRIMER comando de consola de la sesion con un
-    // aviso, y el siguiente ya se ejecuta.
-    let mut snapshot = snapshot;
-    let mut inventory = inventory;
-    if !verbose && (extract_json(snapshot.as_deref().unwrap_or("")).is_none()) {
-        traza_rcon("poll: el snapshot no trae JSON, se reintenta");
-        // El snapshot no ha llegado.  Antes de rendirse, se RECONECTA y se
-        // repite: el sondeo en Python abre una sesion nueva para cada
-        // consulta y asi funciona siempre (el motor rechaza el primer
-        // comando de consola de cada sesion).
-        let snap_cmd = format!(
-            "{}remote.call('xfactorvr', 'get_world_snapshot', {}, {:.1}, {:.1})",
-            prefix, RCON_SNAPSHOT_RADIUS, view_center.0, view_center.1
-        );
+
+    // El inventario se pide con MUCHA menos frecuencia: cambia muy de tarde
+    // en tarde y cada comando de consola se nota en el motor (y en la Pico).
+    let inventory = if do_inventory {
         let inv_cmd = format!("{}remote.call('xfactorvr', 'get_inventory')", prefix);
-        snapshot = rcon.execute_collect_retry(&snap_cmd, 3);
-        inventory = rcon.execute_collect_retry(&inv_cmd, 2);
+        let inv = if verbose {
+            ejecutar_con_reconexion(&mut rcon, &addr, &password, &inv_cmd, 2, |_| true)
+        } else {
+            ejecutar_con_reconexion(&mut rcon, &addr, &password, &inv_cmd, 2, |c| !c.trim().is_empty())
+        };
         traza_rcon(&format!(
-            "poll: reintento -> snapshot {}",
-            match &snapshot {
+            "poll: inventario -> {}",
+            match &inv {
                 Some(c) => format!("{} bytes", c.len()),
                 None => "NADA".to_string(),
             }
         ));
-        if extract_json(snapshot.as_deref().unwrap_or("")).is_none() {
-            let addr = format!("{}:{}", read_host_override().unwrap_or(host.clone()), port);
-            if rcon.connect(&addr, &password) {
-                snapshot = rcon.execute_collect_retry(&snap_cmd, 3);
-                inventory = rcon.execute_collect_retry(&inv_cmd, 2);
-            }
-            traza_rcon(&format!(
-                "poll: tras reconectar -> snapshot {}",
-                match &snapshot {
-                    Some(c) => format!("{} bytes", c.len()),
-                    None => "NADA".to_string(),
-                }
-            ));
-        }
-    }
+        inv
+    } else {
+        None
+    };
 
     RconPoll {
         connected: rcon.is_connected(),
         snapshot,
         inventory,
     }
+}
+
+/// Comando de consola que pide la instantanea del mundo alrededor de un centro.
+///
+/// OJO: el centro va como ENTERO (`{:.0}`).  Con decimales ("0.0") el motor
+/// no encuentra entidades en el area (find_entities con un area decimal no
+/// devuelve nada) y el snapshot llega VACIO: el visor se queda sin mundo.
+/// Verificado contra el servidor real.
+///
+/// Lo usan TANTO el sondeo normal COMO el reintento: si cada uno montase el
+/// comando por su cuenta, el reintento volveria a caer en el error de los
+/// decimales (que es justo lo que pasaba).
+pub fn comando_snapshot(prefix: &str, centro_x: f32, centro_y: f32) -> String {
+    format!(
+        "{}remote.call('xfactorvr', 'get_world_snapshot', {}, {:.0}, {:.0})",
+        prefix, RCON_SNAPSHOT_RADIUS, centro_x, centro_y
+    )
+}
+
+/// Envia un comando y, si la sesion no responde, reinicia la sesion UNA vez
+/// y lo repite.
+///
+/// OJO: una sola reconexion.  Antes el poll encadenaba TRES reinicios de
+/// sesion seguidos (y ademas uno en cada poll), que es lo que machacaba al
+/// motor y retrasaba el render en la Pico.
+fn ejecutar_con_reconexion<P>(
+    rcon: &mut RconClient,
+    addr: &str,
+    password: &str,
+    comando: &str,
+    max_packets: usize,
+    respuesta_buena: P,
+) -> Option<String>
+where
+    P: Fn(&str) -> bool,
+{
+    let primera = rcon.execute_collect_retry(comando, max_packets);
+    if respuesta_buena(primera.as_deref().unwrap_or("")) {
+        return primera;
+    }
+
+    // La sesion no responde: se reinicia UNA vez y se repite el comando.
+    traza_rcon("el comando no respondio, se reinicia la sesion y se repite");
+    rcon.disconnect();
+    if !rcon.connect(addr, password) {
+        return None;
+    }
+    let segunda = rcon.execute_collect_retry(comando, max_packets);
+    if respuesta_buena(segunda.as_deref().unwrap_or("")) {
+        segunda
+    } else {
+        None
+    }
+}
+
+/// Dice si el texto trae algo que parezca el JSON del snapshot.
+///
+/// NO lo parsea: es solo un filtro rapido para saber si la sesion ha
+/// contestado.  El snapshot pesa ~40 KB y el cliente lo va a parsear otra vez
+/// al aplicarlo: parsearlo aqui seria tirar CPU de la Pico en cada poll.
+pub fn trae_json(texto: &str) -> bool {
+    texto.contains('{')
 }
 
 pub static SIMULATION_WORLD: OnceLock<RwLock<SimulationWorld>> = OnceLock::new();
@@ -1361,8 +1447,20 @@ pub enum SnapshotType {
 
 #[derive(Debug, Deserialize)]
 pub struct SnapshotEntity {
+    /// Nombre del PROTOTIPO ("dry-tree", "tree-05", "stone-furnace"). Es lo
+    /// que permite elegir el sprite real del atlas.
     #[serde(rename = "t")]
     pub entity_type: SnapshotType,
+    /// Tipo CANONICO de la entidad ("tree", "stone-furnace", "unit"...).
+    ///
+    /// El mod lo manda aparte porque el cliente no puede deducirlo del
+    /// prototipo: su tabla solo conoce los nombres canonicos, asi que un
+    /// prototipo como "tree-05" caia en el "_ => 0" y la entidad se
+    /// descartaba al aplicar la instantanea.
+    ///
+    /// Con un mod viejo (sin este campo) se sigue usando el prototipo.
+    #[serde(rename = "c", default)]
+    pub canonical_type: String,
     pub x: f32,
     pub y: f32,
     #[serde(rename = "o", default)]
@@ -1755,5 +1853,140 @@ mod tests {
         assert_eq!(facing_delta(std::f32::consts::FRAC_PI_2), (1, 0), "este");
         assert_eq!(facing_delta(std::f32::consts::PI), (0, 1), "sur");
         assert_eq!(facing_delta(3.0 * std::f32::consts::FRAC_PI_2), (-1, 0), "oeste");
+    }
+
+    /// Atlas de prueba para el resolutor de sprites.
+    ///
+    /// El manifiesto real tiene 43 nombres: "dry-tree" si, pero "tree" no
+    /// (y "tree-05" tampoco).  Aqui se meten los dos para poder comprobar
+    /// tanto el sprite del prototipo como el repliegue al canonico.
+    fn sprites_de_prueba() -> HashMap<String, u32> {
+        let mut m = HashMap::new();
+        m.insert("dry-tree".to_string(), 7u32);
+        m.insert("tree".to_string(), 11u32);
+        m.insert("stone-furnace".to_string(), 9u32);
+        m
+    }
+
+    #[test]
+    fn test_entidad_con_tipo_canonico_usa_el_sprite_del_prototipo() {
+        // El mod manda el PROTOTIPO en "t" y el TIPO CANONICO en "c".
+        // "dry-tree" no esta en la tabla de tipos del cliente, asi que sin
+        // "c" la entidad se descartaba y el diorama se quedaba vacio.
+        let sprites = sprites_de_prueba();
+        let mut world = SimulationWorld::new();
+        let mut entities: Vec<LiveEntity> = Vec::new();
+        let raw = r#"{"entities":[{"t":"dry-tree","c":"tree","x":1.0,"y":2.0}],"patches":[]}"#;
+        world.apply_snapshot_con_sprites(&mut entities, raw, |n: &str| {
+            sprites.get(n).copied().unwrap_or(0)
+        });
+
+        assert_eq!(entities.len(), 1, "la entidad NO debe descartarse");
+        assert_eq!(
+            entities[0].entity_type,
+            crate::tabletop::ENTITY_TREE,
+            "el tipo sale del canonico"
+        );
+        assert_eq!(
+            entities[0].sprite_id, 7,
+            "el sprite sale del prototipo (dry-tree), no del canonico"
+        );
+    }
+
+    #[test]
+    fn test_snapshot_antiguo_sin_tipo_canonico_sigue_valiendo() {
+        // Un mod ANTIGUO (sin el campo "c") debe seguir funcionando igual:
+        // el tipo sale del prototipo y, si no esta en la tabla, la entidad se
+        // descarta (como antes).
+        let sprites = sprites_de_prueba();
+        let mut world = SimulationWorld::new();
+        let mut entities: Vec<LiveEntity> = Vec::new();
+        let raw = r#"{"entities":[
+            {"t":"stone-furnace","x":0.0,"y":0.0},
+            {"t":"tree-05","x":1.0,"y":1.0}
+        ],"patches":[]}"#;
+        world.apply_snapshot_con_sprites(&mut entities, raw, |n: &str| {
+            sprites.get(n).copied().unwrap_or(0)
+        });
+
+        assert_eq!(entities.len(), 1, "solo entra la entidad con nombre conocido");
+        assert_eq!(entities[0].entity_type, crate::tabletop::ENTITY_FURNACE);
+        assert_eq!(entities[0].sprite_id, 9, "el sprite sale del prototipo");
+    }
+
+    #[test]
+    fn test_sprite_repliega_al_tipo_canonico() {
+        // Si el prototipo no esta en el atlas (el manifiesto real no tiene
+        // "tree-05"), se usa el sprite del TIPO CANONICO.
+        let sprites = sprites_de_prueba();
+        let mut world = SimulationWorld::new();
+        let mut entities: Vec<LiveEntity> = Vec::new();
+        let raw = r#"{"entities":[{"t":"tree-05","c":"tree","x":3.0,"y":4.0}],"patches":[]}"#;
+        world.apply_snapshot_con_sprites(&mut entities, raw, |n: &str| {
+            sprites.get(n).copied().unwrap_or(0)
+        });
+
+        assert_eq!(entities.len(), 1, "la entidad NO debe descartarse");
+        assert_eq!(entities[0].entity_type, crate::tabletop::ENTITY_TREE);
+        assert_eq!(
+            entities[0].sprite_id, 11,
+            "sin sprite del prototipo se usa el del canonico"
+        );
+    }
+
+    #[test]
+    fn test_comando_del_snapshot_usa_el_centro_entero() {
+        // Con decimales el motor NO encuentra entidades en el area
+        // (find_entities con area decimal no devuelve nada) y el snapshot
+        // llega VACIO.  El centro va como ENTERO, tanto en el sondeo normal
+        // como en el reintento: los dos usan el MISMO comando.
+        let cmd = comando_snapshot("/silent-command ", 1.6, -2.4);
+        assert!(cmd.contains("get_world_snapshot"), "{}", cmd);
+        assert!(cmd.contains(", 32, 2, -2)"), "el centro va entero: {}", cmd);
+        assert!(!cmd.contains("1.6"), "el centro NO puede ir con decimales: {}", cmd);
+        assert!(!cmd.contains("2.4"), "el centro NO puede ir con decimales: {}", cmd);
+
+        // Y el reintento usa el mismo constructor (no el comando a mano con
+        // decimales que habia antes).
+        let reintento = comando_snapshot("", 12.7, -3.2);
+        assert!(reintento.contains(", 32, 13, -3)"), "{}", reintento);
+    }
+
+    /// Instantanea REAL que produce el mod (salida del mod con el campo "c").
+    ///
+    /// Es el caso que se rompia: los arboles del escenario ("tree-05",
+    /// "tree-03", "dry-tree") tenian un prototipo que no esta en la tabla de
+    /// tipos del cliente, asi que se descartaban y el diorama se quedaba con
+    /// 0 entidades.
+    const SNAPSHOT_REAL_DEL_MOD: &str = r#"{"entities":[
+        {"t":"tree-05","c":"tree","x":1.00,"y":2.00,"o":0.000,"s":0,"p":0.000,"h":1.000,"f":0,"d":0},
+        {"t":"dry-tree","c":"tree","x":3.00,"y":4.00,"o":0.000,"s":0,"p":0.000,"h":1.000,"f":0,"d":0},
+        {"t":"stone-furnace","c":"stone-furnace","x":7.00,"y":8.00,"o":0.000,"s":0,"p":0.000,"h":1.000,"f":0,"d":0},
+        {"t":"wooden-chest","c":"wooden-chest","x":13.00,"y":14.00,"o":0.000,"s":0,"p":0.000,"h":1.000,"f":0,"d":0},
+        {"t":"inserter","c":"inserter","x":17.00,"y":18.00,"o":0.000,"s":0,"p":0.000,"h":1.000,"f":0,"d":0,"a":0.000},
+        {"t":"small-biter","c":"unit","x":11.00,"y":12.00,"o":0.000,"s":0,"p":0.000,"h":1.000,"f":0,"d":0}
+    ],"patches":[],"loose":[],"terrain":{}}"#;
+
+    #[test]
+    fn test_snapshot_real_del_mod_no_descarta_entidades() {
+        // Ninguna entidad del snapshot real debe descartarse: antes los
+        // arboles del escenario ("tree-05") no estaban en la tabla de tipos y
+        // se perdian TODOS (el diorama se quedaba vacio).
+        let sprites = sprites_de_prueba();
+        let mut world = SimulationWorld::new();
+        let mut entities: Vec<LiveEntity> = Vec::new();
+        world.apply_snapshot_con_sprites(&mut entities, SNAPSHOT_REAL_DEL_MOD, |n: &str| {
+            sprites.get(n).copied().unwrap_or(0)
+        });
+
+        assert_eq!(entities.len(), 6, "no debe descartarse ninguna entidad");
+        // Los arboles son arboles.
+        assert_eq!(entities[0].entity_type, crate::tabletop::ENTITY_TREE);
+        assert_eq!(entities[1].entity_type, crate::tabletop::ENTITY_TREE);
+        // Y las maquinas siguen siendo maquinas.
+        assert_eq!(entities[2].entity_type, crate::tabletop::ENTITY_FURNACE);
+        assert_eq!(entities[3].entity_type, crate::tabletop::ENTITY_CHEST);
+        assert_eq!(entities[4].entity_type, crate::tabletop::ENTITY_INSERTER);
+        assert_eq!(entities[5].entity_type, crate::tabletop::ENTITY_BITER);
     }
 }

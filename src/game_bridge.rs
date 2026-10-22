@@ -20,6 +20,7 @@ use serde::Deserialize;
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::TcpStream;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock, RwLock};
 use std::time::Duration;
 
@@ -88,6 +89,14 @@ fn traza_rcon(mensaje: &str) {
         eprintln!("[rcon] {mensaje}");
     }
 }
+
+/// Ultimo numero de entidades que se ha logueado.
+///
+/// El log sale por stderr (env_logger) y en Android eso acaba en el logcat,
+/// asi que desde el banco del dispositivo se puede ver que el visor esta
+/// aplicando la instantanea del juego de verdad. Solo se loguea cuando el
+/// numero CAMBIA: el poll va a 8 Hz y si no, el logcat se llena de ruido.
+static ULTIMO_LOG_ENTIDADES: AtomicUsize = AtomicUsize::new(usize::MAX);
 
 #[derive(Clone, Debug)]
 pub struct ResourcePatch {
@@ -417,6 +426,18 @@ impl SimulationWorld {
             .collect();
 
         self.terrain = snap.terrain;
+
+        // Log de estado: desde el banco del dispositivo (adb logcat) se ve
+        // que el visor esta aplicando la instantanea del juego de verdad.
+        let total = entities.len();
+        let anterior = ULTIMO_LOG_ENTIDADES.swap(total, Ordering::Relaxed);
+        if anterior != total {
+            log::info!(
+                "Instantanea aplicada: {} entidades del juego real ({} sueltos)",
+                total,
+                self.loose_items.len()
+            );
+        }
     }
 
     /// Aplica el inventario real del jugador.
@@ -1290,6 +1311,7 @@ pub fn poll_rcon_sync(dt: f32, view_center: (f32, f32)) -> RconPoll {
                 inventory: None,
             };
         }
+        log::info!("RCON conectado al motor de Factorio en {addr}");
         if let Ok(mut cfg) = get_rcon_config().lock() {
             cfg.last_error = None;
         }

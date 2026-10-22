@@ -47,3 +47,7 @@ build/factorio_stripped.elf
 build/factorio_assets/
 build/*.apk
 tmp/
+
+# Modelos 3D ya optimizados para el APK (small, se empaquetan): el *.glb de
+# arriba es para los modelos crudos del mod 3D, que pesan 567 MB.
+!android/src/main/assets/models/*.glb

@@ -1,0 +1,143 @@
+{
+  "_comentario": "Tabla de FUENTES: prototipo de Factorio -> GLB del mod 3D de GDani31 (factorio-3d-mod/models). La consume `optimizar_glb --lote`, que escribe el manifest.json que lee src/modelos3d.rs. Las huellas (huella_tiles) son las del propio mod 3D, que las saco del juego real.",
+  "escala_tile_m": 0.04,
+  "modelos": {
+    "assembling-machine-1": {
+      "fuentes": ["ENTITIES/STRUCTURES/assembling-machine/1/static.glb"],
+      "huella_tiles": 3.0,
+      "giros": ["direccion"]
+    },
+    "assembling-machine-2": {
+      "fuentes": ["ENTITIES/STRUCTURES/assembling-machine/2/static.glb"],
+      "huella_tiles": 3.0,
+      "giros": ["direccion"]
+    },
+    "assembling-machine-3": {
+      "fuentes": ["ENTITIES/STRUCTURES/assembling-machine/3/static.glb"],
+      "huella_tiles": 3.0,
+      "giros": ["direccion"]
+    },
+    "electric-mining-drill": {
+      "fuentes": [
+        "ENTITIES/STRUCTURES/electric-mining-drill/static.glb",
+        "ENTITIES/STRUCTURES/electric-mining-drill/animated1.glb"
+      ],
+      "huella_tiles": 3.0,
+      "giros": ["direccion", "direccion"]
+    },
+    "stone-furnace": {
+      "fuentes": ["ENTITIES/STRUCTURES/stone-furnace/static.glb"],
+      "huella_tiles": 2.0,
+      "giros": ["direccion"]
+    },
+    "steel-furnace": {
+      "fuentes": ["ENTITIES/STRUCTURES/steel-furnace/static.glb"],
+      "huella_tiles": 2.0,
+      "giros": ["direccion"]
+    },
+    "electric-furnace": {
+      "fuentes": [
+        "ENTITIES/STRUCTURES/electric-furnace/static.glb",
+        "ENTITIES/STRUCTURES/electric-furnace/animated1.glb"
+      ],
+      "huella_tiles": 3.0,
+      "giros": ["direccion", "direccion"]
+    },
+    "wooden-chest": {
+      "fuentes": ["ENTITIES/STRUCTURES/wooden-chest/static.glb"],
+      "huella_tiles": 1.0,
+      "giros": ["direccion"]
+    },
+    "iron-chest": {
+      "fuentes": ["ENTITIES/STRUCTURES/iron-chest/static.glb"],
+      "huella_tiles": 1.0,
+      "giros": ["direccion"]
+    },
+    "steel-chest": {
+      "fuentes": ["ENTITIES/STRUCTURES/steel-chest/static.glb"],
+      "huella_tiles": 1.0,
+      "giros": ["direccion"]
+    },
+    "logistic-chest": {
+      "fuentes": ["ENTITIES/STRUCTURES/logistic-chests/static.glb"],
+      "huella_tiles": 1.0,
+      "giros": ["direccion"]
+    },
+    "logistic-container": {
+      "fuentes": ["ENTITIES/STRUCTURES/logistic-chests/static.glb"],
+      "huella_tiles": 1.0,
+      "giros": ["direccion"]
+    },
+    "transport-belt": {
+      "fuentes": ["ENTITIES/STRUCTURES/belts/belt-I.glb"],
+      "huella_tiles": 1.0,
+      "giros": ["direccion"]
+    },
+    "inserter": {
+      "fuentes": [
+        "ENTITIES/STRUCTURES/inserter/static.glb",
+        "ENTITIES/STRUCTURES/inserter/animated1.glb"
+      ],
+      "huella_tiles": 1.0,
+      "giros": ["direccion", "direccion"]
+    },
+    "small-electric-pole": {
+      "fuentes": ["ENTITIES/STRUCTURES/small-electric-pole/static.glb"],
+      "huella_tiles": 1.0,
+      "giros": ["direccion"]
+    },
+    "medium-electric-pole": {
+      "fuentes": ["ENTITIES/STRUCTURES/medium-electric-pole/static.glb"],
+      "huella_tiles": 1.0,
+      "giros": ["direccion"]
+    },
+    "gun-turret": {
+      "fuentes": [
+        "ENTITIES/STRUCTURES/gun-turret/static1.glb",
+        "ENTITIES/STRUCTURES/gun-turret/static2.glb"
+      ],
+      "huella_tiles": 2.0,
+      "giros": ["fijo", "orientacion"]
+    },
+    "radar": {
+      "fuentes": [
+        "ENTITIES/STRUCTURES/radar/static1.glb",
+        "ENTITIES/STRUCTURES/radar/static2.glb"
+      ],
+      "huella_tiles": 3.0,
+      "giros": ["direccion", "giro"]
+    },
+    "roboport": {
+      "fuentes": ["ENTITIES/STRUCTURES/roboport/static.glb"],
+      "huella_tiles": 4.0,
+      "giros": ["direccion"]
+    },
+    "lab": {
+      "fuentes": ["ENTITIES/STRUCTURES/lab/static.glb"],
+      "huella_tiles": 3.0,
+      "giros": ["direccion"]
+    },
+    "boiler": {
+      "fuentes": ["ENTITIES/STRUCTURES/boiler/static.glb"],
+      "huella_tiles": 3.0,
+      "giros": ["direccion"]
+    },
+    "storage-tank": {
+      "fuentes": ["ENTITIES/STRUCTURES/storage-tank/static.glb"],
+      "huella_tiles": 3.0,
+      "giros": ["direccion"]
+    }
+  },
+  "tipos": {
+    "1": "assembling-machine-1",
+    "2": "electric-mining-drill",
+    "3": "stone-furnace",
+    "4": "gun-turret",
+    "5": "radar",
+    "6": "roboport",
+    "7": "wooden-chest",
+    "8": "small-electric-pole",
+    "9": "transport-belt",
+    "10": "inserter"
+  }
+}

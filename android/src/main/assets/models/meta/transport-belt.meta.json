@@ -1,0 +1,13 @@
+{
+  "archivo": "transport-belt.glb",
+  "bbox": [
+    1.8500003814697266,
+    0.441769540309906,
+    2.000000476837158
+  ],
+  "bytes_destino": 1584,
+  "bytes_origen": 290660,
+  "grid": 0.009090911597013474,
+  "triangulos": 12,
+  "verts": 8
+}

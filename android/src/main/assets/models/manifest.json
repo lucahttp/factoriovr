@@ -1,0 +1,333 @@
+{
+  "escala_tile_m": 0.03999999910593033,
+  "generado_por": "optimizar_glb",
+  "modelos": {
+    "assembling-machine-1": {
+      "alto_m": 0.037987884134054184,
+      "ancho_m": 0.11999999731779099,
+      "huella_tiles": 3.0,
+      "partes": [
+        {
+          "archivo": "assembling-machine-1.glb",
+          "giro": "direccion",
+          "triangulos": 17580,
+          "verts": 4994
+        }
+      ]
+    },
+    "assembling-machine-2": {
+      "alto_m": 0.037987884134054184,
+      "ancho_m": 0.11999999731779099,
+      "huella_tiles": 3.0,
+      "partes": [
+        {
+          "archivo": "assembling-machine-2.glb",
+          "giro": "direccion",
+          "triangulos": 17580,
+          "verts": 4994
+        }
+      ]
+    },
+    "assembling-machine-3": {
+      "alto_m": 0.037987884134054184,
+      "ancho_m": 0.11999999731779099,
+      "huella_tiles": 3.0,
+      "partes": [
+        {
+          "archivo": "assembling-machine-3.glb",
+          "giro": "direccion",
+          "triangulos": 17580,
+          "verts": 4994
+        }
+      ]
+    },
+    "boiler": {
+      "alto_m": 0.0892399251461029,
+      "ancho_m": 0.11999999731779099,
+      "huella_tiles": 3.0,
+      "partes": [
+        {
+          "archivo": "boiler.glb",
+          "giro": "direccion",
+          "triangulos": 37844,
+          "verts": 17182
+        }
+      ]
+    },
+    "electric-furnace": {
+      "alto_m": 0.07288939505815506,
+      "ancho_m": 0.11999999731779099,
+      "huella_tiles": 3.0,
+      "partes": [
+        {
+          "archivo": "electric-furnace.0.glb",
+          "giro": "direccion",
+          "triangulos": 39694,
+          "verts": 16328
+        },
+        {
+          "archivo": "electric-furnace.1.glb",
+          "giro": "direccion",
+          "triangulos": 1730,
+          "verts": 691
+        }
+      ]
+    },
+    "electric-mining-drill": {
+      "alto_m": 0.08806068450212479,
+      "ancho_m": 0.11999999731779099,
+      "huella_tiles": 3.0,
+      "partes": [
+        {
+          "archivo": "electric-mining-drill.0.glb",
+          "giro": "direccion",
+          "triangulos": 23614,
+          "verts": 7447
+        },
+        {
+          "archivo": "electric-mining-drill.1.glb",
+          "giro": "direccion",
+          "triangulos": 4804,
+          "verts": 2411
+        }
+      ]
+    },
+    "gun-turret": {
+      "alto_m": 0.038814857602119446,
+      "ancho_m": 0.07999999821186066,
+      "huella_tiles": 2.0,
+      "partes": [
+        {
+          "archivo": "gun-turret.0.glb",
+          "giro": "fijo",
+          "triangulos": 9578,
+          "verts": 3718
+        },
+        {
+          "archivo": "gun-turret.1.glb",
+          "giro": "orientacion",
+          "triangulos": 9532,
+          "verts": 4217
+        }
+      ]
+    },
+    "inserter": {
+      "alto_m": 0.06438205391168594,
+      "ancho_m": 0.03999999910593033,
+      "huella_tiles": 1.0,
+      "partes": [
+        {
+          "archivo": "inserter.0.glb",
+          "giro": "direccion",
+          "triangulos": 5501,
+          "verts": 2704
+        },
+        {
+          "archivo": "inserter.1.glb",
+          "giro": "direccion",
+          "triangulos": 916,
+          "verts": 484
+        }
+      ]
+    },
+    "iron-chest": {
+      "alto_m": 0.03237658739089966,
+      "ancho_m": 0.03999999910593033,
+      "huella_tiles": 1.0,
+      "partes": [
+        {
+          "archivo": "iron-chest.glb",
+          "giro": "direccion",
+          "triangulos": 1328,
+          "verts": 690
+        }
+      ]
+    },
+    "lab": {
+      "alto_m": 0.07027823477983475,
+      "ancho_m": 0.11999999731779099,
+      "huella_tiles": 3.0,
+      "partes": [
+        {
+          "archivo": "lab.glb",
+          "giro": "direccion",
+          "triangulos": 37856,
+          "verts": 10807
+        }
+      ]
+    },
+    "logistic-chest": {
+      "alto_m": 0.03242751583456993,
+      "ancho_m": 0.03999999910593033,
+      "huella_tiles": 1.0,
+      "partes": [
+        {
+          "archivo": "logistic-chest.glb",
+          "giro": "direccion",
+          "triangulos": 3244,
+          "verts": 1691
+        }
+      ]
+    },
+    "logistic-container": {
+      "alto_m": 0.03242751583456993,
+      "ancho_m": 0.03999999910593033,
+      "huella_tiles": 1.0,
+      "partes": [
+        {
+          "archivo": "logistic-chest.glb",
+          "giro": "direccion"
+        }
+      ]
+    },
+    "medium-electric-pole": {
+      "alto_m": 0.13523681461811066,
+      "ancho_m": 0.03999999910593033,
+      "huella_tiles": 1.0,
+      "partes": [
+        {
+          "archivo": "medium-electric-pole.glb",
+          "giro": "direccion",
+          "triangulos": 4864,
+          "verts": 1585
+        }
+      ]
+    },
+    "radar": {
+      "alto_m": 0.11419094353914261,
+      "ancho_m": 0.11999999731779099,
+      "huella_tiles": 3.0,
+      "partes": [
+        {
+          "archivo": "radar.0.glb",
+          "giro": "direccion",
+          "triangulos": 22596,
+          "verts": 9059
+        },
+        {
+          "archivo": "radar.1.glb",
+          "giro": "giro",
+          "triangulos": 6208,
+          "verts": 2906
+        }
+      ]
+    },
+    "roboport": {
+      "alto_m": 0.16040319204330444,
+      "ancho_m": 0.1599999964237213,
+      "huella_tiles": 4.0,
+      "partes": [
+        {
+          "archivo": "roboport.glb",
+          "giro": "direccion",
+          "triangulos": 60838,
+          "verts": 21257
+        }
+      ]
+    },
+    "small-electric-pole": {
+      "alto_m": 0.15200895071029663,
+      "ancho_m": 0.03999999910593033,
+      "huella_tiles": 1.0,
+      "partes": [
+        {
+          "archivo": "small-electric-pole.glb",
+          "giro": "direccion",
+          "triangulos": 3120,
+          "verts": 1044
+        }
+      ]
+    },
+    "steel-chest": {
+      "alto_m": 0.03340063616633415,
+      "ancho_m": 0.03999999910593033,
+      "huella_tiles": 1.0,
+      "partes": [
+        {
+          "archivo": "steel-chest.glb",
+          "giro": "direccion",
+          "triangulos": 2044,
+          "verts": 1112
+        }
+      ]
+    },
+    "steel-furnace": {
+      "alto_m": 0.061234813183546066,
+      "ancho_m": 0.07999999821186066,
+      "huella_tiles": 2.0,
+      "partes": [
+        {
+          "archivo": "steel-furnace.glb",
+          "giro": "direccion",
+          "triangulos": 34846,
+          "verts": 12961
+        }
+      ]
+    },
+    "stone-furnace": {
+      "alto_m": 0.07035837322473526,
+      "ancho_m": 0.07999999821186066,
+      "huella_tiles": 2.0,
+      "partes": [
+        {
+          "archivo": "stone-furnace.glb",
+          "giro": "direccion",
+          "triangulos": 13158,
+          "verts": 5741
+        }
+      ]
+    },
+    "storage-tank": {
+      "alto_m": 0.06298649311065674,
+      "ancho_m": 0.11999999731779099,
+      "huella_tiles": 3.0,
+      "partes": [
+        {
+          "archivo": "storage-tank.glb",
+          "giro": "direccion",
+          "triangulos": 23614,
+          "verts": 10453
+        }
+      ]
+    },
+    "transport-belt": {
+      "alto_m": 0.008835388347506523,
+      "ancho_m": 0.03999999910593033,
+      "huella_tiles": 1.0,
+      "partes": [
+        {
+          "archivo": "transport-belt.glb",
+          "giro": "direccion",
+          "triangulos": 12,
+          "verts": 8
+        }
+      ]
+    },
+    "wooden-chest": {
+      "alto_m": 0.029864836484193802,
+      "ancho_m": 0.03999999910593033,
+      "huella_tiles": 1.0,
+      "partes": [
+        {
+          "archivo": "wooden-chest.glb",
+          "giro": "direccion",
+          "triangulos": 332,
+          "verts": 168
+        }
+      ]
+    }
+  },
+  "tipos": {
+    "1": "assembling-machine-1",
+    "10": "inserter",
+    "2": "electric-mining-drill",
+    "3": "stone-furnace",
+    "4": "gun-turret",
+    "5": "radar",
+    "6": "roboport",
+    "7": "wooden-chest",
+    "8": "small-electric-pole",
+    "9": "transport-belt"
+  },
+  "version": 1
+}

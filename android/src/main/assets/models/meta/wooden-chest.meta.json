@@ -1,0 +1,13 @@
+{
+  "archivo": "wooden-chest.glb",
+  "bbox": [
+    2.0,
+    1.4932422637939453,
+    2.000000476837158
+  ],
+  "bytes_destino": 8620,
+  "bytes_origen": 267284,
+  "grid": 0.009090911597013474,
+  "triangulos": 332,
+  "verts": 168
+}

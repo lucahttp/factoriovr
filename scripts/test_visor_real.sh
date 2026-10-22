@@ -77,10 +77,15 @@ in_container() { "$PODMAN" exec "$CONTAINER" bash -c "$1"; }
 
 # Por PID y no con pkill -f: el patron "rcon-port ..." tambien aparece en la
 # linea de comandos del propio shell que lanza el servidor.
+#
+# OJO: no se puede mirar el fichero .lock para saber si el motor esta vivo:
+# Factorio lo deja en disco y el siguiente arranque se queja de que "ya hay
+# otra instancia" aunque el proceso este muerto.  La unica fuente de verdad
+# son los procesos.
 matar_servidor() {
     in_container 'ps -eo pid,args | awk "\$2 ~ /factorio\$/ {print \$1}" | xargs -r kill 2>/dev/null; true'
     for i in $(seq 1 30); do
-        if ! in_container "test -e '$FACTORIO_DIR/.lock'" 2>/dev/null; then
+        if ! in_container "ps -eo args | grep -q '[f]actorio --start-server'"; then
             return 0
         fi
         sleep 1

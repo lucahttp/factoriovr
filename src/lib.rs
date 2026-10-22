@@ -570,32 +570,38 @@ pub unsafe extern "C" fn xfactorvr_craft_item(
 
     // Si el motor real de Factorio esta conectado, la fabricacion se pide al
     // juego de verdad usando sus recetas oficiales.
-    if let Ok(world) = game_bridge::get_simulation_world().read() {
-        if world.is_connected_to_rcon {
-            let recipe_name = match item_id {
-                game_bridge::ITEM_FURNACE => "stone-furnace",
-                game_bridge::ITEM_IRON_GEAR => "iron-gear-wheel",
-                game_bridge::ITEM_ELECTRONIC_CIRCUIT => "electronic-circuit",
-                game_bridge::ITEM_TRANSPORT_BELT => "transport-belt",
-                game_bridge::ITEM_MINING_DRILL => "electric-mining-drill",
-                game_bridge::ITEM_INSERTER => "inserter",
-                game_bridge::ITEM_ASSEMBLING_MACHINE => "assembling-machine-1",
-                _ => "",
-            };
-            if !recipe_name.is_empty() {
-                let cmd = format!(
-                    "/silent-command remote.call('xfactorvr', 'craft', '{}', {})",
-                    recipe_name, count
-                );
-                if let Ok(mut rcon) = game_bridge::get_rcon_client().lock() {
-                    rcon.execute(&cmd);
-                }
-                return true;
-            }
-        }
+    //
+    // OJO: el lock del mundo se suelta ANTES de la llamada de red (si el
+    // `.read()` sigue vivo, el bucle de render se queda esperando el
+    // `.write()` del mundo mientras el RCON tarda hasta 3 s).
+    let recipe_name = match item_id {
+        game_bridge::ITEM_FURNACE => "stone-furnace",
+        game_bridge::ITEM_IRON_GEAR => "iron-gear-wheel",
+        game_bridge::ITEM_ELECTRONIC_CIRCUIT => "electronic-circuit",
+        game_bridge::ITEM_TRANSPORT_BELT => "transport-belt",
+        game_bridge::ITEM_MINING_DRILL => "electric-mining-drill",
+        game_bridge::ITEM_INSERTER => "inserter",
+        game_bridge::ITEM_ASSEMBLING_MACHINE => "assembling-machine-1",
+        _ => "",
+    };
+    if recipe_name.is_empty() {
+        return false;
     }
-
-    false
+    let conectado = match game_bridge::get_simulation_world().read() {
+        Ok(w) => w.is_connected_to_rcon,
+        Err(_) => false,
+    };
+    if !conectado {
+        return false;
+    }
+    let cmd = format!(
+        "/silent-command remote.call('xfactorvr', 'craft', '{}', {})",
+        recipe_name, count
+    );
+    if let Ok(mut rcon) = game_bridge::get_rcon_client().lock() {
+        rcon.execute(&cmd);
+    }
+    true
 }
 
 /// Minado manual con pico sobre yacimientos de mineral o rocas
@@ -878,21 +884,26 @@ pub unsafe extern "C" fn xfactorvr_set_quick_bar(
         Ok(s) if !s.is_empty() => s.to_string(),
         _ => return false,
     };
-    if let Ok(world) = game_bridge::get_simulation_world().read() {
-        if world.is_connected_to_rcon {
-            let cmd = format!(
-                "/silent-command remote.call('xfactorvr', 'set_quick_bar', {}, {}, '{}')",
-                page.max(1),
-                slot.max(1),
-                nombre
-            );
-            if let Ok(mut rcon) = game_bridge::get_rcon_client().lock() {
-                rcon.execute(&cmd);
-            }
-            return true;
-        }
+    // OJO: el lock del mundo se suelta ANTES de la llamada de red (si el
+    // `.read()` sigue vivo, el bucle de render se queda esperando el
+    // `.write()` del mundo mientras el RCON tarda hasta 3 s).
+    let conectado = match game_bridge::get_simulation_world().read() {
+        Ok(w) => w.is_connected_to_rcon,
+        Err(_) => false,
+    };
+    if !conectado {
+        return false;
     }
-    false
+    let cmd = format!(
+        "/silent-command remote.call('xfactorvr', 'set_quick_bar', {}, {}, '{}')",
+        page.max(1),
+        slot.max(1),
+        nombre
+    );
+    if let Ok(mut rcon) = game_bridge::get_rcon_client().lock() {
+        rcon.execute(&cmd);
+    }
+    true
 }
 
 /// Pone un item en un inventario concreto (la del horno, por ejemplo).
@@ -914,19 +925,24 @@ pub unsafe extern "C" fn xfactorvr_insert_item(
         Ok(s) if !s.is_empty() => s.to_string(),
         _ => return false,
     };
-    if let Ok(world) = game_bridge::get_simulation_world().read() {
-        if world.is_connected_to_rcon {
-            let cmd = format!(
-                "/silent-command remote.call('xfactorvr', 'insert_item', {:.2}, {:.2}, '{}', {}, {})",
-                x, y, nombre, count.max(1), inv_index.max(1)
-            );
-            if let Ok(mut rcon) = game_bridge::get_rcon_client().lock() {
-                rcon.execute(&cmd);
-            }
-            return true;
-        }
+    // OJO: el lock del mundo se suelta ANTES de la llamada de red (si el
+    // `.read()` sigue vivo, el bucle de render se queda esperando el
+    // `.write()` del mundo mientras el RCON tarda hasta 3 s).
+    let conectado = match game_bridge::get_simulation_world().read() {
+        Ok(w) => w.is_connected_to_rcon,
+        Err(_) => false,
+    };
+    if !conectado {
+        return false;
     }
-    false
+    let cmd = format!(
+        "/silent-command remote.call('xfactorvr', 'insert_item', {:.2}, {:.2}, '{}', {}, {})",
+        x, y, nombre, count.max(1), inv_index.max(1)
+    );
+    if let Ok(mut rcon) = game_bridge::get_rcon_client().lock() {
+        rcon.execute(&cmd);
+    }
+    true
 }
 
 /// Rectangulo de una variante del suelo dentro del atlas.
@@ -1154,19 +1170,29 @@ pub unsafe extern "C" fn xfactorvr_on_entity_draw(
 /// Si no hay ningun item ahi, el mod responde "ERR|no_item" y no pasa nada.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn xfactorvr_pick_up_item(tile_x: f32, tile_y: f32) -> bool {
-    if let Ok(world) = game_bridge::get_simulation_world().read() {
-        if world.is_connected_to_rcon {
-            let cmd = format!(
-                "/silent-command remote.call('xfactorvr', 'pick_up_item', {:.2}, {:.2})",
-                tile_x, tile_y
-            );
-            if let Ok(mut rcon) = game_bridge::get_rcon_client().lock() {
-                rcon.execute(&cmd);
-            }
-            return true;
-        }
+    // OJO: el lock del mundo se suelta ANTES de la llamada de red.
+    //
+    // Si el `.read()` del mundo sigue vivo durante el `rcon.execute`, el
+    // bucle de render (que necesita un `.write()` del mundo para aplicar el
+    // snapshot) se queda ESPERANDO: el RwLock no deja pasar las escrituras
+    // mientras hay una lectura viva. Y la llamada al RCON puede tardar hasta
+    // 3 s (el timeout de lectura): en la Pico eso son tres segundos de
+    // visor congelado cada vez que la mano coge un item.
+    let conectado = match game_bridge::get_simulation_world().read() {
+        Ok(w) => w.is_connected_to_rcon,
+        Err(_) => false,
+    };
+    if !conectado {
+        return false;
     }
-    false
+    let cmd = format!(
+        "/silent-command remote.call('xfactorvr', 'pick_up_item', {:.2}, {:.2})",
+        tile_x, tile_y
+    );
+    if let Ok(mut rcon) = game_bridge::get_rcon_client().lock() {
+        rcon.execute(&cmd);
+    }
+    true
 }
 
 /// Saca un item de una caja (o de los ingredientes de un horno).
@@ -1190,22 +1216,26 @@ pub unsafe extern "C" fn xfactorvr_take_from_container(
             Err(_) => return false,
         }
     };
-    if let Ok(world) = game_bridge::get_simulation_world().read() {
-        if world.is_connected_to_rcon {
-            let cmd = format!(
-                "/silent-command remote.call('xfactorvr', 'take_from_container', {:.2}, {:.2}, '{}', {})",
-                tile_x,
-                tile_y,
-                nombre,
-                count.max(1)
-            );
-            if let Ok(mut rcon) = game_bridge::get_rcon_client().lock() {
-                rcon.execute(&cmd);
-            }
-            return true;
-        }
+    // OJO: el lock del mundo se suelta ANTES de la llamada de red (el
+    // `.read()` vivo bloquea al bucle de render, que necesita un `.write()`).
+    let conectado = match game_bridge::get_simulation_world().read() {
+        Ok(w) => w.is_connected_to_rcon,
+        Err(_) => false,
+    };
+    if !conectado {
+        return false;
     }
-    false
+    let cmd = format!(
+        "/silent-command remote.call('xfactorvr', 'take_from_container', {:.2}, {:.2}, '{}', {})",
+        tile_x,
+        tile_y,
+        nombre,
+        count.max(1)
+    );
+    if let Ok(mut rcon) = game_bridge::get_rcon_client().lock() {
+        rcon.execute(&cmd);
+    }
+    true
 }
 
 /// Mete en una maquina o en una caja el item que lleva el actor.
@@ -1236,23 +1266,27 @@ pub unsafe extern "C" fn xfactorvr_insert_carried_item(
             Err(_) => return false,
         }
     };
-    if let Ok(world) = game_bridge::get_simulation_world().read() {
-        if world.is_connected_to_rcon {
-            let cmd = format!(
-                "/silent-command remote.call('xfactorvr', 'insert_carried_item', {:.2}, {:.2}, '{}', {}, {})",
-                tile_x,
-                tile_y,
-                nombre,
-                count.max(1),
-                inv_index.max(1)
-            );
-            if let Ok(mut rcon) = game_bridge::get_rcon_client().lock() {
-                rcon.execute(&cmd);
-            }
-            return true;
-        }
+    // OJO: el lock del mundo se suelta ANTES de la llamada de red (el
+    // `.read()` vivo bloquea al bucle de render, que necesita un `.write()`).
+    let conectado = match game_bridge::get_simulation_world().read() {
+        Ok(w) => w.is_connected_to_rcon,
+        Err(_) => false,
+    };
+    if !conectado {
+        return false;
     }
-    false
+    let cmd = format!(
+        "/silent-command remote.call('xfactorvr', 'insert_carried_item', {:.2}, {:.2}, '{}', {}, {})",
+        tile_x,
+        tile_y,
+        nombre,
+        count.max(1),
+        inv_index.max(1)
+    );
+    if let Ok(mut rcon) = game_bridge::get_rcon_client().lock() {
+        rcon.execute(&cmd);
+    }
+    true
 }
 
 /// Ejecuta la accion de inventario que decide la mano de VR.

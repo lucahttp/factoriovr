@@ -252,7 +252,7 @@ fi
 # clasificar y actuar (es lo que hacen las manos en MR).
 SALIDA_OBJ="$("$PODMAN" exec "$CONTAINER" python3 /tmp/rcon_comandos.py \
     "127.0.0.1:$RCON_PORT" "$RCON_PASSWORD" \
-    "/silent-command local s=game.surfaces[1]; s.create_entity{name='wooden-chest', position={x=6,y=0}}; s.create_entity{name='stone-furnace', position={x=-6,y=0}}; rcon.print('objetos_listos')" \
+    "/silent-command local s=game.surfaces[1]; s.create_entity{name='wooden-chest', position={x=6,y=0}}; s.create_entity{name='stone-furnace', position={x=-6,y=0}}; s.create_entity{name='item-on-ground', position={x=0,y=6}, stack={name='iron-plate', count=5}}; rcon.print('objetos_listos')" \
     2>&1)"
 printf '  %s\n' "$SALIDA_OBJ" | head -2
 

@@ -25,7 +25,6 @@ fn nombre(t: &Interactable) -> &'static str {
         Interactable::Chest => "caja",
         Interactable::Furnace => "horno",
         Interactable::LooseItem { .. } => "item del suelo",
-        _ => "otro",
     }
 }
 
@@ -143,8 +142,12 @@ fn main() {
         sueltos.len()
     );
 
-    // Traza: la respuesta CRUDA del RCON (que puede ser el aviso de
-    // "repeat the command" con el que Factorio rechaza el primer comando).
+    // Traza: el comando SIN el prefijo /silent-command.
+    //
+    // OJO: asi NO tiene que volver nada.  Sin el prefijo, la salida del
+    // `rcon.print` del mod se imprime en la consola del SERVIDOR, no por el
+    // RCON: es la comprobacion de que el camino correcto (con prefijo) es el
+    // que se usa en el resto.
     {
         let crudo = {
             let mut rcon = game_bridge::get_rcon_client()
@@ -156,8 +159,8 @@ fn main() {
             )
         };
         match crudo {
-            Some(c) => println!("traza: respuesta cruda del RCON: {}", &c[..c.len().min(300)]),
-            None => println!("traza: el RCON no devolvio nada"),
+            Some(c) => println!("traza: sin /silent-command el RCON devuelve: {}", &c[..c.len().min(300)]),
+            None => println!("traza: sin /silent-command no vuelve nada (lo esperado: va a la consola del servidor)"),
         }
     }
 

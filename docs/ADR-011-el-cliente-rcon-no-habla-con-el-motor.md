@@ -51,11 +51,23 @@ La causa está en el **acuerdo entre el mod y el cliente**:
 O sea: el mod sabe el tipo y lo tira; el cliente adivina el tipo por un nombre
 que no es el suyo.
 
-El arreglo: el mod manda el **tipo canónico** en `"t"` y el **nombre del
-prototipo** en un campo nuevo `"n"`. El cliente usa `"t"` para el tipo y `"n"`
-para elegir el sprite real (el manifiesto de sprites tiene 43 nombres: cajas,
-hornos, cintas, "dry-tree"... pero no "tree-05", así que hace falta el
-repliegue al canónico).
+El arreglo (implementado): el mod manda **el prototipo en `"t"`** (como
+antes) **y el tipo canónico en un campo nuevo `"c"`**. El cliente usa `"c"`
+para el tipo y `"t"` para elegir el sprite real (el manifiesto de sprites
+tiene 43 nombres: cajas, hornos, cintas, "dry-tree"... pero no "tree-05", así
+que hace falta el repliegue al canónico).
+
+No se cambió `"t"` a propósito: el banco `scripts/test_inventario_vr.sh` (que
+es de otro agente) parsea el snapshot con Python y depende de ese campo.
+
+```
+{"t":"tree-05","c":"tree","x":30.45,"y":-18.36,"o":0.000,"s":0,"p":0.000,
+ "h":1.000,"f":0,"d":0}
+```
+
+El cliente también acepta un snapshot **viejo** (sin `"c"`): entonces el tipo
+sale del prototipo, como siempre, y las entidades cuyo nombre no está en la
+tabla se descartan (como antes).
 
 ## Bug real 2 — el poll martillea al motor
 

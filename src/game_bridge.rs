@@ -59,7 +59,13 @@ const RCON_RECONNECT_INTERVAL: f32 = 3.0;
 const RCON_POLL_INTERVAL: f32 = 0.12;
 const RCON_SNAPSHOT_RADIUS: f32 = 32.0;
 const RCON_CONNECT_TIMEOUT_MS: u64 = 120;
-const RCON_READ_TIMEOUT_MS: u64 = 400;
+/// Espera maxima por respuesta del RCON.
+///
+/// OJO: el snapshot con el TERRENO (miles de tiles) tarda bastante mas que
+/// el inventario: con 400 ms el cliente se cansaba antes de que llegara y se
+/// quedaba SIN mundo (el visor caia en la simulacion local y no se veia el
+/// juego de verdad).  El sondeo en Python del banco espera 5 s por lo mismo.
+const RCON_READ_TIMEOUT_MS: u64 = 3000;
 /// Tope del cuerpo de un paquete RCON. Un snapshot completo con miles de
 /// entidades puede pesar cientos de KB, asi que el limite debe ser holgado.
 const RCON_MAX_BODY: usize = 4 * 1024 * 1024;
@@ -823,6 +829,18 @@ impl RconClient {
             self.stream = None;
             return false;
         }
+
+        // Factorio RECHAZA el primer comando de consola de cada sesion con el
+        // aviso "Using Lua console commands will disable achievements. Please
+        // repeat the command to proceed" (sale en el log del servidor como
+        // [WARNING]).  Ese comando NO se ejecuta, asi que el primero que
+        // mande el cliente se pierde.
+        //
+        // Se gasta el rechazo con un comando inocuo (un "calentamiento"), que
+        // es lo que hace el sondeo en Python del banco.  Su respuesta se lee y
+        // se tira, para no desfasar el protocolo.
+        let _ = self.execute_collect("/silent-command rcon.print('')", 2);
+
         true
     }
 
@@ -861,7 +879,10 @@ impl RconClient {
         if length < 10 || length as usize > RCON_MAX_BODY {
             return None;
         }
-        let body_len = (length - 10) as usize;
+        // OJO: el cuerpo se lee como lo lee el sondeo en Python
+        // (scripts/rcon_probe.py), que es el unico que ha funcionado
+        // contra el servidor real: `length - 8` bytes, no `length - 10`.
+        let body_len = (length - 8) as usize;
         let mut body = vec![0u8; body_len];
         stream.read_exact(&mut body).ok()?;
         let ptype = i32::from_le_bytes(header[8..12].try_into().ok()?);
@@ -913,17 +934,22 @@ impl RconClient {
         }
     }
 
-    /// Envia un comando y reintenta una vez si la respuesta llega vacia.
+    /// Envia un comando y reintenta una vez si la respuesta no vale.
     ///
     /// Factorio rechaza el PRIMER comando de consola de cada sesion con el
     /// aviso "Using Lua console commands will disable achievements. Please
-    /// repeat the command to proceed": la respuesta llega vacia y el comando NO
-    /// se ejecuta. Hay que repetirlo con el mismo texto. Verificado contra el
-    /// servidor real en scripts/local_rcon_check.sh.
+    /// repeat the command to proceed" y el comando NO se ejecuta.
+    ///
+    /// OJO: la respuesta NO llega vacia, llega CON EL AVISO.  Si solo se
+    /// mirara que este vacia, el aviso se tomaria por una respuesta buena y
+    /// el comando no se repetiria: el cliente se quedaria sin el snapshot
+    /// (y el visor caeria en la simulacion local en vez del juego real).
+    /// Verificado contra el servidor real (el aviso sale en su log como
+    /// [WARNING] "Player <server> tried using the command ...").
     pub fn execute_collect_retry(&mut self, command: &str, max_packets: usize) -> Option<String> {
         let first = self.execute_collect(command, max_packets);
         if let Some(ref body) = first {
-            if !body.trim().is_empty() {
+            if !body.trim().is_empty() && !es_aviso_de_rechazo(body) {
                 return first;
             }
         }
@@ -941,6 +967,12 @@ impl RconClient {
         let body = self.execute_collect(command, 3)?;
         parse_leading_number(&body)
     }
+}
+
+/// Dice si el texto es el aviso con el que Factorio rechaza el primer
+/// comando de consola de la sesion (el comando NO se ha ejecutado).
+pub fn es_aviso_de_rechazo(texto: &str) -> bool {
+    texto.contains("Please repeat the command to proceed")
 }
 
 /// Extrae el primer JSON valido de un texto que puede traer ruido alrededor.
@@ -1126,7 +1158,7 @@ pub fn poll_rcon_sync(dt: f32, view_center: (f32, f32)) -> RconPoll {
     // Intento de conexion.
     if do_connect || !rcon.is_connected() {
         if !rcon.is_connected() {
-            let target_host = read_host_override().unwrap_or(host);
+            let target_host = read_host_override().unwrap_or_else(|| host.clone());
             let addr = format!("{}:{}", target_host, port);
             if rcon.connect(&addr, &password) {
                 if let Ok(mut cfg) = get_rcon_config().lock() {
@@ -1167,21 +1199,36 @@ pub fn poll_rcon_sync(dt: f32, view_center: (f32, f32)) -> RconPoll {
     let snapshot = rcon.execute_collect_retry(&snap_cmd, 3);
     let inventory = rcon.execute_collect_retry(&inv_cmd, 2);
 
-    // Si el comando silencioso no trae carga util, se prueba con el comando
-    // normal, que ademas imprime el valor de retorno en la consola.
+    // Si el snapshot no trae JSON, se REPITE el comando (no se quita el
+    // prefijo /silent-command).
+    //
+    // OJO: quitar el prefijo es un error.  El mod imprime el snapshot con
+    // `rcon.print`, y en modo silencioso esa salida vuelve por el RCON; sin
+    // el prefijo se imprime en la consola del SERVIDOR y el cliente se
+    // queda sin nada.  Con el prefijo, repetir el comando es lo que funciona:
+    // Factorio rechaza el PRIMER comando de consola de la sesion con un
+    // aviso, y el siguiente ya se ejecuta.
     let mut snapshot = snapshot;
     let mut inventory = inventory;
     if !verbose && (extract_json(snapshot.as_deref().unwrap_or("")).is_none()) {
-        if let Ok(mut cfg) = get_rcon_config().lock() {
-            cfg.verbose_fallback = true;
-        }
+        // El snapshot no ha llegado.  Antes de rendirse, se RECONECTA y se
+        // repite: el sondeo en Python abre una sesion nueva para cada
+        // consulta y asi funciona siempre (el motor rechaza el primer
+        // comando de consola de cada sesion).
         let snap_cmd = format!(
-            "remote.call('xfactorvr', 'get_world_snapshot', {}, {:.1}, {:.1})",
-            RCON_SNAPSHOT_RADIUS, view_center.0, view_center.1
+            "{}remote.call('xfactorvr', 'get_world_snapshot', {}, {:.1}, {:.1})",
+            prefix, RCON_SNAPSHOT_RADIUS, view_center.0, view_center.1
         );
-        let inv_cmd = "remote.call('xfactorvr', 'get_inventory')";
-        snapshot = rcon.execute_collect(&snap_cmd, 3);
-        inventory = rcon.execute_collect(&inv_cmd, 2);
+        let inv_cmd = format!("{}remote.call('xfactorvr', 'get_inventory')", prefix);
+        snapshot = rcon.execute_collect_retry(&snap_cmd, 3);
+        inventory = rcon.execute_collect_retry(&inv_cmd, 2);
+        if extract_json(snapshot.as_deref().unwrap_or("")).is_none() {
+            let addr = format!("{}:{}", read_host_override().unwrap_or(host.clone()), port);
+            if rcon.connect(&addr, &password) {
+                snapshot = rcon.execute_collect_retry(&snap_cmd, 3);
+                inventory = rcon.execute_collect_retry(&inv_cmd, 2);
+            }
+        }
     }
 
     RconPoll {
@@ -1554,6 +1601,17 @@ mod tests {
         let text = "some log line\n{\"entities\":[],\"patches\":[]}\ntrailing";
         let v = extract_json(text).expect("deberia extraer el JSON");
         assert!(v.get("entities").is_some());
+    }
+
+    /// El aviso con el que Factorio rechaza el primer comando de la sesion
+    /// NO es una respuesta buena: hay que repetir el comando.
+    #[test]
+    fn test_aviso_de_rechazo_del_primer_comando() {
+        assert!(es_aviso_de_rechazo(
+            "Using Lua console commands will disable achievements. Please repeat the command to proceed"
+        ));
+        assert!(!es_aviso_de_rechazo("{\"entities\":[]}"));
+        assert!(!es_aviso_de_rechazo(""));
     }
 
     #[test]

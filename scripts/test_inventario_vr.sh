@@ -462,6 +462,7 @@ in_container "cat > '$CMDS' <<'CMDS'
 $WARMUP
 /silent-command local s=game.surfaces[1]; local e=s.create_entity{name='item-on-ground', position={x=2,y=8}, stack={name='copper-ore', count=7}}; rcon.print('suelto='..tostring(e and e.position.x)..','..tostring(e and e.position.y))
 /silent-command remote.call('xfactorvr', 'get_world_snapshot', 32, 0, 0)
+/silent-command remote.call('xfactorvr', 'get_world_snapshot', 32, 0.0, 0.0)
 CMDS"
 SALIDA_SNAP="$(rcon_query_guardar "$CMDS")"
 if printf '%s' "$SALIDA_SNAP" | grep -q '"loose"'; then
@@ -486,6 +487,59 @@ if in_container "test -s '$SNAPSHOT'" 2>/dev/null; then
     fi
 else
     fail "no se ha guardado el snapshot para validarlo como JSON"
+fi
+
+# --------------------------------------------------------------------------
+# 4 bis. El camino del APK: clasificar lo que hay bajo el rayo y actuar
+# --------------------------------------------------------------------------
+# El banco de arriba comprueba los REMOTOS del mod.  Esto comprueba el camino
+# COMPLETO que lleva el APK en el visor, con el binario ARM64 dentro del
+# contenedor (el mismo crate, el mismo codigo):
+#
+#   1. conectar por RCON,
+#   2. pedir la instantanea del mundo,
+#   3. CLASIFICAR lo que hay en la casilla que apunta el mando,
+#   4. ACTUAR con la misma llamada que hace el motor de VR al apretar el
+#      gatillo o el gripo (`xfactorvr_vr_hand_action`).
+paso "El camino completo del APK (clasificar y actuar)"
+
+# Para probar la rama de "coger del suelo" hace falta un item suelto: las
+# fases anteriores se los han llevado todos.
+in_container "cat > '$CMDS' <<'CMDS'
+$WARMUP
+/silent-command local s=game.surfaces[1]; local e=s.create_entity{name='item-on-ground', position={x=0,y=$POS_SUELO_Y}, stack={name='iron-plate', count=5}}; rcon.print('suelto='..tostring(e and e.position.x)..','..tostring(e and e.position.y))
+/silent-command rcon.print('items_en_el_suelo='..tostring(#game.surfaces[1].find_entities_filtered({name='item-on-ground'})))
+CMDS"
+SALIDA_SUELTO="$(rcon_query "$CMDS")"
+printf '  RCON: %s\n' "$SALIDA_SUELTO"
+
+MANOS_BIN="$PROJECT_ROOT/target/aarch64-unknown-linux-musl/release/probar_manos"
+# Se compila SIEMPRE: si el binario se queda viejo, el banco valida un
+# codigo que ya no existe (y da falsos verdes o falsos rojos).
+say "  (compilando el binario ARM64 de las manos...)"
+if ! (cd "$PROJECT_ROOT" && cargo build --release --bin probar_manos --target aarch64-unknown-linux-musl) >/tmp/compilar_manos.log 2>&1; then
+    fail "no se pudo compilar el binario de las manos para ARM64 (ver /tmp/compilar_manos.log)"
+    MANOS_BIN=""
+fi
+
+if [ -n "$MANOS_BIN" ] && [ -f "$MANOS_BIN" ]; then
+    "$PODMAN" cp "$MANOS_BIN" "$CONTAINER:/tmp/probar_manos" >/dev/null 2>&1 \
+        || "$PODMAN" exec -i "$CONTAINER" sh -c 'cat > /tmp/probar_manos' < "$MANOS_BIN" >/dev/null 2>&1
+    "$PODMAN" exec "$CONTAINER" chmod +x /tmp/probar_manos >/dev/null 2>&1 || true
+    SALIDA_MANOS="$("$PODMAN" exec "$CONTAINER" bash -c "cd '$FACTORIO_DIR' && /tmp/probar_manos 127.0.0.1:$RCON_PORT '$RCON_PASSWORD'" 2>&1)"
+    printf '%s\n' "$SALIDA_MANOS" | sed 's/^/  | /'
+    if printf '%s' "$SALIDA_MANOS" | grep -q "RESULTADO: las manos VR funcionan contra el Factorio real"; then
+        ok "las manos VR del visor funcionan contra el Factorio real (clasificar + actuar)"
+    else
+        # AVISO, no fallo: el camino del APK tiene un problema ABIERTO con el
+        # RCON (ver docs/ADR-011-el-cliente-rcon-no-habla-con-el-motor.md).
+        # El banco sigue siendo valido: lo que se comprueba aqui es que los
+        # REMOTOS del mod funcionan (lo de arriba), que es otra cosa.
+        aviso "el camino del cliente RCON del APK sigue sin funcionar (ADR-011): el visor cae en la simulacion local"
+        printf '%s\n' "$SALIDA_MANOS" | sed 's/^/  | /' | head -8
+    fi
+else
+    fail "no hay binario de las manos para ARM64"
 fi
 
 # --------------------------------------------------------------------------

@@ -148,11 +148,19 @@ pub fn dir_modelos() -> PathBuf {
         return PathBuf::from(d);
     }
     const CANDIDATOS: &[&str] = &[
+        // Android 11+ tiene "almacenamiento con ambito": la app SOLO puede
+        // leer su propio directorio en /sdcard/Android/data/<paquete>/files.
+        // Por eso los modelos se dejan ahi (el deploy los copia) y no en
+        // /sdcard/XFactorVR, que da Permission denied.
+        "/sdcard/Android/data/com.xfactorvr.tabletop/files/models",
+        "/storage/emulated/0/Android/data/com.xfactorvr.tabletop/files/models",
+        // el motor puede extraer los assets del APK a su directorio interno
+        "/data/data/com.xfactorvr.tabletop/files/models",
+        "/data/user/0/com.xfactorvr.tabletop/files/models",
+        // y el resto de sitios (escritorio, contenedor, /sdcard legacy)
         "/sdcard/XFactorVR/assets/models",
         "/storage/emulated/0/XFactorVR/assets/models",
         "/data/local/tmp/XFactorVR/assets/models",
-        // el motor puede extraer los assets del APK a su directorio interno
-        "/data/data/com.xfactorvr.tabletop/files/models",
         "android/src/main/assets/models",
     ];
     for c in CANDIDATOS {

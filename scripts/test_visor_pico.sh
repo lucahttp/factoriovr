@@ -76,7 +76,9 @@ ok "dispositivo $SERIAL ($MODEL, Android $ANDROID)"
 paso "Instalacion de la app (y de Termux:X11, que hace falta para el render)"
 
 [ -f "$APK" ] || sin_entorno "no esta el APK '$APK' (se construye con scripts/build_apk.sh)"
-if "$ADB" -s "$SERIAL" install -r "$APK" 2>&1 | tail -1 | grep -q "Success"; then
+# OJO: adb imprime "Success" en una linea y "Install command complete" en
+# otra, asi que hay que mirar TODA la salida, no solo la ultima linea.
+if "$ADB" -s "$SERIAL" install -r "$APK" 2>&1 | grep -q "Success"; then
     ok "app instalada ($(basename "$APK"))"
 else
     fail "no se pudo instalar el APK"
@@ -90,7 +92,7 @@ elif [ ! -f "$X11_APK" ]; then
 elif "$ADB" -s "$SERIAL" shell pm list packages 2>/dev/null | grep -q "termux.x11"; then
     ok "Termux:X11 ya instalado"
 else
-    if "$ADB" -s "$SERIAL" install -r "$X11_APK" 2>&1 | tail -1 | grep -q "Success"; then
+    if "$ADB" -s "$SERIAL" install -r "$X11_APK" 2>&1 | grep -q "Success"; then
         ok "Termux:X11 instalado"
     else
         fail "no se pudo instalar Termux:X11"
@@ -105,13 +107,39 @@ paso "Mod puente actualizado en el servidor del movil"
 if [ "$XFV_SIN_DEPLOY" = "1" ]; then
     aviso "despliegue saltado (XFV_SIN_DEPLOY=1)"
 else
-    "$ADB" -s "$SERIAL" shell "test -d '$REMOTE_MOD'" 2>/dev/null \
+    "$ADB" -s "$SERIAL" shell "test -d '$REMOTE_SERVER'" 2>/dev/null \
         || sin_entorno "el servidor de Factorio no esta en '$REMOTE_SERVER' (scripts/deploy_pico.sh)"
-    "$ADB" -s "$SERIAL" push "$PROJECT_ROOT/mods/xfactorvr_bridge/control.lua" "$REMOTE_MOD/control.lua" >/dev/null 2>&1
-    "$ADB" -s "$SERIAL" push "$PROJECT_ROOT/mods/xfactorvr_bridge/info.json" "$REMOTE_MOD/info.json" >/dev/null 2>&1
-    CANONICAL="$("$ADB" -s "$SERIAL" shell "grep -c CANONICAL_TYPE_NAMES '$REMOTE_MOD/control.lua'" 2>/dev/null | tr -d '\r')"
+
+    # OJO: el nombre del directorio del mod tiene que COINCIDIR con la version
+    # de su info.json o Factorio lo rechaza y no arranca:
+    #   "Directory name of mod .../xfactorvr_bridge_0.1.1 doesn't match the
+    #    expected xfactorvr_bridge or xfactorvr_bridge_0.2.0"
+    # Se renombra en el movil con mv (sin borrar nada).
+    MOD_VERSION="$(python3 -c "import json;print(json.load(open('$PROJECT_ROOT/mods/xfactorvr_bridge/info.json'))['version'])")"
+    REMOTE_MOD_NEW="$REMOTE_SERVER/mods/xfactorvr_bridge_$MOD_VERSION"
+    "$ADB" -s "$SERIAL" shell "test -d '$REMOTE_MOD_NEW' || mv '$REMOTE_MOD' '$REMOTE_MOD_NEW' 2>/dev/null; true" >/dev/null 2>&1
+    if ! "$ADB" -s "$SERIAL" shell "test -d '$REMOTE_MOD_NEW'" 2>/dev/null; then
+        fail "no se pudo preparar el directorio del mod en '$REMOTE_MOD_NEW'"
+    fi
+
+    # Los MODELOS 3D van al directorio propio de la app en /sdcard: con
+    # Android 11+ (almacenamiento con ambito) la app NO puede leer /sdcard
+    # arbitrario ("Permission denied"), solo su propio Android/data/<paquete>.
+    APP_MODELS="/sdcard/Android/data/com.xfactorvr.tabletop/files/models"
+    "$ADB" -s "$SERIAL" shell "mkdir -p '$APP_MODELS'" >/dev/null 2>&1
+    "$ADB" -s "$SERIAL" push "$PROJECT_ROOT/android/src/main/assets/models/." "$APP_MODELS/" >/dev/null 2>&1
+    N_MODELS="$("$ADB" -s "$SERIAL" shell "ls '$APP_MODELS' | wc -l" 2>/dev/null | tr -d '\r')"
+    if [ "${N_MODELS:-0}" -gt 5 ]; then
+        ok "$N_MODELS modelos 3D desplegados en $APP_MODELS"
+    else
+        fail "no se pudieron desplegar los modelos 3D ($N_MODELS)"
+    fi
+
+    "$ADB" -s "$SERIAL" push "$PROJECT_ROOT/mods/xfactorvr_bridge/control.lua" "$REMOTE_MOD_NEW/control.lua" >/dev/null 2>&1
+    "$ADB" -s "$SERIAL" push "$PROJECT_ROOT/mods/xfactorvr_bridge/info.json" "$REMOTE_MOD_NEW/info.json" >/dev/null 2>&1
+    CANONICAL="$("$ADB" -s "$SERIAL" shell "grep -c CANONICAL_TYPE_NAMES '$REMOTE_MOD_NEW/control.lua'" 2>/dev/null | tr -d '\r')"
     if [ "${CANONICAL:-0}" -gt 0 ]; then
-        ok "el mod con el tipo canonico esta desplegado"
+        ok "el mod con el tipo canonico esta desplegado (xfactorvr_bridge_$MOD_VERSION)"
     else
         fail "el mod desplegado NO lleva el tipo canonico"
     fi
@@ -122,12 +150,24 @@ fi
 # --------------------------------------------------------------------------
 paso "Arranque del motor headless en el movil"
 
+# Si hay un motor de una corrida anterior, se quita: si no, no abre el RCON
+# (el puerto esta ocupado y el fichero de lock hace que Factorio se queje).
 "$ADB" -s "$SERIAL" shell "ps -A | grep '[f]actorio'" 2>/dev/null | head -2
-"$ADB" -s "$SERIAL" shell "nohup sh '$REMOTE_SCRIPT' > /data/local/tmp/factorio_srv.log 2>&1 &" >/dev/null 2>&1
+"$ADB" -s "$SERIAL" shell "ps -A | grep '[f]actorio' | awk '{print \$2}' | xargs -r kill 2>/dev/null; true" >/dev/null 2>&1
+sleep 2
+# OJO: el motor NO puede lanzarse con nohup desde adb. Android 12+ mata los
+# procesos en segundo plano sin interfaz (los "phantom processes") a los
+# pocos minutos, y el motor se caia solo.  La solucion es lanzar el script
+# con el shell de adb en PRIMER PLANO (este script se queda vivo y el motor
+# cuelga de el): por eso el banco se ejecuta en segundo plano.
+"$ADB" -s "$SERIAL" shell "sh '$REMOTE_SCRIPT' > /data/local/tmp/factorio_srv.log 2>&1" >/dev/null 2>&1 &
+MOTOR_SHELL=$!
 
 LISTO=0
 for i in $(seq 1 120); do
-    if "$ADB" -s "$SERIAL" shell "grep -q 'Starting RCON interface' /data/local/tmp/factorio_srv.log 2>/dev/null"; then
+    # OJO: "Starting RCON interface" lo escribe el SERVIDOR (standalone.log);
+    # el script de arranque dice "Servidor Factorio listo: RCON en ...".
+    if "$ADB" -s "$SERIAL" shell "grep -q 'Servidor Factorio listo' /data/local/tmp/factorio_srv.log 2>/dev/null || grep -q 'Starting RCON interface' /data/local/tmp/factorio_arm64/logs/standalone.log 2>/dev/null"; then
         LISTO=1
         break
     fi

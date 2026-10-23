@@ -1424,8 +1424,12 @@ static bool copiar_asset(AAssetManager* mgr, const char* asset_path, const std::
 static void copiar_arbol_assets(AAssetManager* mgr, const std::string& asset_dir,
                                 const std::string& destino_dir) {
     AAssetDir* dir = AAssetManager_openDir(mgr, asset_dir.c_str());
-    if (!dir) return;
+    if (!dir) {
+        LOGE("openxr_engine: no se pudo abrir el directorio de assets '%s'", asset_dir.c_str());
+        return;
+    }
     asegurar_directorio(destino_dir);
+    int copiados = 0;
     while (const char* nombre = AAssetDir_getNextFileName(dir)) {
         std::string sub_asset = asset_dir.empty() ? nombre : (asset_dir + "/" + nombre);
         std::string sub_destino = destino_dir + "/" + nombre;
@@ -1435,9 +1439,12 @@ static void copiar_arbol_assets(AAssetManager* mgr, const std::string& asset_dir
             copiar_arbol_assets(mgr, sub_asset, sub_destino.substr(0, sub_destino.size() - 1));
         } else if (!copiar_asset(mgr, sub_asset.c_str(), sub_destino)) {
             LOGE("openxr_engine: no se pudo copiar el asset %s", sub_asset.c_str());
+        } else {
+            copiados++;
         }
     }
     AAssetDir_close(dir);
+    LOGI("openxr_engine: %d assets copiados de '%s'", copiados, asset_dir.c_str());
 }
 
 /// Deja los modelos 3D del APK en el directorio interno de la app.
@@ -1602,25 +1609,31 @@ static void init_tabletop_scene() {
     s_vao_belt = create_mesh_vao(belt_verts, s_vbo_belt);
     s_count_belt = (int)belt_verts.size();
 
-    // E) Carga individual de Modelos 3D de factorio-3d-mod para Entidades Vivas
+    // E) Los MODELOS 3D de las maquinas.
     //
-    // Los modelos vienen del APK (ver preparar_modelos_3d): se extraen al
-    // directorio interno de la app al arrancar.  Si no esta el modelo, se
-    // dibuja la primitiva de reserva, para que nunca se vea un hueco.
+    // Ya NO se cargan aqui: la geometria la genera el modulo de modelos en
+    // Rust (src/modelos3d.rs), que lee el manifiesto y los GLB optimizados del
+    // mod factorio-3d-mod y conoce el prototipo EXACTO de cada entidad (cofre
+    // de madera o de acero).  Aqui solo se deja el sitio preparado: se
+    // extraen los assets del APK para que el visor sea autonomo.
+    // OJO: init_glb_loader() es el que ENLAZA las FFI del crate (update_
+    // simulation, live_entities, pan_view...).  Sin esto el puente no habla
+    // con el motor y el diorama se queda vacio.
+    init_glb_loader();
+
     preparar_modelos_3d();
-    load_or_create_fallback(ENTITY_ASSEMBLING_MACHINE, ruta_modelo("ENTITIES/STRUCTURES/assembling-machine/static.glb"), 0.18f);
-    load_or_create_fallback(ENTITY_MINING_DRILL, ruta_modelo("ENTITIES/STRUCTURES/electric-mining-drill/static.glb"), 0.16f);
-    load_or_create_fallback(ENTITY_FURNACE, ruta_modelo("ENTITIES/STRUCTURES/steel-furnace/static.glb"), 0.13f);
-    load_or_create_fallback(ENTITY_RADAR, ruta_modelo("ENTITIES/STRUCTURES/radar/static1.glb"), 0.14f);
-    load_or_create_fallback(ENTITY_ROBOPORT, ruta_modelo("ENTITIES/STRUCTURES/roboport/static.glb"), 0.18f);
-    load_or_create_fallback(ENTITY_GUN_TURRET, ruta_modelo("ENTITIES/STRUCTURES/gun-turret/static1.glb"), 0.10f);
-    load_mesh_from_glb(s_turret_top_mesh, ruta_modelo("ENTITIES/STRUCTURES/gun-turret/static2.glb"), 0.09f);
-    load_or_create_fallback(ENTITY_CHEST, ruta_modelo("ENTITIES/STRUCTURES/steel-chest/static.glb"), 0.07f);
-    load_or_create_fallback(ENTITY_ELECTRIC_POLE, ruta_modelo("ENTITIES/STRUCTURES/medium-electric-pole/static.glb"), 0.06f);
+
+    // La MAQUETA de lo que vas a colocar (el build tool) si usa la primitiva
+    // de reserva: es solo una guia de donde va la maquina.
+    load_or_create_fallback(ENTITY_ASSEMBLING_MACHINE, std::string(), 0.18f);
+    load_or_create_fallback(ENTITY_MINING_DRILL, std::string(), 0.16f);
+    load_or_create_fallback(ENTITY_FURNACE, std::string(), 0.13f);
+    load_or_create_fallback(ENTITY_RADAR, std::string(), 0.14f);
+    load_or_create_fallback(ENTITY_ROBOPORT, std::string(), 0.18f);
+    load_or_create_fallback(ENTITY_GUN_TURRET, std::string(), 0.10f);
+    load_or_create_fallback(ENTITY_CHEST, std::string(), 0.07f);
+    load_or_create_fallback(ENTITY_ELECTRIC_POLE, std::string(), 0.06f);
     load_or_create_fallback(ENTITY_TRANSPORT_BELT, std::string(), 0.04f);
-    load_or_create_fallback(ENTITY_BITER, ruta_modelo("ENTITIES/ENEMIES/biters/biter_tier1.glb"), 0.09f);
-    load_or_create_fallback(ENTITY_TREE, ruta_modelo("ENTITIES/FOLIAGE/tree1/static.glb"), 0.13f);
-    load_or_create_fallback(ENTITY_PLAYER, ruta_modelo("ENTITIES/PLAYER/idle.glb"), 0.075f);
 
     // F) Consola Holográfica Espacial y Quickbar 6DoF (Generals XR pattern)
     // Flotante y angulada hacia los ojos del jugador
@@ -1825,7 +1838,6 @@ static void draw_tabletop_scene(const float* vp_mat,
         // reserva para lo que no tiene modelo (items del suelo, arbustos,
         // vagonetas...).  Antes al reves: si habia sprite, se dibujaba el
         // sprite tumbado y NUNCA se llegaba a la malla.
-        const ModelMesh& mesh = s_entity_meshes[ent.entity_type];
         // Una entidad se dibuja con su MODELO 3D de verdad si el puente le ha
         // asignado uno (model_id != 0).  La geometria la genera el modulo de
         // modelos en Rust con los GLB del mod factorio-3d-mod (optimizados y

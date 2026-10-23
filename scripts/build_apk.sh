@@ -75,7 +75,10 @@ if [ -d "$PROJECT_ROOT/android/src/main/assets" ]; then
     mkdir -p "$BUILD_DIR/apk/assets"
     # rsync sin --delete: lo que hay en el repo manda, lo que sobra se queda.
     rsync -a "$PROJECT_ROOT/android/src/main/assets/" "$BUILD_DIR/apk/assets/"
-    zip -u -r "$BUILD_DIR/unaligned.apk" assets/
+    # SIN COMPRIMIR: el AssetManager de Android no puede LISTAR un directorio
+    # de assets comprimidos (AAssetManager_openDir falla), y entonces la
+    # extraccion de los modelos al directorio interno de la app no copia nada.
+    zip -0 -u -r "$BUILD_DIR/unaligned.apk" assets/
     echo "    assets incluidos: $(find "$BUILD_DIR/apk/assets" -type f | wc -l | tr -d ' ') ficheros"
 fi
 cd "$PROJECT_ROOT"

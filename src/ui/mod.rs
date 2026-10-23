@@ -39,6 +39,7 @@
 
 pub mod estados;
 pub mod items;
+pub mod fuente;
 pub mod tabla;
 pub mod ventanas;
 

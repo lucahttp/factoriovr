@@ -21,7 +21,7 @@
 //!     4..8    numero de frame  u32
 //!     8..10   ancho   u16
 //!     10..12  alto    u16
-//!     12      flags   u8   (bit 0: imagen invertida verticalmente)
+//!     12      flags   u8   (bit 0: el ojo al que pertenece el frame: 0 = izquierdo, 1 = derecho)
 //!     13      formato u8   (0 = RGBA8888)
 //!     14..16  reservado u16
 //!   carga: ancho * alto * 4 bytes RGBA

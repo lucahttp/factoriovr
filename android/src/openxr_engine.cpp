@@ -31,6 +31,14 @@
 #include <mutex>
 #include <atomic>
 
+// Modulos nuevos del visor:
+//   * puente_entrada: cliente del protocolo XFCE (clics al motor, 27021)
+//   * panel_mesa:     matematicas del quad TUMBADO del motor sobre la mesa
+//   * ancla_espacial: anclaje a la mesa real con las extensiones XR_BD_*
+#include "puente_entrada.h"
+#include "panel_mesa.h"
+#include "ancla_espacial.h"
+
 #define TAG "XFactorVR_OpenXR"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, TAG, __VA_ARGS__)
@@ -452,8 +460,8 @@ struct DioramaVertex {
 };
 
 // Dimensiones de la mesa de diorama (en metros)
-static const float TABLE_HALF_W = 0.60f;  // Ancho total 1.20m
-static const float TABLE_HALF_D = 0.40f;  // Profundidad total 0.80m
+static const float TABLE_HALF_W = 0.90f;  // Ancho total 1.80m
+static const float TABLE_HALF_D = 0.60f;  // Profundidad total 1.20m
 
 // ============================================================================
 // ESTADO DE MESA Y OBSERVADOR HUMANO (GENERALS XR PATTERN)
@@ -464,6 +472,33 @@ static XrVector3f s_table_pos = { 0.0f, 0.74f, -1.05f };
 static float s_table_yaw = 0.0f;
 static float s_table_scale = 1.0f;
 static float s_table_model_mat[16];
+
+// ============================================================================
+// ANCLAJE ESPACIAL A LA MESA REAL (XR_BD_spatial_*, ver ADR-014)
+// ============================================================================
+// Cuando el runtime de PICO detecta una superficie horizontal (la mesa de
+// verdad), el modulo `ancla_espacial` devuelve su pose en STAGE.  Esa pose
+// pasa a ser la BASE del diorama: el yaw local del usuario y la escala se
+// componen ENCIMA de ella.  Sin ancla valida todo sigue igual que antes (la
+// traslacion fija de STAGE).
+static bool  s_ancla_activa = false;      // hay un ancla valida y trackeada
+static float s_ancla_mat[16];             // pose del ancla en STAGE
+static bool  s_juego_click_armado = false; // el gatillo esta pulsado sobre el motor
+static float s_ancla_yaw = 0.0f;          // yaw (en STAGE) del ancla
+static float s_table_yaw_local = 0.0f;    // yaw del usuario respecto a la base
+static bool  s_ancla_preparado = false;   // ya se pidio detectar la mesa
+
+// --- Panel tumbado del motor (clic XFCE) -----------------------------------
+// Ultima matriz del panel tumbado (en el espacio del mundo) y el tamano de
+// la imagen que hay en la textura.  La usa el rayo de la mano para saber en
+// que pixel del motor ha caido el puntero (clic XFCE).
+static float s_game_panel_mat[16];
+static int   s_game_panel_w = 0;
+static int   s_game_panel_h = 0;
+/// Pixel del motor donde se armo el ultimo clic XFCE (se suelta en el MISMO
+/// punto: el motor necesita ver pulsacion y soltura).
+static int   s_juego_click_x = 0;
+static int   s_juego_click_y = 0;
 
 // Modo Observador a escala humana 1:1 (XrWorld::observer)
 static bool s_observer_mode = false;
@@ -646,7 +681,16 @@ typedef int (*pfn_xfactorvr_ui_vertices)(DioramaVertex* out, int max);
 typedef long long (*pfn_xfactorvr_ui_hit)(uint32_t ventana, float u, float v);
 // Geometria 3D de todas las entidades vivas que tienen modelo (la genera el
 // modulo Rust con los GLB del mod factorio-3d-mod).
-typedef int (*pfn_xfactorvr_modelo3d_geometria_viva)(DioramaVertex* out, int max);
+// Renderer 3D instanciado del VISOR (src/renderer/ en el crate de Rust):
+// una llamada de dibujo por prototipo, con una matriz por instancia.
+typedef bool  (*pfn_xfactorvr_3d_iniciar)(void);
+typedef uint32_t (*pfn_xfactorvr_dibujar_modelos_3d_ex)(const float* vp16, const float* tabla16);
+typedef bool  (*pfn_xfactorvr_sgsr_preparar)(int w_in, int h_in, int w_out, int h_out);
+typedef uint32_t (*pfn_xfactorvr_sgsr_fbo)(void);
+typedef bool  (*pfn_xfactorvr_sgsr_escalar)(void);
+// Geometria de una ventana del HUD y pulsacion de un control.
+typedef bool (*pfn_xfactorvr_ui_ventana_geom)(uint32_t ventana, float* out);
+typedef int  (*pfn_xfactorvr_ui_pulsar)(uint32_t ventana, uint32_t id);
 
 static pfn_xfactorvr_load_glb s_load_glb = nullptr;
 static pfn_xfactorvr_free_glb s_free_glb = nullptr;
@@ -670,7 +714,15 @@ static pfn_xfactorvr_vr_hand_action s_vr_hand_action = nullptr;
 static pfn_xfactorvr_vr_hand_release s_vr_hand_release = nullptr;
 static pfn_xfactorvr_ui_vertices s_ui_vertices = nullptr;
 static pfn_xfactorvr_ui_hit s_ui_hit = nullptr;
-static pfn_xfactorvr_modelo3d_geometria_viva s_modelo3d_viva = nullptr;
+static pfn_xfactorvr_ui_ventana_geom s_ui_ventana_geom = nullptr;
+static pfn_xfactorvr_ui_pulsar s_ui_pulsar = nullptr;
+static pfn_xfactorvr_3d_iniciar s_3d_iniciar = nullptr;
+static pfn_xfactorvr_dibujar_modelos_3d_ex s_dibujar_modelos_3d = nullptr;
+static pfn_xfactorvr_sgsr_preparar s_sgsr_preparar = nullptr;
+static pfn_xfactorvr_sgsr_fbo s_sgsr_fbo = nullptr;
+static pfn_xfactorvr_sgsr_escalar s_sgsr_escalar = nullptr;
+static int s_sgsr_entrada_w = 1440;
+static int s_sgsr_entrada_h = 1440;
 
 // Estado de Minado Manual con Pico (mantener Trigger en vetas de mineral)
 static float s_manual_mining_timer = 0.0f;
@@ -721,7 +773,17 @@ static void update_table_matrix() {
     mat4_translate(trans, s_table_pos.x, s_table_pos.y, s_table_pos.z);
     mat4_scale(sc, s_table_scale, s_table_scale, s_table_scale);
     mat4_multiply(rot, sc, model_temp);
-    mat4_multiply(trans, model_temp, s_table_model_mat);
+    if (s_ancla_activa) {
+        // Con ancla a la mesa real la BASE es la pose del ancla (que ya
+        // trae la traslacion y la orientacion detectadas): encima se compone
+        // solo el yaw local del usuario y la escala.
+        float base[16];
+        mat4_rotate_y(rot, s_table_yaw_local);
+        mat4_multiply(s_ancla_mat, rot, base);
+        mat4_multiply(base, sc, s_table_model_mat);
+    } else {
+        mat4_multiply(trans, model_temp, s_table_model_mat);
+    }
 }
 
 // Interacción bimanual (Pinch-to-Zoom y Rotación bimanual)
@@ -1310,7 +1372,13 @@ static void init_glb_loader() {
     s_vr_hand_release = (pfn_xfactorvr_vr_hand_release)dlsym(handle, "xfactorvr_vr_hand_release");
     s_ui_vertices = (pfn_xfactorvr_ui_vertices)dlsym(handle, "xfactorvr_ui_vertices");
     s_ui_hit = (pfn_xfactorvr_ui_hit)dlsym(handle, "xfactorvr_ui_hit");
-    s_modelo3d_viva = (pfn_xfactorvr_modelo3d_geometria_viva)dlsym(handle, "xfactorvr_modelo3d_geometria_viva");
+    s_ui_ventana_geom = (pfn_xfactorvr_ui_ventana_geom)dlsym(handle, "xfactorvr_ui_ventana_geom");
+    s_ui_pulsar = (pfn_xfactorvr_ui_pulsar)dlsym(handle, "xfactorvr_ui_pulsar");
+    s_3d_iniciar = (pfn_xfactorvr_3d_iniciar)dlsym(handle, "xfactorvr_3d_iniciar");
+    s_dibujar_modelos_3d = (pfn_xfactorvr_dibujar_modelos_3d_ex)dlsym(handle, "xfactorvr_dibujar_modelos_3d_ex");
+    s_sgsr_preparar = (pfn_xfactorvr_sgsr_preparar)dlsym(handle, "xfactorvr_sgsr_preparar");
+    s_sgsr_fbo = (pfn_xfactorvr_sgsr_fbo)dlsym(handle, "xfactorvr_sgsr_fbo");
+    s_sgsr_escalar = (pfn_xfactorvr_sgsr_escalar)dlsym(handle, "xfactorvr_sgsr_escalar");
     s_get_atlas_page_count = (pfn_xfactorvr_get_atlas_page_count)dlsym(handle, "xfactorvr_get_atlas_page_count");
     s_get_atlas_page_size = (pfn_xfactorvr_get_atlas_page_size)dlsym(handle, "xfactorvr_get_atlas_page_size");
     s_get_atlas_page_pixels = (pfn_xfactorvr_get_atlas_page_pixels)dlsym(handle, "xfactorvr_get_atlas_page_pixels");
@@ -1348,7 +1416,13 @@ static void init_glb_loader() {
             s_vr_hand_release = (pfn_xfactorvr_vr_hand_release)dlsym(mod_handle, "xfactorvr_vr_hand_release");
             s_ui_vertices = (pfn_xfactorvr_ui_vertices)dlsym(mod_handle, "xfactorvr_ui_vertices");
             s_ui_hit = (pfn_xfactorvr_ui_hit)dlsym(mod_handle, "xfactorvr_ui_hit");
-            s_modelo3d_viva = (pfn_xfactorvr_modelo3d_geometria_viva)dlsym(mod_handle, "xfactorvr_modelo3d_geometria_viva");
+            s_ui_ventana_geom = (pfn_xfactorvr_ui_ventana_geom)dlsym(mod_handle, "xfactorvr_ui_ventana_geom");
+            s_ui_pulsar = (pfn_xfactorvr_ui_pulsar)dlsym(mod_handle, "xfactorvr_ui_pulsar");
+            s_3d_iniciar = (pfn_xfactorvr_3d_iniciar)dlsym(mod_handle, "xfactorvr_3d_iniciar");
+            s_dibujar_modelos_3d = (pfn_xfactorvr_dibujar_modelos_3d_ex)dlsym(mod_handle, "xfactorvr_dibujar_modelos_3d_ex");
+            s_sgsr_preparar = (pfn_xfactorvr_sgsr_preparar)dlsym(mod_handle, "xfactorvr_sgsr_preparar");
+            s_sgsr_fbo = (pfn_xfactorvr_sgsr_fbo)dlsym(mod_handle, "xfactorvr_sgsr_fbo");
+            s_sgsr_escalar = (pfn_xfactorvr_sgsr_escalar)dlsym(mod_handle, "xfactorvr_sgsr_escalar");
         }
     }
     LOGI("openxr_engine: Cargador GLB y FFI Factorio enlazados (load=%p, get=%p, inv=%p, patches=%p, mine=%p, interact=%p)",
@@ -1728,6 +1802,66 @@ static void trigger_controller_haptics(XrSession session, XrAction haptic_action
 // Panel con el render real del juego (definido mas abajo, en su propio
 // bloque: necesita sockets y textura).
 static void draw_game_panel(const float* vp_mat, const float* model_mesa, bool ojo_primario);
+
+/// Hit-test del HUD NUEVO: que control hay bajo el rayo.
+///
+/// Las ventanas del HUD viven en el espacio local (el de la cabeza): se
+/// calcula el impacto del rayo con el plano de cada ventana y se le pasan
+/// las coordenadas en PIXELES al modulo Rust, que es quien sabe que control
+/// hay en cada pixel (pixels y hit-test salen de la MISMA tabla).
+///
+/// Devuelve el id del control (o -1) y escribe en `ventana_out` la ventana.
+static long long hit_test_hud(
+    const float* ro, const float* rd, float ray_len,
+    uint32_t* ventana_out, float* t_out) {
+    if (!s_ui_hit || !s_ui_ventana_geom) return -1;
+    long long mejor = -1;
+    float mejor_t = ray_len;
+    for (uint32_t vi = 0; vi < 4; ++vi) {
+        float g[12];
+        if (!s_ui_ventana_geom(vi, g)) continue;
+        const float px = g[0], py = g[1], pz = g[2];
+        const float qx = g[3], qy = g[4], qz = g[5], qw = g[6];
+        const float escala = g[7];
+        const float ancho_px = g[8], alto_px = g[9];
+        const float ancho_m = g[10], alto_m = g[11];
+
+        // Normal del plano de la ventana: su -Z local rotado.
+        const float nx = -(2.0f * (qx * qz + qw * qy));
+        const float ny = -(2.0f * (qy * qz - qw * qx));
+        const float nz = -(1.0f - 2.0f * (qx * qx + qy * qy));
+
+        const float den = nx * rd[0] + ny * rd[1] + nz * rd[2];
+        if (fabsf(den) < 1e-6f) continue;
+        const float num = nx * (px - ro[0]) + ny * (py - ro[1]) + nz * (pz - ro[2]);
+        const float t = num / den;
+        if (t <= 0.0f || t >= mejor_t) continue;
+
+        // Punto de impacto en coordenadas LOCALES de la ventana
+        // (rotacion inversa = conjugado del cuaternion).
+        const float hx = ro[0] + rd[0] * t - px;
+        const float hy = ro[1] + rd[1] * t - py;
+        const float hz = ro[2] + rd[2] * t - pz;
+        const float lx = hx * qw + hy * qz - hz * qy;
+        const float ly = -hx * qy + hy * qw + hz * qx;
+        const float lz = hx * qx + hy * qy + hz * qz;
+
+        const float ancho_local = ancho_m * escala;
+        const float alto_local = alto_m * escala;
+        if (ancho_local <= 0.0f || alto_local <= 0.0f) continue;
+        const float u = (lx / ancho_local + 0.5f) * ancho_px;
+        const float v = (0.5f - ly / alto_local) * alto_px;
+        if (u < 0.0f || u > ancho_px || v < 0.0f || v > alto_px) continue;
+
+        const long long id = s_ui_hit(vi, u, v);
+        if (id < 0) continue;
+        mejor = id;
+        mejor_t = t;
+        *ventana_out = vi;
+        if (t_out) *t_out = t;
+    }
+    return mejor;
+}
 
 static void draw_tabletop_scene(const float* vp_mat,
                                 float anim_time,
@@ -2239,6 +2373,49 @@ static void draw_tabletop_scene(const float* vp_mat,
         bool has_ui_hit = false;
         float ray_len = 1.6f;
 
+        // Clic XFCE sobre el frame del motor (protocolo XFCE, puerto 27021).
+        // El rayo de la mano (el MISMO que usa el hover del HUD) se proyecta
+        // sobre el quad tumbado del panel: si lo golpea, el punto de la
+        // pantalla del motor se manda al inyector como clic de raton.
+        //
+        // El motor necesita ver la pulsacion (ARMAR) y la soltura (SOLTAR)
+        // sobre la MISMA posicion, asi que aqui solo se arma; la soltura se
+        // envia cuando el dedo se levanta (ver el bucle de frames).
+        //
+        // COMPETENCIA POR EL PUNTERO (criterio de Generals-Zero-Hour-XR: gana
+        // lo que esta mas cerca).  El panel del motor esta tumbado en la mesa,
+        // 5 mm por ENCIMA de ella, asi que el panel se queda con el gatillo y
+        // el diorama de debajo no dispara nada.  Sin esto, el mismo gatillo
+        // mandaba un clic al motor Y una orden por RCON al diorama.
+        bool has_panel_hit = false;
+        int panel_px = 0, panel_py = 0;
+        if (is_primary_eye && !s_observer_mode && s_game_panel_w > 0 && s_game_panel_h > 0) {
+            const float origen_rayo[3] = { rx, ry, rz };
+            const float dir_rayo[3] = { dx, dy, dz };
+            int px = 0, py = 0;
+            if (panel_mesa_rayo_a_pixel(origen_rayo, dir_rayo, s_game_panel_mat,
+                                        s_game_panel_w, s_game_panel_h, &px, &py)) {
+                // Distancia al plano del panel (matriz column-major: la
+                // columna 2 es la normal del quad, la 3 la traslacion).
+                const float* mm = s_game_panel_mat;
+                const float nx = mm[8], ny = mm[9], nz = mm[10];
+                const float den = nx * dir_rayo[0] + ny * dir_rayo[1] + nz * dir_rayo[2];
+                float t_panel = -1.0f;
+                if (fabsf(den) > 1e-6f) {
+                    const float num = nx * (mm[12] - origen_rayo[0]) + ny * (mm[13] - origen_rayo[1])
+                                     + nz * (mm[14] - origen_rayo[2]);
+                    const float t = num / den;
+                    if (t > 0.0f) t_panel = t;
+                }
+                if (t_panel > 0.0f && t_panel < ray_len) {
+                    ray_len = t_panel;
+                    has_panel_hit = true;
+                    panel_px = px;
+                    panel_py = py;
+                }
+            }
+        }
+
         // 1. Raycast contra el plano físico de la mesa en STAGE (Y = s_table_pos.y)
         if (fabsf(dy) > 1e-4f) {
             float t = (s_table_pos.y - ry) / dy;
@@ -2253,7 +2430,9 @@ static void draw_tabletop_scene(const float* vp_mat,
                 loc_x = (rel_x * cos_y - rel_z * sin_y) / s_table_scale;
                 loc_z = (rel_x * sin_y + rel_z * cos_y) / s_table_scale;
 
-                if (fabsf(loc_x) <= TABLE_HALF_W && fabsf(loc_z) <= TABLE_HALF_D) {
+                // La mesa solo gana si esta MAS CERCA que lo que ya haya
+                // cogido el puntero (el panel del motor esta 5 mm mas arriba).
+                if (fabsf(loc_x) <= TABLE_HALF_W && fabsf(loc_z) <= TABLE_HALF_D && t < ray_len) {
                     has_table_hit = true;
                     ray_len = t;
                     hit_stage_x = cand_x;
@@ -2265,6 +2444,33 @@ static void draw_tabletop_scene(const float* vp_mat,
         // 2. Raycast contra la Consola UI Holográfica y Quickbar
         s_hovered_ui_btn = -1;
         s_hovered_quickbar_slot = -1;
+
+        // 2-bis. El HUD NUEVO (src/ui/): el rayo se prueba contra cada
+        // ventana y el modulo Rust decide que control hay.  Gana el mas
+        // cercano, y si hay control, el rayo NO llega a la mesa (asi no se
+        // coloca una maquina mientras se pulsa un boton).
+        uint32_t hud_ventana = 0;
+        long long hud_control = -1;
+        if (is_primary_eye && !s_observer_mode) {
+            const float origen_rayo[3] = { rx, ry, rz };
+            const float dir_rayo[3] = { dx, dy, dz };
+            float t_hud = 0.0f;
+            hud_control = hit_test_hud(origen_rayo, dir_rayo, ray_len, &hud_ventana, &t_hud);
+            if (hud_control >= 0) {
+                ray_len = t_hud;
+                has_ui_hit = true;
+                // Pulsar un control del HUD: el modulo Rust decide que hacer
+                // (elegir maquina, fabricar) y devuelve el tipo de entidad a
+                // colocar en la mesa (0 = nada que colocar).
+                if (trigger_clicked && s_ui_pulsar) {
+                    int tipo = s_ui_pulsar(hud_ventana, (uint32_t)hud_control);
+                    if (tipo > 0) {
+                        s_selected_build_tool = (uint32_t)tipo;
+                        LOGI("HUD: maquina elegida para colocar (tipo=%d)", tipo);
+                    }
+                }
+            }
+        }
         float ui_plane_z = -TABLE_HALF_D - 0.08f;
         float ui_world_z = s_table_pos.z + (ui_plane_z * cosf(s_table_yaw));
         float t_ui = (ui_world_z - rz) / (dz != 0 ? dz : 1e-4f);
@@ -2277,6 +2483,9 @@ static void draw_tabletop_scene(const float* vp_mat,
             if (fabsf(rel_x) < 0.31f && fabsf(rel_y) < 0.14f) {
                 has_ui_hit = true;
                 ray_len = t_ui;
+                // El HUD esta delante de la mesa: si el rayo lo alcanza, el
+                // HUD gana el puntero y el panel del motor no se lleva el clic.
+                has_panel_hit = false;
 
                 // Botones de comando superiores (rel_y > 0.02)
                 if (rel_y > 0.02f) {
@@ -2298,6 +2507,17 @@ static void draw_tabletop_scene(const float* vp_mat,
                         } else if (s_hovered_ui_btn == 1) {
                             s_table_placed = false;
                             LOGI("Re-anclando mesa...");
+                            // Ademas, si el runtime trae el sensing espacial,
+                            // se vuelve a buscar la mesa REAL (planos
+                            // horizontales) para clavar la fabrica en ella.
+                            if (xfv::ancla_espacial_disponible()) {
+                                if (xfv::ancla_espacial_preparar_mesa()) {
+                                    LOGI("Anclaje espacial: buscando la mesa real...");
+                                } else {
+                                    LOGI("Anclaje espacial: no se pudo buscar la mesa (%s)",
+                                         xfv::ancla_espacial_estado());
+                                }
+                            }
                         } else {
                             s_active_ui_tab = s_hovered_ui_btn - 2;
                         }
@@ -2365,6 +2585,21 @@ static void draw_tabletop_scene(const float* vp_mat,
                     }
                 }
             }
+        }
+
+        // --- EL GATILLO SE ENTREGA AL GANADOR ------------------------------
+        // Ya han competido el panel del motor (XFCE), el HUD y la mesa, y ha
+        // ganado el MAS CERCANO (criterio de Generals-Zero-Hour-XR).  El panel
+        // esta tumbado en la mesa, 5 mm por encima, asi que si el rayo lo
+        // toca el clic va al motor y el diorama no dispara nada debajo.
+        if (has_panel_hit && trigger_clicked && !s_observer_mode) {
+            s_juego_click_x = panel_px;
+            s_juego_click_y = panel_py;
+            s_juego_click_armado = true;
+            // ARMAR: accion = 1 (boton abajo).  La soltura se envia cuando el
+            // dedo se levanta, sobre la MISMA posicion (ver el bucle de frames).
+            xfv::puente_entrada_arma_soltar(panel_px, panel_py, 1);
+            LOGI("Clic XFCE ARMADO en pixel (%d, %d) del motor", panel_px, panel_py);
         }
 
         // 3. Rejilla Magnética (Grid Snapping) y Ghost Preview 6DoF sobre la mesa (Fase 2)
@@ -2693,28 +2928,12 @@ static void draw_tabletop_scene(const float* vp_mat,
 
     // LAS MAQUINAS CON MODELO 3D DE VERDAD.
     //
-    // La geometria la genera el modulo de modelos en Rust con los GLB del mod
-    // factorio-3d-mod (optimizados: de 63,7 MB a 7,2 MB) y llega ya
-    // transformada y colocada en su casilla.  Se dibuja entera en un solo
-    // draw call, con la matriz de la mesa.
-    if (s_modelo3d_viva) {
-        static std::vector<DioramaVertex> modelo_verts(80000);
-        int n = s_modelo3d_viva(modelo_verts.data(), (int)modelo_verts.size());
-        if (n > 0) {
-            float mod_mvp[16];
-            mat4_multiply(vp_mat, active_model, mod_mvp);
-            glUniformMatrix4fv(s_model_loc, 1, GL_FALSE, active_model);
-            glUniformMatrix4fv(s_mvp_loc, 1, GL_FALSE, mod_mvp);
-            glUniform1f(s_enable_clipping_loc, s_observer_mode ? 0.0f : 1.0f);
-            glUniform1f(s_use_tex_loc, 0.0f);
-            glUniform1f(s_lit_loc, 1.0f);
-            glUniform3f(s_emissive_loc, 0.0f, 0.0f, 0.0f);
-
-            glBindVertexArray(s_dynamic_vao);
-            glBindBuffer(GL_ARRAY_BUFFER, s_dynamic_vbo);
-            glBufferSubData(GL_ARRAY_BUFFER, 0, (size_t)n * sizeof(DioramaVertex), modelo_verts.data());
-            glDrawArrays(GL_TRIANGLES, 0, (GLsizei)n);
-        }
+    // El renderer vive en Rust (src/renderer/): sube cada GLB a la GPU una
+    // sola vez y dibuja TODAS las instancias de ese prototipo en una llamada
+    // (glDrawElementsInstanced), con una matriz por maquina.  La geometria
+    // sale de las entidades reales que llegan por RCON, con su model_id.
+    if (s_dibujar_modelos_3d) {
+        s_dibujar_modelos_3d(vp_mat, active_model);
     }
 
     // El render real del juego (si el juego lo esta mandando) se pinta como un
@@ -2737,9 +2956,13 @@ static void draw_tabletop_scene(const float* vp_mat,
             n = s_ui_vertices(ui_verts.data(), (int)ui_verts.size());
         }
         if (n > 0) {
+            // Las ventanas del HUD viven en el espacio LOCAL (el de la
+            // cabeza), no en el de la mesa: se pintan con la matriz de la
+            // vista y SIN la de la mesa, o saldrian tumbadas sobre el
+            // tablero en vez de flotar delante de la cara.
             float ui_mvp[16];
-            mat4_multiply(vp_mat, active_model, ui_mvp);
-            glUniformMatrix4fv(s_model_loc, 1, GL_FALSE, active_model);
+            memcpy(ui_mvp, vp_mat, sizeof(ui_mvp));
+            glUniformMatrix4fv(s_model_loc, 1, GL_FALSE, vp_mat);
             glUniformMatrix4fv(s_mvp_loc, 1, GL_FALSE, ui_mvp);
             glUniform1f(s_enable_clipping_loc, 0.0f);
             glUniform1f(s_use_tex_loc, 0.0f);
@@ -2786,12 +3009,24 @@ static void draw_tabletop_scene(const float* vp_mat,
 static const uint16_t JUEGO_PUERTO = 27020;
 /// Desplazamiento horizontal de la UV por ojo (fraccion del ancho de la imagen).
 static const float JUEGO_PARALAJE = 0.018f;
-/// Altura del panel sobre la mesa, en metros.
-static const float JUEGO_ALTURA = 0.30f;
-/// Distancia del panel al borde lejano de la mesa, en metros.
-static const float JUEGO_PROFUNDIDAD = -0.56f;
-/// Ancho del panel, en metros (16:9 con la altura que sale de la textura).
-static const float JUEGO_ANCHO = 1.00f;
+
+// --- Panel TUMBADO (modulo `panel_mesa`) -----------------------------------
+/// Despegue del panel tumbado sobre la superficie de la mesa, en metros.
+/// 5 mm: por encima de los sprites del diorama (0,2-2 mm) para que no haya
+/// z-fighting, y visualmente pegado a la mesa.
+static const float JUEGO_PANEL_ALTURA = 0.005f;
+/// Desplazamiento del centro del panel dentro de la mesa (X y Z), en metros.
+static const float JUEGO_PANEL_OFFSET_X = 0.0f;
+static const float JUEGO_PANEL_OFFSET_Z = 0.0f;
+/// Ancho del framebuffer ORIGINAL del motor (el viewport que publica el
+/// inyector).  El inyector reduce ese frame al tamano de destino con
+/// factores enteros: 1280 -> 640 deja 16 px por casilla en la imagen
+/// TRANSMITIDA (32 px por casilla en el juego, reducidos a la mitad).
+static const int JUEGO_ANCHO_PX = 1280;
+/// Pixels del juego por casilla (zoom 1 de Factorio).
+static const float JUEGO_PX_POR_CASILLA = 32.0f;
+/// Metros de mesa que mide una casilla del juego (escala 1:1).
+static const float JUEGO_M_POR_CASILLA = 0.04f;
 
 /// Frame recibido del juego.
 struct GameFrame {
@@ -2913,33 +3148,31 @@ static void* game_receiver_thread(void* /*arg*/) {
 }
 
 /// Crea el quad del panel (se hace una sola vez).
+///
+/// El quad es el UNITARIO de `panel_mesa`: x e y de -1 a +1 en el plano local
+/// XY, z = 0 y la normal (0,0,1).  El tamaño real lo pone la ESCALA de la
+/// matriz (panel_mesa_matriz_tumbado), que lo tumba: la normal (0,0,1) pasa
+/// a (0,1,0) (apunta ARRIBA) y la ARRIBA de la imagen queda en -Z (lejos del
+/// jugador), igual que los sprites del mundo.
+///
+/// La V va INVERTIDA a proposito (misma convencion que antes): el motor
+/// dibuja el mundo con la Y invertida, asi que en el framebuffer la fila 0 es
+/// la de ARRIBA de la imagen.  Al subir el buffer tal cual a la textura, la
+/// t=0 queda en la fila 0, asi que la t=0 tiene que pintar la parte de ARRIBA
+/// del panel.
 static void construir_panel_juego() {
     if (s_vao_juego != 0) return;
     std::vector<DioramaVertex> verts;
-    const float w = JUEGO_ANCHO * 0.5f;
-    const float h = w * 9.0f / 16.0f;
-    auto push = [&](float x, float y, float u, float v) {
+    PanelMesaVertice pv[PANEL_MESA_VERTICES];
+    panel_mesa_vertices(pv);
+    for (const PanelMesaVertice& v : pv) {
         DioramaVertex d{};
-        d.x = x; d.y = y; d.z = 0.0f;
-        d.nx = 0.0f; d.ny = 0.0f; d.nz = 1.0f;
-        d.u = u; d.v = v;
+        d.x = v.x; d.y = v.y; d.z = v.z;
+        d.nx = v.nx; d.ny = v.ny; d.nz = v.nz;
+        d.u = v.u; d.v = v.v;
         d.r = 1.0f; d.g = 1.0f; d.b = 1.0f; d.a = 1.0f;
         verts.push_back(d);
-    };
-    // Cara que mira a +Z.
-    //
-    // La V va INVERTIDA a proposito: el motor dibuja el mundo con la Y
-    // invertida, asi que en el framebuffer la fila 0 es la de ARRIBA de la
-    // imagen (comprobado comparando el frame que viaja por el socket con una
-    // captura de la pantalla real del juego).  Al subir el buffer tal cual a
-    // la textura, la t=0 queda en la fila 0, asi que la t=0 tiene que pintar
-    // la parte de ARRIBA del panel.
-    push(-w, -h, 0.0f, 1.0f);
-    push( w, -h, 1.0f, 1.0f);
-    push( w,  h, 1.0f, 0.0f);
-    push(-w, -h, 0.0f, 1.0f);
-    push( w,  h, 1.0f, 0.0f);
-    push(-w,  h, 0.0f, 0.0f);
+    }
     s_juego_vertices = (int)verts.size();
     s_vao_juego = create_mesh_vao(verts, s_vbo_juego);
 }
@@ -2996,10 +3229,28 @@ static void draw_game_panel(const float* vp_mat, const float* model_mesa, bool o
     construir_panel_juego();
     if (s_vao_juego == 0) return;
 
-    // Posicion: en el espacio de la mesa, en el borde lejano y por encima.
-    float m_pos[16], m_panel[16];
-    mat4_translate(m_pos, 0.0f, JUEGO_ALTURA, JUEGO_PROFUNDIDAD);
-    mat4_multiply(model_mesa, m_pos, m_panel);
+    // Posicion: el quad tumbado sobre la mesa (la fabrica "en la mesa").
+    // El tamaño sale de la imagen que llega y de la escala 1:1 del juego
+    // (1 casilla = 32 px del motor = 0,04 m de mesa).
+    PanelMesaConfig cfg;
+    panel_mesa_config_inicial(&cfg);
+    cfg.img_w = s_tex_juego_w[ojo];
+    cfg.img_h = s_tex_juego_h[ojo];
+    cfg.px_por_casilla = panel_mesa_px_por_casilla_recibida(
+        cfg.img_w, JUEGO_ANCHO_PX, JUEGO_PX_POR_CASILLA);
+    cfg.m_por_casilla = JUEGO_M_POR_CASILLA;
+    cfg.altura_m = JUEGO_PANEL_ALTURA;
+    cfg.offset_x_m = JUEGO_PANEL_OFFSET_X;
+    cfg.offset_z_m = JUEGO_PANEL_OFFSET_Z;
+
+    float m_panel[16];
+    panel_mesa_matriz_tumbado(model_mesa, &cfg, m_panel);
+
+    // La matriz y el tamano de la imagen se guardan para el rayo de la mano:
+    // con ellos se calcula el pixel del motor donde ha caido el puntero.
+    memcpy(s_game_panel_mat, m_panel, sizeof(s_game_panel_mat));
+    s_game_panel_w = cfg.img_w;
+    s_game_panel_h = cfg.img_h;
 
     float mvp[16];
     mat4_multiply(vp_mat, m_panel, mvp);
@@ -3037,6 +3288,320 @@ static void draw_game_panel(const float* vp_mat, const float* model_mesa, bool o
 // HILO PRINCIPAL DE OPENXR
 // ============================================================================
 
+/// Procesa los eventos de la sesion OpenXR.
+///
+/// Devuelve false si el motor de VR debe terminar (el usuario se ha ido o el
+/// runtime ha perdido la sesion).
+static bool procesar_eventos_sesion(XrInstance instance, XrSession session, bool& sessionRunning) {
+    XrEventDataBuffer eventData = { .type = XR_TYPE_EVENT_DATA_BUFFER };
+    while (xrPollEvent(instance, &eventData) == XR_SUCCESS) {
+        if (eventData.type == XR_TYPE_EVENT_DATA_SESSION_STATE_CHANGED) {
+            auto* stateEvent = (XrEventDataSessionStateChanged*)&eventData;
+            LOGI("OpenXR SessionStateChanged: estado=%d (actual_running=%d)", (int)stateEvent->state, sessionRunning ? 1 : 0);
+            if (stateEvent->state == XR_SESSION_STATE_READY ||
+                ((stateEvent->state == XR_SESSION_STATE_SYNCHRONIZED ||
+                  stateEvent->state == XR_SESSION_STATE_VISIBLE ||
+                  stateEvent->state == XR_SESSION_STATE_FOCUSED) && !sessionRunning)) {
+                XrSessionBeginInfo beginInfo = {
+                    .type = XR_TYPE_SESSION_BEGIN_INFO,
+                    .primaryViewConfigurationType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO,
+                };
+                XrResult r = xrBeginSession(session, &beginInfo);
+                LOGI("xrBeginSession resultado: %d (0=SUCCESS)", (int)r);
+                if (XR_SUCCEEDED(r)) {
+                    sessionRunning = true;
+                    LOGI("=== OpenXR SESSION ACTIVA Y RENDERIZANDO ===");
+                }
+            } else if (stateEvent->state == XR_SESSION_STATE_STOPPING) {
+                if (sessionRunning) {
+                    xrEndSession(session);
+                    sessionRunning = false;
+                    LOGI("=== OpenXR SESSION DETENIDA (STOPPING) ===");
+                }
+            } else if (stateEvent->state == XR_SESSION_STATE_EXITING ||
+                       stateEvent->state == XR_SESSION_STATE_LOSS_PENDING) {
+                LOGI("=== OpenXR SESSION SALIENDO (EXITING/LOSS) ===");
+                s_running = false;
+            }
+        }
+        eventData.type = XR_TYPE_EVENT_DATA_BUFFER;
+    }
+    return s_running;
+}
+
+/// ANCLAJE ESPACIAL A LA MESA REAL (XR_BD_spatial_*).
+///
+/// Se actualiza una vez por frame: el modulo devuelve la pose del ancla en
+/// STAGE.  Si la hay, esa pose pasa a ser la base del diorama; si no, se sigue
+/// con la ruta habitual de STAGE.
+static void actualizar_anclaje_espacial(XrFrameState& frameState) {
+    if (!xfv::ancla_espacial_disponible()) return;
+
+    // La primera vez se pide la deteccion de superficies: el usuario puede
+    // volver a pedirla con el boton "Re-anclando mesa".
+    if (!s_ancla_preparado) {
+        s_ancla_preparado = true;
+        if (xfv::ancla_espacial_preparar_mesa()) {
+            LOGI("Anclaje espacial: buscando la mesa real...");
+        } else {
+            LOGI("Anclaje espacial: no se pudo arrancar la deteccion (%s)",
+                 xfv::ancla_espacial_estado());
+        }
+    }
+    if (xfv::ancla_espacial_actualizar(frameState)) {
+        float m_ancla[16];
+        xfv::ancla_espacial_matriz(m_ancla);
+        // El yaw del ancla se saca de su eje X (columna 0 de la matriz,
+        // column-major): yaw = atan2(-z, x).
+        const float yaw_ancla = atan2f(-m_ancla[2], m_ancla[0]);
+        const bool primera_vez = !s_ancla_activa;
+        memcpy(s_ancla_mat, m_ancla, sizeof(s_ancla_mat));
+        s_ancla_yaw = yaw_ancla;
+        if (primera_vez) {
+            // El yaw del usuario pasa a ser LOCAL respecto al ancla: a partir
+            // de aqui la mesa sigue la orientacion detectada.
+            s_table_yaw_local = s_table_yaw - yaw_ancla;
+        }
+        s_table_yaw = yaw_ancla + s_table_yaw_local;
+        // La mesa se Situa sobre la superficie detectada.
+        s_table_pos.x = m_ancla[12];
+        s_table_pos.y = m_ancla[13];
+        s_table_pos.z = m_ancla[14];
+        s_ancla_activa = true;
+        s_table_placed = true;
+        update_table_matrix();
+        if (primera_vez) {
+            LOGI("=== MESA ANCLADA A LA MESA REAL: pos=(%.2f, %.2f, %.2f) yaw=%.2f (%s) ===",
+                 s_table_pos.x, s_table_pos.y, s_table_pos.z, s_table_yaw,
+                 xfv::ancla_espacial_estado());
+        }
+    } else if (s_ancla_activa) {
+        // Se perdio el tracking: se vuelve a la ruta habitual (STAGE)
+        // conservando la ultima pose conocida.
+        s_ancla_activa = false;
+        LOGI("Anclaje perdido (%s): la mesa vuelve al STAGE",
+             xfv::ancla_espacial_estado());
+        update_table_matrix();
+    }
+}
+
+/// Estado de la entrada del mando en un frame.
+///
+/// Se lee una vez por frame y se pasa a las funciones que la necesitan: asi
+/// el bucle principal no mezcla "leer el mando" con "mover la mesa".
+struct EntradaMando {
+    XrSpaceLocation rightAimLoc{};
+    XrSpaceLocation leftAimLoc{};
+    bool rightAimValid = false;
+    bool leftAimValid = false;
+    bool trigger_pressed = false;
+    bool trigger_clicked = false;
+    bool grip_clicked = false;
+    XrActionStateVector2f stick{};
+    XrActionStateFloat grip{};
+    XrActionStateFloat leftGrip{};
+};
+
+/// Lee el mando: sincroniza las acciones, consulta puntero y botones, aplica
+/// el gesto diferido (armar/soltar) y mueve el centro de vista con el stick.
+static EntradaMando leer_entrada_mando(
+    XrSession session,
+    XrActionSet actionSet,
+    XrSpace rightAimSpace,
+    XrSpace leftAimSpace,
+    XrSpace appSpace,
+    XrTime predictedDisplayTime,
+    XrAction rightTrigAction,
+    XrAction rightGripAction,
+    XrAction rightStickAction,
+    XrAction leftStickAction,
+    XrAction leftGripAction,
+    bool& prev_trigger,
+    bool& prev_grip,
+    float dt_seconds) {
+    EntradaMando e;
+
+    // Sincronizar acciones del mando
+    XrActiveActionSet activeSet = { .actionSet = actionSet };
+    XrActionsSyncInfo syncInfo = {
+        .type = XR_TYPE_ACTIONS_SYNC_INFO,
+        .countActiveActionSets = 1,
+        .activeActionSets = &activeSet,
+    };
+    xrSyncActions(session, &syncInfo);
+
+    // Consultar puntero 6DoF
+    xrLocateSpace(rightAimSpace, appSpace, predictedDisplayTime, &e.rightAimLoc);
+    e.rightAimValid = (e.rightAimLoc.locationFlags & XR_SPACE_LOCATION_POSITION_VALID_BIT) &&
+                       (e.rightAimLoc.locationFlags & XR_SPACE_LOCATION_ORIENTATION_VALID_BIT);
+
+    // Consultar botones del mando
+    XrActionStateFloat trigState = { .type = XR_TYPE_ACTION_STATE_FLOAT };
+    XrActionStateGetInfo getTrig = { .type = XR_TYPE_ACTION_STATE_GET_INFO, .action = rightTrigAction };
+    xrGetActionStateFloat(session, &getTrig, &trigState);
+    e.trigger_pressed = (trigState.currentState > 0.5f);
+    e.trigger_clicked = e.trigger_pressed && !prev_trigger;
+    const bool trigger_released = !e.trigger_pressed && prev_trigger;
+    prev_trigger = e.trigger_pressed;
+
+    XrActionStateFloat gripState = { .type = XR_TYPE_ACTION_STATE_FLOAT };
+    XrActionStateGetInfo getGrip = { .type = XR_TYPE_ACTION_STATE_GET_INFO, .action = rightGripAction };
+    xrGetActionStateFloat(session, &getGrip, &gripState);
+    e.grip = gripState;
+    e.grip_clicked = (gripState.currentState > 0.5f) && !prev_grip;
+    const bool grip_released = !(gripState.currentState > 0.5f) && prev_grip;
+    prev_grip = (gripState.currentState > 0.5f);
+
+    // GESTO DIFERIDO (patron de Generals-Zero-Hour-XR): al apretar el
+    // gatillo la accion se ARMA (eso lo hace el motor de VR cuando dibuja),
+    // y aqui, cuando el dedo se levanta, se EJECUTA.
+    //
+    // Asi un roce o un movimiento de la mano no hacen nada por error, y el
+    // usuario ve la accion preparada antes de que ocurra.
+    if (s_vr_hand_release) {
+        if (trigger_released) s_vr_hand_release(0u);
+        if (grip_released) s_vr_hand_release(1u);
+    }
+
+    // SOLTAR el clic XFCE: se suelta en la MISMA posicion donde se armo
+    // (el motor necesita ver pulsacion y soltura del raton en el mismo
+    // punto para aplicar sus reglas de seleccion, fantasma y rotacion).
+    if (trigger_released && s_juego_click_armado) {
+        s_juego_click_armado = false;
+        // SOLTAR: accion = 2 (boton arriba).  El modulo reutiliza la
+        // posicion armada, asi que se le pasa la misma.
+        xfv::puente_entrada_suelta(s_juego_click_x, s_juego_click_y, 1);
+        LOGI("Clic XFCE SOLTADO en pixel (%d, %d) del motor",
+             s_juego_click_x, s_juego_click_y);
+    }
+
+    XrActionStateVector2f stickState = { .type = XR_TYPE_ACTION_STATE_VECTOR2F };
+    XrActionStateGetInfo getStick = { .type = XR_TYPE_ACTION_STATE_GET_INFO, .action = rightStickAction };
+    xrGetActionStateVector2f(session, &getStick, &stickState);
+    e.stick = stickState;
+
+    // Desplazamiento de la ventana de mapa con el joystick izquierdo.
+    // Permite explorar la fabrica mas alla de las casillas iniciales.
+    // El stick derecho queda para la altura de la mesa y el giro de colocacion.
+    XrActionStateVector2f leftStickState = { .type = XR_TYPE_ACTION_STATE_VECTOR2F };
+    XrActionStateGetInfo getLeftStick = { .type = XR_TYPE_ACTION_STATE_GET_INFO, .action = leftStickAction };
+    xrGetActionStateVector2f(session, &getLeftStick, &leftStickState);
+
+    if (s_pan_view) {
+        const float deadzone = 0.18f;
+        float stick_len = sqrtf(leftStickState.currentState.x * leftStickState.currentState.x +
+                                leftStickState.currentState.y * leftStickState.currentState.y);
+        if (stick_len > deadzone) {
+            // El desplazamiento se escala por el tiempo real del frame para
+            // que la velocidad de exploracion sea igual a 60 y 90 Hz.
+            float pan_speed = 9.0f * dt_seconds;
+            s_pan_view(leftStickState.currentState.x * pan_speed,
+                       leftStickState.currentState.y * pan_speed);
+        }
+    }
+
+    // El centro de vista vive en Rust (lo usa el radio del snapshot RCON).
+    // Se relee para que el render y la consulta al motor nunca divergan.
+    if (s_get_view_center) {
+        float cx = 0.0f, cy = 0.0f;
+        if (s_get_view_center(&cx, &cy)) {
+            s_view_pan_x = cx;
+            s_view_pan_y = cy;
+        }
+    }
+
+    XrActionStateFloat leftGripState = { .type = XR_TYPE_ACTION_STATE_FLOAT };
+    XrActionStateGetInfo getLeftGrip = { .type = XR_TYPE_ACTION_STATE_GET_INFO, .action = leftGripAction };
+    xrGetActionStateFloat(session, &getLeftGrip, &leftGripState);
+    e.leftGrip = leftGripState;
+
+    xrLocateSpace(leftAimSpace, appSpace, predictedDisplayTime, &e.leftAimLoc);
+    e.leftAimValid = (e.leftAimLoc.locationFlags & XR_SPACE_LOCATION_POSITION_VALID_BIT);
+
+    return e;
+}
+
+/// Aplica los gestos que mueven la mesa: zoom y giro con las dos manos,
+/// agarre monomanual, altura y giro de la herramienta de colocacion.
+static void aplicar_gestos_mesa(const EntradaMando& e) {
+    // 1. Interacción Bimanual: Zoom y Rotación con Dos Manos (Generals XR pattern)
+    bool both_grips = e.rightAimValid && e.leftAimValid &&
+                      (e.grip.currentState > 0.5f) && (e.leftGrip.currentState > 0.5f);
+
+    if (both_grips) {
+        float dx = e.rightAimLoc.pose.position.x - e.leftAimLoc.pose.position.x;
+        float dy = e.rightAimLoc.pose.position.y - e.leftAimLoc.pose.position.y;
+        float dz = e.rightAimLoc.pose.position.z - e.leftAimLoc.pose.position.z;
+        float dist = sqrtf(dx * dx + dy * dy + dz * dz);
+        float angle = atan2f(dz, dx);
+
+        if (!s_dual_grip_active) {
+            s_dual_grip_active = true;
+            s_dual_grip_initial_dist = fmaxf(dist, 0.05f);
+            s_dual_grip_initial_scale = s_table_scale;
+            s_dual_grip_initial_angle = angle;
+            s_dual_grip_initial_yaw = s_table_yaw;
+        } else {
+            // Escalar (Pinch-to-zoom con las dos manos)
+            float ratio = dist / s_dual_grip_initial_dist;
+            s_table_scale = fminf(fmaxf(s_dual_grip_initial_scale * ratio, 0.25f), 4.0f);
+
+            // Rotar sobre eje vertical Y con las dos manos
+            float delta_angle = angle - s_dual_grip_initial_angle;
+            s_table_yaw = s_dual_grip_initial_yaw - delta_angle;
+            // Con ancla a la mesa real el yaw del usuario es local: se
+            // guarda respecto al ancla, no respecto al STAGE.
+            if (s_ancla_activa) {
+                s_table_yaw_local = s_table_yaw - s_ancla_yaw;
+            }
+
+            update_table_matrix();
+        }
+    } else if (s_dual_grip_active) {
+        s_dual_grip_active = false;
+        save_tabletop_layout();
+    } else if (e.rightAimValid && e.grip.currentState > 0.5f && !e.grip_clicked) {
+        // 2. Agarre y arrastre monomanual de la mesa (XrSurfaceGrab)
+        if (!s_table_grabbed) {
+            s_table_grabbed = true;
+            s_grab_start_hand = e.rightAimLoc.pose.position;
+            s_grab_start_table = s_table_pos;
+        } else {
+            s_table_pos.x = s_grab_start_table.x + (e.rightAimLoc.pose.position.x - s_grab_start_hand.x);
+            s_table_pos.y = s_grab_start_table.y + (e.rightAimLoc.pose.position.y - s_grab_start_hand.y);
+            s_table_pos.z = s_grab_start_table.z + (e.rightAimLoc.pose.position.z - s_grab_start_hand.z);
+
+            update_table_matrix();
+        }
+    } else if (e.grip.currentState <= 0.5f) {
+        if (s_table_grabbed) {
+            s_table_grabbed = false;
+            save_tabletop_layout();
+        }
+    }
+
+    // 2. Rotación de herramienta de colocación con Joystick X o ajuste de altura con Y
+    if (!s_table_grabbed && !s_observer_mode) {
+        if (fabsf(e.stick.currentState.y) > 0.2f) {
+            s_table_pos.y += e.stick.currentState.y * 0.004f;
+            update_table_matrix();
+        }
+        if (fabsf(e.stick.currentState.x) > 0.6f && !s_stick_rotated) {
+            s_placement_yaw += (e.stick.currentState.x > 0.0f) ? 1.5707963f : -1.5707963f;
+            s_stick_rotated = true;
+            LOGI("Rotación de colocación 6DoF: yaw=%.2f", s_placement_yaw);
+        } else if (fabsf(e.stick.currentState.x) < 0.2f) {
+            s_stick_rotated = false;
+        }
+    } else if (s_observer_mode) {
+        // Desplazamiento a pie en modo observador humano
+        if (fabsf(e.stick.currentState.y) > 0.15f || fabsf(e.stick.currentState.x) > 0.15f) {
+            s_observer_pos.z -= e.stick.currentState.y * 0.04f;
+            s_observer_pos.x += e.stick.currentState.x * 0.04f;
+        }
+    }
+}
+
 static void* openxr_thread_main(void* arg) {
     ANativeActivity* activity = (ANativeActivity*)arg;
     LOGI("=== Iniciando hilo OpenXR Standalone para Pico 4 Ultra ===");
@@ -3058,6 +3623,16 @@ static void* openxr_thread_main(void* arg) {
     if (pthread_create(&s_game_thread, nullptr, game_receiver_thread, nullptr) != 0) {
         LOGE("No se pudo arrancar el hilo receptor del render del juego");
         s_game_corriendo.store(false);
+    }
+
+    // Puente de entrada (protocolo XFCE): aqui el APK es el CLIENTE y el
+    // inyector (dentro del motor) el SERVIDOR.  Por este canal viajan los
+    // clics que hace la mano del VR sobre el frame del motor.
+    if (xfv::puente_entrada_iniciar("127.0.0.1", 27021)) {
+        LOGI("Puente de entrada XFCE arrancado (127.0.0.1:27021)");
+    } else {
+        LOGE("No se pudo arrancar el puente de entrada XFCE: %s",
+             xfv::puente_entrada_ultimo_error());
     }
 
     // 1. Inicializar Loader Android
@@ -3103,6 +3678,13 @@ static void* openxr_thread_main(void* arg) {
         "XR_BD_controller_interaction",
         "XR_EXT_performance_settings",
         "XR_FB_display_refresh_rate",
+        // Sensing espacial de ByteDance: sin pedir estas en la instancia el
+        // runtime devuelve XR_ERROR_FEATURE_UNSUPPORTED y no hay anclaje a
+        // la mesa real (ver ADR-014).
+        "XR_BD_spatial_sensing",
+        "XR_BD_spatial_anchor",
+        "XR_BD_spatial_plane",
+        "XR_BD_spatial_scene",
     };
 
     std::vector<const char*> enabledExtensions;
@@ -3208,6 +3790,16 @@ static void* openxr_thread_main(void* arg) {
     eglMakeCurrent(egl_display, egl_surface, egl_surface, egl_context);
     LOGI("Contexto EGL / OpenGL ES 3.2 creado y activo");
 
+    // El renderer 3D del visor necesita el contexto GL corriente: se prepara
+    // una sola vez, aqui.
+    if (s_3d_iniciar) {
+        if (s_3d_iniciar()) {
+            LOGI("Renderer 3D instanciado listo (modelos GLB por prototipo)");
+        } else {
+            LOGE("El renderer 3D no arranco: las maquinas se veran con su sprite 2D");
+        }
+    }
+
     // 6. Crear XrSession
     XrGraphicsBindingOpenGLESAndroidKHR glesBinding = {
         .type = XR_TYPE_GRAPHICS_BINDING_OPENGL_ES_ANDROID_KHR,
@@ -3231,6 +3823,16 @@ static void* openxr_thread_main(void* arg) {
         return nullptr;
     }
     LOGI("XrSession creada exitosamente");
+
+    // 6.0 Anclaje espacial a la mesa real (XR_BD_spatial_*).
+    // Si el runtime no expone las extensiones, el modulo queda inactivo y el
+    // visor sigue con el STAGE de siempre (nunca se rompe nada).
+    if (xfv::ancla_espacial_iniciar(instance, session, systemId)) {
+        LOGI("Anclaje espacial activo (%s)", xfv::ancla_espacial_estado());
+    } else {
+        LOGI("Anclaje espacial NO disponible (%s): se sigue con STAGE",
+             xfv::ancla_espacial_estado());
+    }
 
     // 6.1 Capa de Passthrough (XR_FB_passthrough)
     // La capa de passthrough debe ir PRIMERA en el arreglo de capas de xrEndFrame:
@@ -3510,6 +4112,24 @@ static void* openxr_thread_main(void* arg) {
     init_tabletop_scene();
     init_audio_system();
 
+    // SGSR (upscaling de Qualcomm): la escena se dibuja a 1440x1440 y se
+    // reescala a la resolucion del visor (2160x2160 en la Pico 4 Ultra).
+    // Solo se usa si el modulo Rust lo deja preparado: si falla, se dibuja
+    // directamente al framebuffer del visor como siempre.
+    if (s_sgsr_preparar) {
+        const uint32_t ancho_entrada = 1440;
+        const uint32_t alto_entrada = 1440;
+        if (s_sgsr_preparar((int)ancho_entrada, (int)alto_entrada,
+                            (int)swapchains[0].width, (int)swapchains[0].height)) {
+            s_sgsr_entrada_w = (int)ancho_entrada;
+            s_sgsr_entrada_h = (int)alto_entrada;
+            LOGI("SGSR listo: %dx%d -> %dx%d", ancho_entrada, alto_entrada,
+                 swapchains[0].width, swapchains[0].height);
+        } else {
+            LOGE("SGSR no disponible: se dibuja directo al visor");
+        }
+    }
+
     // 9. Bucle de ejecución
     bool sessionRunning = false;
     s_running = true;
@@ -3525,38 +4145,8 @@ static void* openxr_thread_main(void* arg) {
     while (s_running) {
         pump_android_input_queue();
 
-        XrEventDataBuffer eventData = { .type = XR_TYPE_EVENT_DATA_BUFFER };
-        while (xrPollEvent(instance, &eventData) == XR_SUCCESS) {
-            if (eventData.type == XR_TYPE_EVENT_DATA_SESSION_STATE_CHANGED) {
-                auto* stateEvent = (XrEventDataSessionStateChanged*)&eventData;
-                LOGI("OpenXR SessionStateChanged: estado=%d (actual_running=%d)", (int)stateEvent->state, sessionRunning ? 1 : 0);
-                if (stateEvent->state == XR_SESSION_STATE_READY ||
-                    ((stateEvent->state == XR_SESSION_STATE_SYNCHRONIZED ||
-                      stateEvent->state == XR_SESSION_STATE_VISIBLE ||
-                      stateEvent->state == XR_SESSION_STATE_FOCUSED) && !sessionRunning)) {
-                    XrSessionBeginInfo beginInfo = {
-                        .type = XR_TYPE_SESSION_BEGIN_INFO,
-                        .primaryViewConfigurationType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO,
-                    };
-                    XrResult r = xrBeginSession(session, &beginInfo);
-                    LOGI("xrBeginSession resultado: %d (0=SUCCESS)", (int)r);
-                    if (XR_SUCCEEDED(r)) {
-                        sessionRunning = true;
-                        LOGI("=== OpenXR SESSION ACTIVA Y RENDERIZANDO ===");
-                    }
-                } else if (stateEvent->state == XR_SESSION_STATE_STOPPING) {
-                    if (sessionRunning) {
-                        xrEndSession(session);
-                        sessionRunning = false;
-                        LOGI("=== OpenXR SESSION DETENIDA (STOPPING) ===");
-                    }
-                } else if (stateEvent->state == XR_SESSION_STATE_EXITING ||
-                           stateEvent->state == XR_SESSION_STATE_LOSS_PENDING) {
-                    LOGI("=== OpenXR SESSION SALIENDO (EXITING/LOSS) ===");
-                    s_running = false;
-                }
-            }
-            eventData.type = XR_TYPE_EVENT_DATA_BUFFER;
+        if (!procesar_eventos_sesion(instance, session, sessionRunning)) {
+            break;
         }
 
         if (!sessionRunning) {
@@ -3578,6 +4168,8 @@ static void* openxr_thread_main(void* arg) {
                 dt_seconds = 0.016f;
             }
         }
+
+        actualizar_anclaje_espacial(frameState);
 
         XrFrameBeginInfo beginInfo = { .type = XR_TYPE_FRAME_BEGIN_INFO };
         xrBeginFrame(session, &beginInfo);
@@ -3617,7 +4209,7 @@ static void* openxr_thread_main(void* arg) {
         }
 
         // Anclar mesa en el mundo real en el primer frame válido
-        if (!s_table_placed && (viewState.viewStateFlags & XR_VIEW_STATE_POSITION_VALID_BIT)) {
+        if (!s_table_placed && !s_ancla_activa && (viewState.viewStateFlags & XR_VIEW_STATE_POSITION_VALID_BIT)) {
             float hx = (views[0].pose.position.x + views[1].pose.position.x) * 0.5f;
             float hy = (views[0].pose.position.y + views[1].pose.position.y) * 0.5f;
             float hz = (views[0].pose.position.z + views[1].pose.position.z) * 0.5f;
@@ -3636,6 +4228,7 @@ static void* openxr_thread_main(void* arg) {
             }
 
             s_table_yaw = atan2f(-fx, -fz);
+            s_table_yaw_local = s_table_yaw;
 
             float rot[16], trans[16];
             mat4_rotate_y(rot, s_table_yaw);
@@ -3647,161 +4240,15 @@ static void* openxr_thread_main(void* arg) {
                  s_table_pos.x, s_table_pos.y, s_table_pos.z, s_table_yaw);
         }
 
-        // Sincronizar acciones del mando
-        XrActiveActionSet activeSet = { .actionSet = actionSet };
-        XrActionsSyncInfo syncInfo = {
-            .type = XR_TYPE_ACTIONS_SYNC_INFO,
-            .countActiveActionSets = 1,
-            .activeActionSets = &activeSet,
-        };
-        xrSyncActions(session, &syncInfo);
-
-        // Consultar puntero 6DoF
-        XrSpaceLocation rightAimLoc = { .type = XR_TYPE_SPACE_LOCATION };
-        xrLocateSpace(rightAimSpace, appSpace, frameState.predictedDisplayTime, &rightAimLoc);
-        bool rightAimValid = (rightAimLoc.locationFlags & XR_SPACE_LOCATION_POSITION_VALID_BIT) &&
-                             (rightAimLoc.locationFlags & XR_SPACE_LOCATION_ORIENTATION_VALID_BIT);
-
-        // Consultar botones del mando
-        XrActionStateFloat trigState = { .type = XR_TYPE_ACTION_STATE_FLOAT };
-        XrActionStateGetInfo getTrig = { .type = XR_TYPE_ACTION_STATE_GET_INFO, .action = rightTrigAction };
-        xrGetActionStateFloat(session, &getTrig, &trigState);
-        bool trigger_pressed = (trigState.currentState > 0.5f);
-        bool trigger_clicked = trigger_pressed && !prev_trigger;
-        bool trigger_released = !trigger_pressed && prev_trigger;
-        prev_trigger = trigger_pressed;
-
-        XrActionStateFloat gripState = { .type = XR_TYPE_ACTION_STATE_FLOAT };
-        XrActionStateGetInfo getGrip = { .type = XR_TYPE_ACTION_STATE_GET_INFO, .action = rightGripAction };
-        xrGetActionStateFloat(session, &getGrip, &gripState);
-        bool grip_pressed = (gripState.currentState > 0.5f);
-        bool grip_clicked = grip_pressed && !prev_grip;
-        bool grip_released = !grip_pressed && prev_grip;
-        prev_grip = grip_pressed;
-
-        // GESTO DIFERIDO (patron de Generals-Zero-Hour-XR): al apretar el
-        // gatillo la accion se ARMA (eso lo hace el motor de VR cuando dibuja),
-        // y aqui, cuando el dedo se levanta, se EJECUTA.
-        //
-        // Asi un roce o un movimiento de la mano no hacen nada por error, y el
-        // usuario ve la accion preparada antes de que ocurra.
-        if (s_vr_hand_release) {
-            if (trigger_released) s_vr_hand_release(0u);
-            if (grip_released) s_vr_hand_release(1u);
-        }
-
-        XrActionStateVector2f stickState = { .type = XR_TYPE_ACTION_STATE_VECTOR2F };
-        XrActionStateGetInfo getStick = { .type = XR_TYPE_ACTION_STATE_GET_INFO, .action = rightStickAction };
-        xrGetActionStateVector2f(session, &getStick, &stickState);
-
-        // Desplazamiento de la ventana de mapa con el joystick izquierdo.
-        // Permite explorar la fabrica mas alla de las casillas iniciales.
-        // El stick derecho queda para la altura de la mesa y el giro de colocacion.
-        XrActionStateVector2f leftStickState = { .type = XR_TYPE_ACTION_STATE_VECTOR2F };
-        XrActionStateGetInfo getLeftStick = { .type = XR_TYPE_ACTION_STATE_GET_INFO, .action = leftStickAction };
-        xrGetActionStateVector2f(session, &getLeftStick, &leftStickState);
-
-        if (s_pan_view) {
-            const float deadzone = 0.18f;
-            float stick_len = sqrtf(leftStickState.currentState.x * leftStickState.currentState.x +
-                                    leftStickState.currentState.y * leftStickState.currentState.y);
-            if (stick_len > deadzone) {
-                // El desplazamiento se escala por el tiempo real del frame para
-                // que la velocidad de exploracion sea igual a 60 y 90 Hz.
-                float pan_speed = 9.0f * dt_seconds;
-                s_pan_view(leftStickState.currentState.x * pan_speed,
-                           leftStickState.currentState.y * pan_speed);
-            }
-        }
-
-        // El centro de vista vive en Rust (lo usa el radio del snapshot RCON).
-        // Se relee para que el render y la consulta al motor nunca divergan.
-        if (s_get_view_center) {
-            float cx = 0.0f, cy = 0.0f;
-            if (s_get_view_center(&cx, &cy)) {
-                s_view_pan_x = cx;
-                s_view_pan_y = cy;
-            }
-        }
-
-        XrActionStateFloat leftGripState = { .type = XR_TYPE_ACTION_STATE_FLOAT };
-        XrActionStateGetInfo getLeftGrip = { .type = XR_TYPE_ACTION_STATE_GET_INFO, .action = leftGripAction };
-        xrGetActionStateFloat(session, &getLeftGrip, &leftGripState);
-
-        XrSpaceLocation leftAimLoc = { .type = XR_TYPE_SPACE_LOCATION };
-        xrLocateSpace(leftAimSpace, appSpace, frameState.predictedDisplayTime, &leftAimLoc);
-        bool leftAimValid = (leftAimLoc.locationFlags & XR_SPACE_LOCATION_POSITION_VALID_BIT);
-
-        // 1. Interacción Bimanual: Zoom y Rotación con Dos Manos (Generals XR pattern)
-        bool both_grips = rightAimValid && leftAimValid && (gripState.currentState > 0.5f) && (leftGripState.currentState > 0.5f);
-
-        if (both_grips) {
-            float dx = rightAimLoc.pose.position.x - leftAimLoc.pose.position.x;
-            float dy = rightAimLoc.pose.position.y - leftAimLoc.pose.position.y;
-            float dz = rightAimLoc.pose.position.z - leftAimLoc.pose.position.z;
-            float dist = sqrtf(dx * dx + dy * dy + dz * dz);
-            float angle = atan2f(dz, dx);
-
-            if (!s_dual_grip_active) {
-                s_dual_grip_active = true;
-                s_dual_grip_initial_dist = fmaxf(dist, 0.05f);
-                s_dual_grip_initial_scale = s_table_scale;
-                s_dual_grip_initial_angle = angle;
-                s_dual_grip_initial_yaw = s_table_yaw;
-            } else {
-                // Escalar (Pinch-to-zoom con las dos manos)
-                float ratio = dist / s_dual_grip_initial_dist;
-                s_table_scale = fminf(fmaxf(s_dual_grip_initial_scale * ratio, 0.25f), 4.0f);
-
-                // Rotar sobre eje vertical Y con las dos manos
-                float delta_angle = angle - s_dual_grip_initial_angle;
-                s_table_yaw = s_dual_grip_initial_yaw - delta_angle;
-
-                update_table_matrix();
-            }
-        } else if (s_dual_grip_active) {
-            s_dual_grip_active = false;
-            save_tabletop_layout();
-        } else if (rightAimValid && gripState.currentState > 0.5f && !grip_clicked) {
-            // 2. Agarre y arrastre monomanual de la mesa (XrSurfaceGrab)
-            if (!s_table_grabbed) {
-                s_table_grabbed = true;
-                s_grab_start_hand = rightAimLoc.pose.position;
-                s_grab_start_table = s_table_pos;
-            } else {
-                s_table_pos.x = s_grab_start_table.x + (rightAimLoc.pose.position.x - s_grab_start_hand.x);
-                s_table_pos.y = s_grab_start_table.y + (rightAimLoc.pose.position.y - s_grab_start_hand.y);
-                s_table_pos.z = s_grab_start_table.z + (rightAimLoc.pose.position.z - s_grab_start_hand.z);
-
-                update_table_matrix();
-            }
-        } else if (gripState.currentState <= 0.5f) {
-            if (s_table_grabbed) {
-                s_table_grabbed = false;
-                save_tabletop_layout();
-            }
-        }
-
-        // 2. Rotación de herramienta de colocación con Joystick X o ajuste de altura con Y
-        if (!s_table_grabbed && !s_observer_mode) {
-            if (fabsf(stickState.currentState.y) > 0.2f) {
-                s_table_pos.y += stickState.currentState.y * 0.004f;
-                update_table_matrix();
-            }
-            if (fabsf(stickState.currentState.x) > 0.6f && !s_stick_rotated) {
-                s_placement_yaw += (stickState.currentState.x > 0.0f) ? 1.5707963f : -1.5707963f;
-                s_stick_rotated = true;
-                LOGI("Rotación de colocación 6DoF: yaw=%.2f", s_placement_yaw);
-            } else if (fabsf(stickState.currentState.x) < 0.2f) {
-                s_stick_rotated = false;
-            }
-        } else if (s_observer_mode) {
-            // Desplazamiento a pie en modo observador humano
-            if (fabsf(stickState.currentState.y) > 0.15f || fabsf(stickState.currentState.x) > 0.15f) {
-                s_observer_pos.z -= stickState.currentState.y * 0.04f;
-                s_observer_pos.x += stickState.currentState.x * 0.04f;
-            }
-        }
+        // Leer el mando y aplicar los gestos que mueven la mesa.
+        EntradaMando entrada = leer_entrada_mando(
+            session, actionSet,
+            rightAimSpace, leftAimSpace, appSpace,
+            frameState.predictedDisplayTime,
+            rightTrigAction, rightGripAction, rightStickAction,
+            leftStickAction, leftGripAction,
+            prev_trigger, prev_grip, dt_seconds);
+        aplicar_gestos_mesa(entrada);
 
         anim_time += dt_seconds;
 
@@ -3815,8 +4262,18 @@ static void* openxr_thread_main(void* arg) {
             XrSwapchainImageWaitInfo waitImg = { .type = XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO, .timeout = XR_INFINITE_DURATION };
             xrWaitSwapchainImage(swapchains[i].handle, &waitImg);
 
-            glBindFramebuffer(GL_FRAMEBUFFER, swapchains[i].fbos[imgIndex]);
-            glViewport(0, 0, swapchains[i].width, swapchains[i].height);
+            // SGSR (upscaling de Qualcomm): si esta preparado, la escena se
+            // dibuja a la resolucion interna (mas nitida de lo que da la GPU
+            // sola) y luego se reescala al framebuffer del visor.
+            const bool usar_sgsr = (s_sgsr_fbo != nullptr && s_sgsr_escalar != nullptr &&
+                                    s_sgsr_fbo() != 0);
+            if (usar_sgsr) {
+                glBindFramebuffer(GL_FRAMEBUFFER, s_sgsr_fbo());
+                glViewport(0, 0, s_sgsr_entrada_w, s_sgsr_entrada_h);
+            } else {
+                glBindFramebuffer(GL_FRAMEBUFFER, swapchains[i].fbos[imgIndex]);
+                glViewport(0, 0, swapchains[i].width, swapchains[i].height);
+            }
 
             glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
             glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
@@ -3826,7 +4283,16 @@ static void* openxr_thread_main(void* arg) {
             mat4_view_from_pose(views[i].pose, viewMat);
             mat4_multiply(proj, viewMat, vp_mat);
 
-            draw_tabletop_scene(vp_mat, anim_time, dt_seconds, rightAimLoc.pose, rightAimValid, trigger_clicked, (trigState.currentState > 0.5f), grip_clicked, (i == 0), session, rightHapticAction);
+            draw_tabletop_scene(vp_mat, anim_time, dt_seconds, entrada.rightAimLoc.pose, entrada.rightAimValid, entrada.trigger_clicked, entrada.trigger_pressed, entrada.grip_clicked, (i == 0), session, rightHapticAction);
+
+            if (usar_sgsr) {
+                // Se reescala la escena interna al framebuffer del visor.
+                glBindFramebuffer(GL_FRAMEBUFFER, swapchains[i].fbos[imgIndex]);
+                glViewport(0, 0, swapchains[i].width, swapchains[i].height);
+                glDisable(GL_DEPTH_TEST);
+                s_sgsr_escalar();
+                glEnable(GL_DEPTH_TEST);
+            }
 
             XrSwapchainImageReleaseInfo relInfo = { .type = XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO };
             xrReleaseSwapchainImage(swapchains[i].handle, &relInfo);
@@ -3892,6 +4358,10 @@ static void* openxr_thread_main(void* arg) {
         pthread_join(s_game_thread, nullptr);
         s_game_thread = 0;
     }
+
+    // Y el puente de entrada tambien.
+    xfv::puente_entrada_cerrar();
+    LOGI("Puente de entrada XFCE cerrado");
 
     activity->vm->DetachCurrentThread();
     LOGI("=== Hilo OpenXR finalizado ===");

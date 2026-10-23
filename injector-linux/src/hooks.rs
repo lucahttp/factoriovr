@@ -257,11 +257,20 @@ pub fn instalar() {
     // Se instala siempre: el hook de `AssemblingMachine::draw` es independiente
     // del resto y no toca nada del juego si `XFACTORVR_3D=0`.
     crate::modelo3d::configurar();
+    // El registro de modelos 3D (manifiesto + directorio).  Se carga antes de
+    // instalar los hooks: los hooks de entidad necesitan saber que modelos
+    // hay para mapear el prototipo de cada entidad.
+    crate::render3d::configurar();
     crate::modelo3d::instalar(&simbolos);
 
     // --- envio de la imagen real del juego al visor VR ---
     // Se activa con `XFACTORVR_STREAM=host:puerto`. Si no esta, no hace nada.
     crate::stream::configurar();
+
+    // --- puente de entrada: la mano del VR entra como el raton del motor ---
+    // Se activa con `XFACTORVR_ENTRADA_PUERTO`. Con esto el motor deja de
+    // necesitar comandos: recibe un raton y decide el (ver docs/ADR-013).
+    crate::entrada::instalar(&simbolos);
 
     // --- resolver ---
     let encontrado = match simbolos.resolver(&objetivo) {

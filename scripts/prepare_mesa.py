@@ -42,10 +42,32 @@ PAQUETES = [
     # glvnd: el runtime que despacha las llamadas de GL.  Sin el,
     # libGL.so.1 no se puede cargar (le falta libGLdispatch.so.0) y el
     # cliente grafico se queda sin contexto: "Could not initialize OpenGL".
-    "libglvnd0", "libeglvnd0",
+    "libglvnd0", "libeglvnd0", "libglx0",
+    # OpenGL ES 2.0 (Mesa): es lo que usa el driver "offscreen" de SDL2, que
+    # es el unico que funciona en Android sin servidor X.  Sin esta libreria el
+    # cliente grafico arranca pero muere con "Could not initialize OpenGL /
+    # GLES library".
+    "libgles2-mesa", "libgles2",
     "libvulkan1", "mesa-vulkan-drivers", "mesa-zink", "libllvm15", "libsensors5",
     "libxcb1", "libx11-6", "libxau6", "libxdmcp6", "libxext6", "libbsd0",
     "libmd0",
+    # Dependencias DIRECTAS de zink_dri.so / libvulkan_*.so / libEGL_mesa.so.0.
+    # El enlazador las exige en el momento de cargar la libreria, asi que si
+    # falta una sola, el driver no carga y el cliente grafico muere con
+    # "Could not initialize OpenGL / GLES library". Con estas, ademas, el
+    # cliente puede abrir ventana de verdad en el visor (no solo en el
+    # contenedor, que ya traia la pila completa de Ubuntu).
+    "libexpat1", "libzstd1", "libelf1",
+    "libdrm-radeon1", "libdrm-amdgpu1", "libdrm-nouveau2",
+    "libxcb-dri3-0", "libxcb-dri2-0", "libxcb-present0", "libxcb-sync1",
+    "libxcb-randr0", "libxcb-xfixes0", "libxcb-shm0", "libxcb-glx0",
+    "libxshmfence1", "libx11-xcb1", "libxfixes3", "libxxf86vm1",
+    "libwayland-client0", "libwayland-server0",
+    # Dependencias de SEGUNDO NIVEL (las necesitan libLLVM-15, libwayland-*,
+    # libffi...).  El enlazador tambien las exige al cargar, asi que si faltan
+    # el vendor EGL de Mesa no llega a cargarse nunca.
+    "libffi8", "libedit2", "libtinfo6", "libxml2", "libz3-4",
+    "libicu72", "liblzma5",
     # SDL2 (el cliente lo lleva estatico, pero lo dejamos por si acaso)
     "libsdl2-2.0-0",
 ]
@@ -63,6 +85,8 @@ ESPERADOS = [
     "usr/lib/aarch64-linux-gnu/libvulkan.so.1",
     # lavapipe: Vulkan por software, para validar sin GPU.
     "usr/lib/aarch64-linux-gnu/libvulkan_lvp.so",
+    # OpenGL ES 2.0 de Mesa (para el driver "offscreen" de SDL2).
+    "usr/lib/aarch64-linux-gnu/libGLESv2.so.2",
     "usr/share/vulkan/icd.d/lvp_icd.aarch64.json",
     # El linker de glibc (Debian lo deja en /lib).
     # La glibc no va en este payload: la aporta el runtime del visor
@@ -172,8 +196,18 @@ def podar_alias_dri(out):
     (SELinux no deja crear enlaces duros en shell_data_file), dejando el
     payload a medias y el cliente grafico sin Zink.
 
-    Se queda solo el driver que se usa (zink) y se borran los alias: el
-    contenido es identico, asi que el nombre es lo unico que cambia."""
+    Se deja el driver que se usa (zink) y el resto de alias se CONVIERTE EN
+    ENLACES SIMBOLICOS al mismo fichero: el contenido es identico, asi que lo
+    unico que cambia es el nombre, y el nombre es justo lo que usa Mesa para
+    decidir que driver carga ("swrast_dri.so" para el software, "zink_dri.so"
+    para Zink).
+
+    OJO (bug encontrado el 2026-10-23): antes los alias se BORRABAN.  En el
+    visor eso dejaba a Mesa sin driver software, y como el visor no tiene
+    /dev/dri/renderD* (solo card0/card1), eglQueryDevicesEXT no encontraba
+    ningun device y SDL moria con "Could not find a valid EGL device to
+    initialize".  Con el alias swrast_dri.so presente, Mesa ofrece el device
+    software y el cliente grafico abre ventana."""
     dri = os.path.join(out, "usr", "lib", "aarch64-linux-gnu", "dri")
     if not os.path.isdir(dri):
         return 0
@@ -189,29 +223,60 @@ def podar_alias_dri(out):
             continue
         por_inodo.setdefault((st.st_dev, st.st_ino), []).append(f)
 
-    borrados = 0
+    # 1. Se limpian los enlaces simbolicos que hubiera de una ronda anterior:
+    #    pueden apuntar a un fichero que ya no existe (enlaces rotos).
+    for f in sorted(os.listdir(dri)):
+        p = os.path.join(dri, f)
+        if os.path.islink(p):
+            try:
+                os.remove(p)
+            except OSError:
+                pass
+
+    # 2. Se agrupan los ficheros reales por inodo (los alias del megadriver
+    #    son el mismo contenido).
+    por_inodo = {}
+    for f in sorted(os.listdir(dri)):
+        p = os.path.join(dri, f)
+        if os.path.islink(p) or not os.path.isfile(p):
+            continue
+        try:
+            st = os.stat(p)
+        except OSError:
+            continue
+        por_inodo.setdefault((st.st_dev, st.st_ino), []).append(f)
+
+    reemplazados = 0
     for _clave, nombres in por_inodo.items():
         if len(nombres) < 2:
             continue
-        # Se elige el mejor nombre: zink es el que se usa en el visor.
-        elegido = None
-        for pref in ("zink_dri.so", "kms_swrast_dri.so", "swrast_dri.so"):
-            if pref in nombres:
-                elegido = pref
-                break
-        if elegido is None:
-            elegido = nombres[0]
+        # El fichero real se llama SIEMPRE zink_dri.so (es el que se usa en el
+        # visor); el resto de nombres pasan a ser enlaces a ese.
+        elegido = "zink_dri.so"
+        if elegido not in nombres:
+            # Si el fichero real tiene otro nombre, se renombra.
+            origen = os.path.join(dri, nombres[0])
+            destino = os.path.join(dri, elegido)
+            if not os.path.lexists(destino):
+                try:
+                    os.rename(origen, destino)
+                    nombres = [elegido] + [n for n in nombres if n != nombres[0]]
+                except OSError:
+                    elegido = nombres[0]
         for f in nombres:
             if f == elegido:
                 continue
+            destino = os.path.join(dri, f)
             try:
-                os.remove(os.path.join(dri, f))
-                borrados += 1
+                if os.path.lexists(destino):
+                    os.remove(destino)
+                os.symlink(elegido, destino)
+                reemplazados += 1
             except OSError:
                 pass
-    if borrados:
-        log(f"Podados {borrados} alias del megadriver (mismo binario, otro nombre)")
-    return borrados
+    if reemplazados:
+        log(f"Convertidos {reemplazados} alias del megadriver en enlaces simbolicos")
+    return reemplazados
 
 
 def enlaces_duros(out):
@@ -267,27 +332,175 @@ def podar_glibc_debian(out):
     "version `GLIBC_2.38' not found".
 
     La glibc que se usa es la del runtime del visor, asi que aqui solo se
-    deja lo que ese runtime no trae: libgcc_s.so.1."""
-    libgcc = None
+    deja lo que ese runtime no trae: libgcc_s.so.1.
+
+    OJO (bug encontrado el 2026-10-23): antes este paso BORRABA el directorio
+    lib/ entero.  En Debian con /usr fusionado, muchos paquetes siguen
+    instalando ahi: zlib1g pone libz.so.1 y libexpat1 pone libexpat.so.1.
+    Al borrar el directorio se perdian, el driver no cargaba y el cliente
+    grafico moria con "Could not initialize OpenGL / GLES library" sin decir
+    cual era el problema de verdad.
+
+    Ahora: lo que NO es glibc se muda a usr/lib (que es donde esta el camino
+    de busqueda) y lo que SI es glibc se borra.
+    """
+    # Archivos que son de la glibc de Debian (y sus enlaces).
+    glibc = {
+        "libc.so.6", "libm.so.6", "libmvec.so.1", "libpthread.so.0",
+        "libdl.so.2", "librt.so.1", "libresolv.so.2", "libanl.so.1",
+        "libnsl.so.1", "libutil.so.1", "libBrokenLocale.so.1",
+        "libthread_db.so.1", "ld-linux-aarch64.so.1", "libcrypt.so.1",
+        "libnss_compat.so.2", "libnss_db.so.2", "libnss_dns.so.2",
+        "libnss_files.so.2", "libnss_hesiod.so.2", "libnss_nisplus.so.2",
+        "libnss_nis.so.2", "libnss_sss.so.2",
+    }
+    destino = os.path.join(out, "usr/lib/aarch64-linux-gnu")
+    os.makedirs(destino, exist_ok=True)
+    mudados = 0
+    borrados = 0
+    for base in ("lib/aarch64-linux-gnu", "lib64", "lib"):
+        carpeta = os.path.join(out, base)
+        if not os.path.isdir(carpeta):
+            continue
+        for nombre in sorted(os.listdir(carpeta)):
+            origen = os.path.join(carpeta, nombre)
+            if not os.path.isfile(origen) and not os.path.islink(origen):
+                continue
+            # Para un enlace, lo que decide es el destino.
+            clave = os.path.basename(os.readlink(origen)) if os.path.islink(origen) else nombre
+            if clave in glibc or nombre in glibc:
+                os.remove(origen)
+                borrados += 1
+                continue
+            destino_final = os.path.join(destino, nombre)
+            if os.path.lexists(destino_final):
+                os.remove(destino_final)
+            shutil.move(origen, destino_final)
+            mudados += 1
+        # Se quitan los directorios vacios que quedan.
+        for r, dirs, files in os.walk(carpeta, topdown=False):
+            if not os.listdir(r):
+                os.rmdir(r)
+    if mudados or borrados:
+        log(f"  glibc quitada ({borrados} ficheros); {mudados} mudados a usr/lib")
+
+    # libgcc_s.so.1 se conserva (la glibc la aporta el runtime del visor).
     for base in ("usr/lib/aarch64-linux-gnu", "lib/aarch64-linux-gnu"):
         p = os.path.join(out, base, "libgcc_s.so.1")
         if os.path.exists(p):
-            libgcc = p
+            destino_final = os.path.join(out, "usr/lib/aarch64-linux-gnu", "libgcc_s.so.1")
+            if os.path.abspath(p) != os.path.abspath(destino_final):
+                shutil.copy2(p, destino_final)
             break
-    # Se copia antes de borrar: libgcc_s.so.1 vive dentro de lib/.
-    guardado = None
-    if libgcc:
-        guardado = os.path.join(out, ".libgcc_s.so.1.guardado")
-        shutil.copy2(libgcc, guardado)
-    shutil.rmtree(os.path.join(out, "lib"), ignore_errors=True)
-    shutil.rmtree(os.path.join(out, "lib64"), ignore_errors=True)
-    if guardado:
-        dest_dir = os.path.join(out, "usr/lib/aarch64-linux-gnu")
-        os.makedirs(dest_dir, exist_ok=True)
-        shutil.copy2(guardado, os.path.join(dest_dir, "libgcc_s.so.1"))
-        os.remove(guardado)
-        log("  libgcc_s.so.1 conservado (la glibc la aporta el runtime del visor)")
     log("  glibc de Debian quitada del payload de Mesa")
+
+
+def dependencias_needed(ruta):
+    """Lista las librerias DT_NEEDED de un ELF (sin herramientas externas)."""
+    import struct
+    with open(ruta, "rb") as f:
+        datos = f.read()
+    if datos[:4] != b"\x7fELF":
+        return []
+    shoff, = struct.unpack_from("<Q", datos, 0x28)
+    shentsize, shnum, shstrndx = struct.unpack_from("<HHH", datos, 0x3A)
+
+    def sh(i):
+        return struct.unpack_from("<IIQQQQIIQQ", datos, shoff + i * shentsize)
+
+    strtab = sh(shstrndx)[4]
+    secciones = {}
+    for i in range(shnum):
+        s = sh(i)
+        secciones[datos[strtab + s[0]:].split(b"\0")[0].decode()] = s
+    if ".dynamic" not in secciones or ".dynstr" not in secciones:
+        return []
+    dynstr = secciones[".dynstr"][4]
+    salida = []
+    dy = secciones[".dynamic"]
+    for off in range(dy[4], dy[4] + dy[5], 16):
+        tag, val = struct.unpack_from("<qQ", datos, off)
+        if tag == 0:
+            break
+        if tag == 1:
+            fin = datos.index(b"\0", dynstr + val)
+            salida.append(datos[dynstr + val:fin].decode())
+    return salida
+
+
+# Lo que aporta el runtime de glibc del visor (prepare_glibc.sh), no el payload.
+DE_LA_GLIBC = {
+    "libc.so.6", "libm.so.6", "libpthread.so.0", "libdl.so.2", "librt.so.1",
+    "libresolv.so.2", "libgcc_s.so.1", "ld-linux-aarch64.so.1",
+    "libnsl.so.1", "libutil.so.1",
+}
+
+# Librerias criticas: si alguna de estas no carga, el cliente grafico no
+# puede crear contexto y muere con "Could not initialize OpenGL".
+CRITICAS = [
+    "usr/lib/aarch64-linux-gnu/dri/zink_dri.so",
+    "usr/lib/aarch64-linux-gnu/dri/swrast_dri.so",
+    "usr/lib/aarch64-linux-gnu/libEGL_mesa.so.0",
+    "usr/lib/aarch64-linux-gnu/libGLX_mesa.so.0",
+    "usr/lib/aarch64-linux-gnu/libGL.so.1",
+    "usr/lib/aarch64-linux-gnu/libEGL.so.1",
+    "usr/lib/aarch64-linux-gnu/libvulkan.so.1",
+    "usr/lib/aarch64-linux-gnu/libvulkan_lvp.so",
+    "usr/lib/aarch64-linux-gnu/libvulkan_freedreno.so",
+]
+
+
+def verificar_dependencias(out):
+    """Comprueba que todas las DT_NEEDED de las librerias criticas esten.
+
+    Esto es lo que faltaba: el payload se construia sin libexpat, libz, la
+    pila xcb/wayland... y el enlazador se quejaba de "cannot open shared
+    object file" al cargar el driver, que el motor traducía a un
+    "Could not initialize OpenGL" sin decir cual era el problema de verdad.
+    """
+    base = os.path.join(out, "usr/lib/aarch64-linux-gnu")
+
+    # Se indexan todas las librerias del payload por nombre (con sus enlaces).
+    por_nombre = {}
+    for raiz, _dirs, files in os.walk(out):
+        for f in files:
+            p = os.path.join(raiz, f)
+            por_nombre.setdefault(f, p)
+        for d in os.listdir(raiz):
+            p = os.path.join(raiz, d)
+            if os.path.islink(p):
+                por_nombre.setdefault(os.path.basename(d), p)
+
+    faltan = {}
+
+    def visita(ruta, origen, nivel=0):
+        if nivel > 8:
+            return
+        for dep in dependencias_needed(ruta):
+            if dep in DE_LA_GLIBC:
+                continue
+            destino = por_nombre.get(dep)
+            if destino is None:
+                faltan.setdefault(dep, []).append(origen)
+                continue
+            # Tambien se comprueban las dependencias de segundo nivel: el
+            # vendor EGL de Mesa, por ejemplo, no carga si libLLVM no puede
+            # cargar libffi.
+            visita(destino, origen, nivel + 1)
+
+    for rel in CRITICAS:
+        ruta = os.path.join(out, rel)
+        if not os.path.exists(ruta):
+            continue
+        visita(ruta, os.path.basename(rel))
+    if faltan:
+        log("FALTAN librerias en el payload (el driver no cargara):")
+        for dep, usos in sorted(faltan.items()):
+            log(f"    {dep}  (la necesitan: {', '.join(sorted(set(usos)))})")
+        log("  anadelas a PAQUETES y vuelve a construir el payload.")
+        return False
+    log("Dependencias de las librerias criticas: todas presentes.")
+    return True
 
 
 def main():
@@ -354,6 +567,11 @@ def main():
         log(f"  {'OK     ' if ok else 'AUSENTE'} {rel}  ({tam/1e6:.1f} MB)")
         if not ok:
             faltan.append(rel)
+
+    log("")
+    log("Comprobando las dependencias de las librerias criticas:")
+    if not verificar_dependencias(out):
+        return 1
 
     # Se cuentan inodes unicos: los drivers de DRI son hardlinks del mismo
     # fichero y sumarlos todos multiplicaria el tamano por 43.

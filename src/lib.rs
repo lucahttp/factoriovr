@@ -8,6 +8,7 @@ pub mod game_bridge;
 pub mod modelos3d;
 pub mod offsets;
 pub mod openxr;
+pub mod renderer;
 pub mod symbols;
 pub mod tabletop;
 pub mod terreno;
@@ -1632,6 +1633,105 @@ pub unsafe extern "C" fn xfactorvr_ui_vertices(
     let n = verts.len().min(max as usize);
     buffer[..n].copy_from_slice(&verts[..n]);
     n as i32
+}
+
+/// Traduce un item del inventario al tipo de entidad que se coloca en la
+/// mesa (el inverso de `entity_type_to_item_id`).
+fn item_id_to_entity_type(item_id: u32) -> u32 {
+    match item_id {
+        game_bridge::ITEM_ASSEMBLING_MACHINE => tabletop::ENTITY_ASSEMBLING_MACHINE,
+        game_bridge::ITEM_MINING_DRILL => tabletop::ENTITY_MINING_DRILL,
+        game_bridge::ITEM_FURNACE => tabletop::ENTITY_FURNACE,
+        game_bridge::ITEM_TURRET => tabletop::ENTITY_GUN_TURRET,
+        game_bridge::ITEM_RADAR => tabletop::ENTITY_RADAR,
+        game_bridge::ITEM_ROBOPORT => tabletop::ENTITY_ROBOPORT,
+        game_bridge::ITEM_CHEST => tabletop::ENTITY_CHEST,
+        game_bridge::ITEM_POWER_POLE => tabletop::ENTITY_ELECTRIC_POLE,
+        game_bridge::ITEM_TRANSPORT_BELT => tabletop::ENTITY_TRANSPORT_BELT,
+        game_bridge::ITEM_INSERTER => tabletop::ENTITY_INSERTER,
+        _ => 0,
+    }
+}
+
+/// Geometria de una ventana del HUD, para que el motor de VR pueda hacer el
+/// hit-test con el rayo de la mano.
+///
+/// Escribe en `out` (12 floats): posicion xyz, rotacion (cuaternion xyzw),
+/// escala, ancho_px, alto_px, ancho_m y alto_m.  Devuelve false si esa
+/// ventana no existe.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn xfactorvr_ui_ventana_geom(ventana: u32, out: *mut f32) -> bool {
+    if out.is_null() {
+        return false;
+    }
+    let h = hud().lock().unwrap_or_else(|e| e.into_inner());
+    let id = match ventana {
+        0 => ui::ventanas::IdVentana::Construir,
+        1 => ui::ventanas::IdVentana::Inventario,
+        2 => ui::ventanas::IdVentana::Fabricar,
+        3 => ui::ventanas::IdVentana::Vista,
+        _ => return false,
+    };
+    let Some(v) = h.ventanas.ventana(id) else {
+        return false;
+    };
+    let (ancho_px, alto_px) = h.tamano_px(id);
+    let q = v.plano.rotacion;
+    let buf = [
+        v.plano.posicion.x,
+        v.plano.posicion.y,
+        v.plano.posicion.z,
+        q.x,
+        q.y,
+        q.z,
+        q.w,
+        v.plano.escala,
+        ancho_px as f32,
+        alto_px as f32,
+        v.ancho_m,
+        v.alto_m(),
+    ];
+    std::ptr::copy_nonoverlapping(buf.as_ptr(), out, buf.len());
+    true
+}
+
+/// Pulsa un control del HUD y ejecuta lo que corresponda.
+///
+/// Devuelve el TIPO DE ENTIDAD a colocar en la mesa (0 = nada que colocar).
+/// Para "Fabricar" la receta se fabrica aqui mismo contra el motor real.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn xfactorvr_ui_pulsar(ventana: u32, id: u32) -> i32 {
+    let id_ventana = match ventana {
+        0 => ui::ventanas::IdVentana::Construir,
+        1 => ui::ventanas::IdVentana::Inventario,
+        2 => ui::ventanas::IdVentana::Fabricar,
+        3 => ui::ventanas::IdVentana::Vista,
+        _ => return 0,
+    };
+    let accion = {
+        let mut h = hud().lock().unwrap_or_else(|e| e.into_inner());
+        h.pulsar(id_ventana, id)
+    };
+    match accion {
+        Some(ui::tabla::Accion::Construir(item_id)) => {
+            // Elegir la maquina: el motor de VR la pondra como "herramienta de
+            // colocacion" y el usuario la colocara pulsando sobre la mesa.
+            let tipo = item_id_to_entity_type(item_id);
+            let mut h = hud().lock().unwrap_or_else(|e| e.into_inner());
+            h.estados.elegir_maquina(item_id, (id_ventana, id));
+            h.sincronizar_estados();
+            tipo as i32
+        }
+        Some(ui::tabla::Accion::Fabricar(item_id)) => {
+            // Fabricar de verdad: el mod hace la receta en el Factorio real.
+            xfactorvr_craft_item(item_id, 1);
+            let mut h = hud().lock().unwrap_or_else(|e| e.into_inner());
+            h.estados.elegir_receta(item_id, (id_ventana, id));
+            h.sincronizar_estados();
+            0
+        }
+        _ => 0,
+    }
 }
 
 /// Hit-test del HUD: que control hay bajo el punto (u, v) de la ventana.

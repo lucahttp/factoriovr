@@ -183,10 +183,19 @@ pub fn dir_modelos() -> PathBuf {
 // ---------------------------------------------------------------------------
 
 /// Geometria cruda de un modelo (en las unidades del GLB original).
-struct Geometria {
-    vertices: Vec<DioramaVertex>,
-    min: [f32; 3],
-    max: [f32; 3],
+///
+/// Publica porque el renderer 3D (`src/renderer/`) la sube tal cual a la
+/// GPU: los vertices ya vienen con el color horneado del GLB optimizado.
+#[derive(Debug)]
+pub struct Geometria {
+    /// Vertices unicos de la malla (los que se suben a la GPU).
+    pub vertices: Vec<DioramaVertex>,
+    /// Indices de los triangulos (3 por triangulo) sobre `vertices`.
+    pub indices: Vec<u32>,
+    /// Caja minima del modelo.
+    pub min: [f32; 3],
+    /// Caja maxima del modelo.
+    pub max: [f32; 3],
 }
 
 static CACHE: OnceLock<Mutex<HashMap<String, Arc<Geometria>>>> = OnceLock::new();
@@ -253,6 +262,13 @@ fn geometria_de_fichero(nombre: &str) -> Option<Arc<Geometria>> {
             None
         }
     }
+}
+
+/// Geometria (del cache) de un fichero GLB concreto ("assembling-machine-1.glb").
+///
+/// El renderer 3D la usa para subir la malla a la GPU una sola vez.
+pub fn geometria_de_archivo(nombre: &str) -> Option<Arc<Geometria>> {
+    geometria_de_fichero(nombre)
 }
 
 // ---------------------------------------------------------------------------
@@ -387,13 +403,15 @@ fn cargar_glb(ruta: &Path) -> anyhow::Result<Geometria> {
         }
     }
 
-    let mut vertices = Vec::new();
+    // Vertices UNICOS (los que se suben a la GPU) + los indices de los
+    // triangulos.  La geometria que se entrega al motor de VR sale de aqui
+    // "des-indexada" (triangulo a triangulo), pero el renderer 3D del visor
+    // dibuja con los indices: 3 veces menos vertices que procesar.
+    let mut vertices: Vec<DioramaVertex> = Vec::new();
+    let mut indices: Vec<u32> = Vec::new();
     for (pos, nrm, uv, col, idx) in crudos {
-        for i in idx {
-            let i = i as usize;
-            if i >= pos.len() {
-                continue;
-            }
+        let base = vertices.len() as u32;
+        for i in 0..pos.len() {
             vertices.push(DioramaVertex {
                 x: pos[i][0],
                 y: pos[i][1],
@@ -409,10 +427,24 @@ fn cargar_glb(ruta: &Path) -> anyhow::Result<Geometria> {
                 a: col[i][3],
             });
         }
+        // Un triangulo con algun indice colgante se descarta ENTERO (si no,
+        // el triangulo sale con vertices de otro sitio).
+        for t in idx.chunks(3) {
+            if t.len() < 3 {
+                continue;
+            }
+            if t.iter().any(|i| *i as usize >= pos.len()) {
+                continue;
+            }
+            indices.push(base + t[0]);
+            indices.push(base + t[1]);
+            indices.push(base + t[2]);
+        }
     }
 
     Ok(Geometria {
         vertices,
+        indices,
         min,
         max,
     })
@@ -467,7 +499,7 @@ fn sample(img: &gltf::image::Data, u: f32, v: f32, tinte: [f32; 4]) -> [f32; 4] 
 // ---------------------------------------------------------------------------
 
 /// Giro (radianes) de una parte segun la orientacion de la entidad.
-fn yaw_de_parte(giro: Giro, orientacion: f32, frame: u32) -> f32 {
+pub fn yaw_de_parte(giro: Giro, orientacion: f32, frame: u32) -> f32 {
     match giro {
         Giro::Fijo => 0.0,
         Giro::Direccion | Giro::Orientacion => YAW_BASE - orientacion,
@@ -527,7 +559,10 @@ pub fn geometria_prototipo(
     for (parte, geo) in partes_geo {
         let yaw = yaw_de_parte(parte.giro, orientacion, frame);
         let (sy, cy) = yaw.sin_cos();
-        for v in &geo.vertices {
+        // La geometria que se entrega al motor va DES-INDEXADA (triangulo a
+        // triangulo): el motor la pinta con glDrawArrays.
+        for i in &geo.indices {
+            let v = &geo.vertices[*i as usize];
             let x = (v.x - off_x) * s;
             let y = (v.y - off_y) * s;
             let z = (v.z - off_z) * s;
@@ -568,7 +603,10 @@ pub fn geometria_tipo(
     geometria_prototipo(proto, tile_x, tile_y, orientacion, frame, escala_tile_m)
 }
 
-/// Numero de vertices de un modelo (sin transformarlo). Util para medir.
+/// Numero de VERTICES de un modelo (los unicos que se suben a la GPU).
+///
+/// Util para medir y para comprobar que el GLB cargado es el que dice el
+/// manifiesto.
 pub fn vertices_de_prototipo(proto: &str) -> Option<usize> {
     let modelo = modelo_para_prototipo(proto)?;
     let mut n = 0;
@@ -577,6 +615,148 @@ pub fn vertices_de_prototipo(proto: &str) -> Option<usize> {
     }
     Some(n)
 }
+
+/// Numero de TRIANGULOS de un modelo (los indices divided por 3).
+pub fn triangulos_de_prototipo(proto: &str) -> Option<usize> {
+    let modelo = modelo_para_prototipo(proto)?;
+    let mut n = 0;
+    for parte in &modelo.partes {
+        n += geometria_de_fichero(&parte.archivo)?.indices.len() / 3;
+    }
+    Some(n)
+}
+
+// ---------------------------------------------------------------------------
+// MODELO INSTANCIABLE (para el renderer 3D del visor)
+// ---------------------------------------------------------------------------
+//
+// El renderer NO puede instanciar la geometria ya transformada de
+// `geometria_prototipo` (esa es una copia por entidad: pesa y no se puede
+// instanciar).  Lo que necesita es:
+//
+//   * la MALLA en su espacio local (la del GLB, tal cual), y
+//   * una MATRIZ por entidad que la pone en su casilla.
+//
+// Eso es exactamente lo que describe `ModeloInstanciable`: la escala comun
+// y el desplazamiento comun del modelo (los mismos que usa
+// `geometria_prototipo`, para que la malla instanciada caiga EXACTAMENTE
+// donde caia la geometria transformada).
+
+/// Una parte del modelo, lista para instanciar.
+#[derive(Clone, Debug)]
+pub struct ParteInstanciable {
+    /// Fichero GLB de la parte (la clave de la malla en la GPU).
+    pub archivo: String,
+    /// Como gira esta parte respecto a la entidad.
+    pub giro: Giro,
+}
+
+/// Un modelo, con los numeros communes para poder instanciarlo.
+#[derive(Clone, Debug)]
+pub struct ModeloInstanciable {
+    /// Prototipo ("assembling-machine-1").
+    pub prototipo: String,
+    /// Escala comun del modelo (metros por unidad del GLB).
+    pub escala: f32,
+    /// Desplazamiento comun del modelo (centro de la caja y base en el suelo).
+    pub offset: [f32; 3],
+    /// Partes del modelo (cada una es una malla).
+    pub partes: Vec<ParteInstanciable>,
+}
+
+static CACHE_INSTANCIABLE: OnceLock<std::sync::Mutex<HashMap<String, Arc<ModeloInstanciable>>>> =
+    OnceLock::new();
+
+fn cache_instanciable() -> &'static std::sync::Mutex<HashMap<String, Arc<ModeloInstanciable>>> {
+    CACHE_INSTANCIABLE.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
+/// Modelo instanciable de un prototipo.
+///
+/// Devuelve `None` si el prototipo no tiene modelo 3D o si no se pudieron
+/// cargar sus GLB (el que llama sigue con el sprite 2D).
+pub fn modelo_instanciable(proto: &str) -> Option<Arc<ModeloInstanciable>> {
+    if let Ok(c) = cache_instanciable().lock() {
+        if let Some(m) = c.get(proto) {
+            return Some(m.clone());
+        }
+    }
+    let modelo = modelo_para_prototipo(proto)?;
+    let escala_tile = escala_tile();
+
+    let mut partes = Vec::with_capacity(modelo.partes.len());
+    let mut min = [f32::MAX; 3];
+    let mut max = [f32::MIN; 3];
+    for parte in &modelo.partes {
+        let geo = geometria_de_fichero(&parte.archivo)?;
+        for k in 0..3 {
+            min[k] = min[k].min(geo.min[k]);
+            max[k] = max[k].max(geo.max[k]);
+        }
+        partes.push(ParteInstanciable {
+            archivo: parte.archivo.clone(),
+            giro: parte.giro,
+        });
+    }
+    if partes.is_empty() {
+        return None;
+    }
+    let ext_x = max[0] - min[0];
+    let ext_z = max[2] - min[2];
+    let huella_m = modelo.huella_tiles * escala_tile;
+    let escala = huella_m / ext_x.max(ext_z).max(1e-6);
+
+    let m = Arc::new(ModeloInstanciable {
+        prototipo: proto.to_string(),
+        escala,
+        offset: [
+            (min[0] + max[0]) * 0.5,
+            min[1],
+            (min[2] + max[2]) * 0.5,
+        ],
+        partes,
+    });
+    if let Ok(mut c) = cache_instanciable().lock() {
+        c.insert(proto.to_string(), m.clone());
+    }
+    Some(m)
+}
+
+/// Matriz de una instancia: coloca la parte del modelo en su casilla.
+///
+/// Es la MISMA transformacion que aplica `geometria_prototipo`, pero en
+/// forma de matriz (para poder instanciar):
+///
+/// ```text
+/// M = T(casilla) * Ry(giro) * S(escala) * T(-offset)
+/// ```
+///
+/// `tile_x`/`tile_y` son casillas de Factorio ya restadas el centro de la
+/// vista (el mismo convenio que usa el motor de VR para los sprites).
+pub fn matriz_instancia(
+    modelo: &ModeloInstanciable,
+    parte: &ParteInstanciable,
+    tile_x: f32,
+    tile_y: f32,
+    orientacion: f32,
+    frame: u32,
+    escala_tile_m: f32,
+) -> glam::Mat4 {
+    let escala = if escala_tile_m > 0.0 {
+        escala_tile_m
+    } else {
+        ESCALA_TILE_M_POR_DEFECTO
+    };
+    let yaw = yaw_de_parte(parte.giro, orientacion, frame);
+    let px = tile_x * escala;
+    let pz = tile_y * escala;
+    let off = modelo.offset;
+    glam::Mat4::from_translation(glam::Vec3::new(px, 0.0, pz))
+        * glam::Mat4::from_rotation_y(yaw)
+        * glam::Mat4::from_scale(glam::Vec3::splat(modelo.escala))
+        * glam::Mat4::from_translation(glam::Vec3::new(-off[0], -off[1], -off[2]))
+}
+
 
 // ---------------------------------------------------------------------------
 // FFI para el motor de VR (el C++ lo llama por dlsym, como el resto)

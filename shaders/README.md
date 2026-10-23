@@ -1,31 +1,39 @@
-# shaders/ — Shaders de referencia (NO los usa el motor actual)
+# shaders/ — El shader PBR de referencia (GLSL de escritorio)
 
-Estos ficheros GLSL ES 3.20 vienen de **Generals-Zero-Hour-XR** y son la
-referencia para lo que le falta al motor:
+Aquí queda **una sola cosa**: el shader PBR completo de
+**Generals-Zero-Hour-XR** (`model.vert` / `model.frag`), con instancing, IK,
+sombras y materiales. Es la referencia de lo que se puede hacer.
 
-- `warp.vert/frag`: deformación del suelo 2D sobre el plano 3D con filtrado
-  *sharp-bilinear*.
-- `model.vert/frag`: renderizado de los modelos 3D GLTF.
-- `sky.vert/frag`: cielo.
-- `sgsr/`: super-resolución de Qualcomm Snapdragon (SGSR) para el Adreno 740.
+## Lo que usa el visor de verdad
 
-## El motor actual no los usa
+Los shaders que el visor ejecuta están en
+**`android/src/main/assets/shaders/`**:
 
-El motor de VR es `android/src/openxr_engine.cpp` y lleva **sus propios
-shaders en línea** (OpenXR, sprites, terreno, panel del render del juego). El
-APK ni siquiera los empaqueta: `scripts/build_apk.sh` no los copia.
+| Fichero | Qué es |
+|---|---|
+| `modelo_visor.vert` / `.frag` | PBR con el color horneado en el vértice (la versión en **GLES 3.2**, la que entiende el Adreno de la Pico). Sin UBO ni esqueleto: el modelo se pinta con el color del vértice y una matriz por instancia. |
+| `fullscreen.vert` | El quad de pantalla completa (SGSR). |
+| `sgsr/sgsr1.frag` | El SGSR de Qualcomm, adaptado a GLES 3.2 (el original usa `textureGather`, que en ES 3.0 no existe). |
 
-Hubo un pipeline gráfico en Rust (`src/renderer/`, con `warp.rs`, `model.rs` y
-`sgsr.rs`) que usaba estos shaders, pero **nadie lo llamaba**: el motor en C++
-lo dejó obsoleto y aquel código se borró en la auditoría de ADR-010.
+El motor los carga desde ahí con `src/renderer/shader.rs` (si no están en el
+APK, usa una copia embebida).
 
-## Para qué se conservan
+## Lo que se ha descartado (y por qué)
 
-El **SGSR está pendiente de portar** al motor C++: es la vía de reescalado por
-software de la imagen del juego que se ve en el panel, y con ella se podría
-subir la resolución de lo que se manda al visor. El material está aquí para
-que el port no haya que buscarlo otra vez.
+- **`warp.vert` / `warp.frag`** (deformación del render 2D sobre el plano 3D):
+  **descartado**. Son D3D11 (GLSL de escritorio con `StructuredBuffer` y
+  `layout(set=…)`) y el motor en Android va con OpenGL ES 3.2: no hay
+  equivalente. Además el warp solo tiene sentido si el motor dibuja en 3D, y
+  aquí el 3D lo pone el **visor** (terreno real + modelos GLB de las
+  entidades reales), no el motor.
+- **`sky.vert` / `sky.frag`**: el cielo no se usa.
+- **`sgsr/`** (la copia de escritorio): la version que funciona es la de
+  `assets/shaders/sgsr/`.
 
-**No funcionan tal cual**: son shaders de escritorio (GLSL 3.20) y habría que
-adaptarlos a GLES 3.20 y al encadenado del motor (que dibuja a un FBOs
-intermedio, no a pantalla).
+## El siguiente paso natural
+
+`model.vert` / `model.frag` de aquí es **más completo** que
+`modelo_visor.vert` (trae UBO con todos los parametros del material, IK y
+sombras). Adaptarlo a GLES 3.2 (UBO → uniforms, esqueleto → quaterniones por
+instancia) es lo que haria que las maquinas se vean con material de verdad en
+vez de con color plano.

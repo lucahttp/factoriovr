@@ -123,6 +123,31 @@ static MODO_2D: AtomicU64 = AtomicU64::new(0);
 /// Si vale 1, se dibujan las cajas.
 static ACTIVO: AtomicU64 = AtomicU64::new(1);
 
+/// Si vale 1, no se busca ningun modelo 3D (solo el cubo de prueba).
+static SIN_MODELOS: AtomicU64 = AtomicU64::new(0);
+
+/// Si vale 1, se dibuja tambien el cubo de prueba (ademas de los modelos).
+static CUBO_ACTIVO: AtomicU64 = AtomicU64::new(0);
+
+/// Si vale 1, el sprite 2D de las entidades con modelo NO se encola (el
+/// modelo 3D lo sustituye por completo).
+static SIN_SPRITE: AtomicU64 = AtomicU64::new(0);
+
+/// Cada cuantos flush se dibujan los modelos (1 = en todos).
+///
+/// El motor dibuja el mundo por trozos y cada trozo vacia la cola de sprites:
+/// si los modelos se dibujan en todos los flush, se redibujan (caro).  Con un
+/// valor mayor se dibujan solo de tarde en tarde (puede que el mundo se
+/// dibuje encima de ellos).
+static CADA_FLUSH: AtomicU64 = AtomicU64::new(1);
+
+/// Contador de flush (para el throttle).
+static CONTADOR_FLUSH: AtomicU64 = AtomicU64::new(0);
+
+/// Maximo de modelos que se dibujan en un frame (el motor dibuja cientos de
+/// entidades: pintarlas todas es una burrada).
+const MAX_INSTANCIAS: usize = 48;
+
 /// Interruptores de bisectado (todo a 1 por defecto).
 ///
 ///   * `HOOK_SETUP` -> instalar el detour de `SpriteDrawOrder::setup`
@@ -171,7 +196,7 @@ static CAMARA_BASE: Mutex<(u64, f64)> = Mutex::new((u64::MAX, 0.0));
 static DIAG_UB: AtomicU64 = AtomicU64::new(0);
 
 /// Cuantas cajas se guardan como maximo.
-const MAX_PENDIENTES: usize = 32;
+const MAX_PENDIENTES: usize = 64;
 
 /// Posicion del mapa de una entidad, en 1/256 de tile (2 x i32).
 ///
@@ -193,6 +218,10 @@ struct Caja {
     sy: f32,
     /// Direccion de la entidad (0..15).
     direccion: u8,
+    /// Indice del modelo 3D en el registro (-1 = sin modelo).
+    modelo: i32,
+    /// Pixels por casilla (el zoom del motor).
+    escala: f32,
 }
 
 /// Las cajas pendientes y las entidades vistas.
@@ -209,6 +238,8 @@ static ESTADO: Mutex<Estado> = Mutex::new(Estado {
         sx: 0.0,
         sy: 0.0,
         direccion: 0,
+        modelo: -1,
+        escala: 32.0,
     }; MAX_PENDIENTES],
     n_pend: 0,
     visibles: [Caja {
@@ -217,11 +248,14 @@ static ESTADO: Mutex<Estado> = Mutex::new(Estado {
         sx: 0.0,
         sy: 0.0,
         direccion: 0,
+        modelo: -1,
+        escala: 32.0,
     }; MAX_PENDIENTES],
     n_visibles: 0,
     entidades: [Entidad {
         pos: PosMapa { x: 0, y: 0 },
         direccion: 0,
+        modelo: -1,
     }; MAX_ENTIDADES],
     n_entidades: 0,
 });
@@ -249,21 +283,27 @@ struct Estado {
 
 impl Estado {
     /// Anota una entidad (la llama el hook de `AssemblingMachine::draw`).
-    fn anota_entidad(&mut self, pos: PosMapa, direccion: u8) {
+    fn anota_entidad(&mut self, pos: PosMapa, direccion: u8, modelo: i32) {
         let mut i = self.n_entidades;
         if i >= MAX_ENTIDADES {
             i = 0;
         }
-        self.entidades[i] = Entidad { pos, direccion };
+        self.entidades[i] = Entidad {
+            pos,
+            direccion,
+            modelo,
+        };
         self.n_entidades = i + 1;
     }
 
     /// ¿Esta posicion de mapa es la de alguna entidad vista?
-    fn direccion_de(&self, pos: PosMapa) -> Option<u8> {
+    ///
+    /// Devuelve su direccion y su modelo.
+    fn entidad_de(&self, pos: PosMapa) -> Option<(u8, i32)> {
         let mut i = 0usize;
         while i < self.n_entidades && i < MAX_ENTIDADES {
             if self.entidades[i].pos == pos {
-                return Some(self.entidades[i].direccion);
+                return Some((self.entidades[i].direccion, self.entidades[i].modelo));
             }
             i += 1;
         }
@@ -321,10 +361,12 @@ fn con_estado<R>(f: impl FnOnce(&mut Estado) -> R) -> R {
 struct Entidad {
     pos: PosMapa,
     direccion: u8,
+    /// Indice del modelo 3D en el registro (-1 = sin modelo).
+    modelo: i32,
 }
 
 /// Cuantas entidades se guardan como maximo.
-const MAX_ENTIDADES: usize = 16;
+const MAX_ENTIDADES: usize = 64;
 
 /// Numero de entidades vistas (copia atomica del estado compartido).
 ///
@@ -922,10 +964,18 @@ const TIPOS_3D: &[(&str, &str)] = &[
     ("_ZNK10RocketSilo4drawER9DrawQueue", "RocketSilo"),
     ("_ZNK3Lab4drawER9DrawQueue", "Lab"),
     ("_ZNK6Boiler4drawER9DrawQueue", "Boiler"),
+    ("_ZNK12ElectricPole4drawER9DrawQueue", "ElectricPole"),
+    ("_ZNK8Roboport4drawER9DrawQueue", "Roboport"),
+    ("_ZNK5Radar4drawER9DrawQueue", "Radar"),
+    ("_ZNK8Inserter4drawER9DrawQueue", "Inserter"),
+    ("_ZNK6Turret4drawER9DrawQueue", "Turret"),
+    ("_ZNK10AmmoTurret4drawER9DrawQueue", "AmmoTurret"),
+    ("_ZNK15ContainerEntity4drawER9DrawQueue", "ContainerEntity"),
+    ("_ZNK15LinkedContainer4drawER9DrawQueue", "LinkedContainer"),
 ];
 
 /// Maximo de tipos de entidad con 3D (tamano de los arrays de trampolines).
-const MAX_TIPOS_3D: usize = 16;
+const MAX_TIPOS_3D: usize = 24;
 
 /// Trampolin de `DrawQueue::draw`.
 static TRAMPOLIN_DQ: AtomicUsize = AtomicUsize::new(0);
@@ -974,9 +1024,17 @@ hook_de_entidad!(xfv_hook_ent_6, 6);
 hook_de_entidad!(xfv_hook_ent_7, 7);
 hook_de_entidad!(xfv_hook_ent_8, 8);
 hook_de_entidad!(xfv_hook_ent_9, 9);
+hook_de_entidad!(xfv_hook_ent_10, 10);
+hook_de_entidad!(xfv_hook_ent_11, 11);
+hook_de_entidad!(xfv_hook_ent_12, 12);
+hook_de_entidad!(xfv_hook_ent_13, 13);
+hook_de_entidad!(xfv_hook_ent_14, 14);
+hook_de_entidad!(xfv_hook_ent_15, 15);
+hook_de_entidad!(xfv_hook_ent_16, 16);
+hook_de_entidad!(xfv_hook_ent_17, 17);
 
 /// Los hooks por tipo, en el mismo orden que `TIPOS_3D`.
-static HOOKS_ENT: [unsafe extern "C" fn(*mut c_void, *mut c_void); 10] = [
+static HOOKS_ENT: [unsafe extern "C" fn(*mut c_void, *mut c_void); 18] = [
     xfv_hook_ent_0,
     xfv_hook_ent_1,
     xfv_hook_ent_2,
@@ -987,6 +1045,14 @@ static HOOKS_ENT: [unsafe extern "C" fn(*mut c_void, *mut c_void); 10] = [
     xfv_hook_ent_7,
     xfv_hook_ent_8,
     xfv_hook_ent_9,
+    xfv_hook_ent_10,
+    xfv_hook_ent_11,
+    xfv_hook_ent_12,
+    xfv_hook_ent_13,
+    xfv_hook_ent_14,
+    xfv_hook_ent_15,
+    xfv_hook_ent_16,
+    xfv_hook_ent_17,
 ];
 
 extern "C" fn hook_draw_asm(this: *mut c_void, queue: *mut c_void, indice: usize) {
@@ -997,7 +1063,11 @@ extern "C" fn hook_draw_asm(this: *mut c_void, queue: *mut c_void, indice: usize
     if ACTIVO.load(Ordering::Relaxed) == 1 && !this.is_null() {
         let pos = leer_posicion(this);
         let direccion = leer_direccion(this);
-        con_estado(|e| e.anota_entidad(pos, direccion));
+        // El modelo 3D que le toca: se saca del PROTOTIPO de la entidad
+        // ("assembling-machine-1", "stone-furnace"...).  El prototipo se
+        // localiza en caliente (en esta build no hay `Entity::getPrototype`).
+        let modelo = modelo_de_entidad(this, indice);
+        con_estado(|e| e.anota_entidad(pos, direccion, modelo));
         N_ENTIDADES.fetch_add(1, Ordering::Relaxed);
         if n <= 3 {
             log::info(&format!(
@@ -1023,6 +1093,24 @@ extern "C" fn hook_draw_asm(this: *mut c_void, queue: *mut c_void, indice: usize
             let f: HookDraw = std::mem::transmute(tramp);
             f(this, queue);
         }
+    }
+}
+
+/// El modelo 3D que le toca a una entidad (-1 = ninguno).
+///
+/// Se averigua por el PROTOTIPO de la entidad (el nombre "assembling-machine-1"
+/// y compañía).  En esta build del motor no existe `Entity::getPrototype()`,
+/// asi que el modulo `proto` localiza el puntero al prototipo en caliente.
+fn modelo_de_entidad(this: *mut c_void, clase: usize) -> i32 {
+    if SIN_MODELOS.load(Ordering::Relaxed) == 1 {
+        return -1;
+    }
+    match crate::proto::nombre_de_prototipo(this, clase) {
+        Some(nombre) => match crate::render3d::indice_de_prototipo(&nombre) {
+            Some(i) => i as i32,
+            None => -1,
+        },
+        None => -1,
     }
 }
 
@@ -1152,16 +1240,6 @@ extern "C" fn hook_draw_queue(
     // calcular las posiciones de los sprites con la camara ya desplazada.
     aplicar_desplazamiento_camara(this);
 
-    // El original primero: el sprite tiene que existir.
-    let tramp = TRAMPOLIN_DQ.load(Ordering::Relaxed);
-    if tramp != 0 {
-        // SAFETY: el trampolin repone los argumentos intactos.
-        unsafe {
-            let f: HookDrawQueue = std::mem::transmute(tramp);
-            f(this, sprite, position, flags, layer, shift, _size_x, _size_y);
-        }
-    }
-
     if ACTIVO.load(Ordering::Relaxed) == 0 || position.is_null() || this.is_null() {
         return;
     }
@@ -1177,7 +1255,29 @@ extern "C" fn hook_draw_queue(
     let pos = PosMapa { x: mp[0], y: mp[1] };
 
     // ¿Es el sprite de una de nuestras entidades?
-    let direccion = match con_estado(|e| e.direccion_de(pos)) {
+    let entidad = con_estado(|e| e.entidad_de(pos));
+
+    // Si la entidad tiene modelo 3D y se ha pedido sustituir el sprite, NO
+    // se encola el sprite 2D (si no, la maquina se veria doble: el modelo
+    // encima del sprite plano).
+    let sustituir = match entidad {
+        Some((_, m)) if m >= 0 && SIN_SPRITE.load(Ordering::Relaxed) == 1 => true,
+        _ => false,
+    };
+
+    if !sustituir {
+        // El original primero: el sprite tiene que existir.
+        let tramp = TRAMPOLIN_DQ.load(Ordering::Relaxed);
+        if tramp != 0 {
+            // SAFETY: el trampolin repone los argumentos intactos.
+            unsafe {
+                let f: HookDrawQueue = std::mem::transmute(tramp);
+                f(this, sprite, position, flags, layer, shift, _size_x, _size_y);
+            }
+        }
+    }
+
+    let (direccion, modelo) = match entidad {
         Some(d) => d,
         None => return,
     };
@@ -1234,6 +1334,10 @@ extern "C" fn hook_draw_queue(
         sx: sx as f32,
         sy: sy as f32,
         direccion,
+        modelo,
+        // Pixels por casilla: el motor dibuja el mundo con 32 pixels por
+        // casilla multiplicados por el zoom.
+        escala: 32.0 * escala as f32,
     };
     con_estado(|e| e.anade_caja(caja));
     let total = PENDIENTES.fetch_add(1, Ordering::Relaxed) + 1;
@@ -1376,7 +1480,7 @@ fn pintar_si_toca(_origen: &str) {
     }
 
     if quiere_3d {
-        dibujar_cajas(gl, &vp);
+        dibujar_3d(gl, &vp);
     }
     capturar_si_pide(gl, &vp);
 }
@@ -1438,6 +1542,10 @@ pub fn capturar_frame_completo() {
     if w <= 0 || h <= 0 || w > 4096 || h > 4096 {
         return;
     }
+
+    // El tamano real del framebuffer: lo necesita el puente de entrada para
+    // pasar los pixeles del visor a pixeles del motor (ver docs/ADR-013).
+    crate::entrada::fijar_viewport(w as u32, h as u32);
 
     // Guardar los framebuffers que hay puestos y leer del del mundo.
     let fb_dibujo = gl_int(gl, GL_DRAW_FRAMEBUFFER_BINDING);
@@ -1637,12 +1745,70 @@ fn orden_caras(m: &[f32; 16]) -> [u32; 36] {
     out
 }
 
-/// Dibuja las cajas pendientes en el framebuffer que hay enlazado.
-fn dibujar_cajas(gl: &Gl, vp: &[i32; 4]) {
+/// Dibuja el 3D en el framebuffer que hay enlazado.
+///
+/// Primero los **modelos de verdad** (los GLB) y, si esta puesto el modo
+/// cubo, tambien el cubo de prueba (que sirve de referencia).
+fn dibujar_3d(gl: &Gl, vp: &[i32; 4]) {
     let cajas = con_estado(|e| e.publica_cajas());
     if cajas.is_empty() {
         return;
     }
+    // El throttle: solo se dibujan los modelos cada N flushes.
+    let n = CONTADOR_FLUSH.fetch_add(1, Ordering::Relaxed);
+    let cada = CADA_FLUSH.load(Ordering::Relaxed).max(1);
+    if n % cada == 0 {
+        dibujar_modelos(&cajas, vp);
+    }
+    if CUBO_ACTIVO.load(Ordering::Relaxed) == 0 {
+        return;
+    }
+    dibujar_cajas(gl, vp, &cajas);
+}
+
+/// Dibuja los modelos 3D de verdad (una instancia por entidad).
+fn dibujar_modelos(cajas: &[Caja], vp: &[i32; 4]) {
+    let mut instancias: Vec<crate::render3d::Instancia> = Vec::new();
+    for c in cajas.iter() {
+        if c.modelo < 0 {
+            // Sin modelo: no se dibuja nada (la entidad se sigue viendo con
+            // su sprite normal: no queda un hueco).
+            continue;
+        }
+        if c.sx <= 0.0 || c.sy <= 0.0 {
+            continue;
+        }
+        // Las entidades fuera de la pantalla no se dibujan.
+        if c.wx + c.sx * 0.5 < 0.0
+            || c.wx - c.sx * 0.5 > vp[2] as f32
+            || c.wy + c.sy * 0.5 < 0.0
+            || c.wy - c.sy * 0.5 > vp[3] as f32
+        {
+            continue;
+        }
+        instancias.push(crate::render3d::Instancia {
+            modelo: c.modelo as usize,
+            x: c.wx,
+            // El pie de la maquina se apoya en el borde inferior de su sprite.
+            y: c.wy + c.sy * 0.5,
+            direccion: c.direccion,
+            pixeles_por_tile: c.escala,
+        });
+    }
+    if instancias.is_empty() {
+        return;
+    }
+    if instancias.len() > MAX_INSTANCIAS {
+        instancias.truncate(MAX_INSTANCIAS);
+    }
+    // De lejos a cerca: las mas altas en la pantalla (menor Y) se dibujan
+    // primero (no hay buffer de profundidad: el orden lo decide el pintón).
+    instancias.sort_by(|a, b| a.y.partial_cmp(&b.y).unwrap_or(std::cmp::Ordering::Equal));
+    crate::render3d::dibujar(&instancias, vp);
+}
+
+/// Dibuja las cajas pendientes en el framebuffer que hay enlazado.
+fn dibujar_cajas(gl: &Gl, vp: &[i32; 4], cajas: &[Caja]) {
     let cubo = match CUBO.get() {
         Some(c) => c,
         None => return,
@@ -2332,15 +2498,21 @@ pub fn preparar_gl() {
         }
         None => log::error("no se pudo crear el cubo 3D"),
     }
+
+    // El renderer de los modelos de verdad (usa el mismo contexto GL).
+    crate::render3d::preparar_gl();
 }
 
 /// Devuelve un resumen de lo que ha pasado (para el log).
 pub fn resumen() -> String {
     format!(
-        "draw {} veces, {} cajas pendientes, {} dibujadas",
+        "draw {} veces, {} cajas pendientes, {} cubos dibujadas, {} mallas de modelo 3D, \
+         {} prototipos identificados",
         LLAMADAS.load(Ordering::Relaxed),
         PENDIENTES.load(Ordering::Relaxed),
         DIBUJADOS.load(Ordering::Relaxed),
+        crate::render3d::dibujados(),
+        crate::proto::IDENTIFICADOS.load(Ordering::Relaxed),
     )
 }
 
@@ -2364,6 +2536,20 @@ pub fn configurar() {
     }
     if let Ok(v) = std::env::var("XFACTORVR_3D_VOLTEAR") {
         CAPTURAR_VOLTEADA.store(if v != "0" { 1 } else { 0 }, Ordering::Relaxed);
+    }
+    if let Ok(v) = std::env::var("XFACTORVR_3D_CUBO") {
+        CUBO_ACTIVO.store(if v != "0" { 1 } else { 0 }, Ordering::Relaxed);
+    }
+    if let Ok(v) = std::env::var("XFACTORVR_3D_SIN_MODELOS") {
+        SIN_MODELOS.store(if v != "0" { 1 } else { 0 }, Ordering::Relaxed);
+    }
+    if let Ok(v) = std::env::var("XFACTORVR_3D_SIN_SPRITE") {
+        SIN_SPRITE.store(if v != "0" { 1 } else { 0 }, Ordering::Relaxed);
+    }
+    if let Ok(v) = std::env::var("XFACTORVR_3D_CADA_FLUSH") {
+        if let Ok(n) = v.trim().parse::<u64>() {
+            CADA_FLUSH.store(n.max(1), Ordering::Relaxed);
+        }
     }
     for (var, destino) in [
         ("XFACTORVR_3D_HOOK_SETUP", &HOOK_SETUP),

@@ -10,7 +10,7 @@
         {
           "archivo": "assembling-machine-1.glb",
           "giro": "direccion",
-          "triangulos": 17580,
+          "triangulos": 9505,
           "verts": 4994
         }
       ]
@@ -23,7 +23,7 @@
         {
           "archivo": "assembling-machine-2.glb",
           "giro": "direccion",
-          "triangulos": 17580,
+          "triangulos": 9505,
           "verts": 4994
         }
       ]
@@ -36,7 +36,7 @@
         {
           "archivo": "assembling-machine-3.glb",
           "giro": "direccion",
-          "triangulos": 17580,
+          "triangulos": 9505,
           "verts": 4994
         }
       ]
@@ -49,7 +49,7 @@
         {
           "archivo": "boiler.glb",
           "giro": "direccion",
-          "triangulos": 37844,
+          "triangulos": 33414,
           "verts": 17182
         }
       ]
@@ -62,13 +62,13 @@
         {
           "archivo": "electric-furnace.0.glb",
           "giro": "direccion",
-          "triangulos": 39694,
+          "triangulos": 32354,
           "verts": 16328
         },
         {
           "archivo": "electric-furnace.1.glb",
           "giro": "direccion",
-          "triangulos": 1730,
+          "triangulos": 1311,
           "verts": 691
         }
       ]
@@ -81,13 +81,13 @@
         {
           "archivo": "electric-mining-drill.0.glb",
           "giro": "direccion",
-          "triangulos": 23614,
+          "triangulos": 14818,
           "verts": 7447
         },
         {
           "archivo": "electric-mining-drill.1.glb",
           "giro": "direccion",
-          "triangulos": 4804,
+          "triangulos": 4702,
           "verts": 2411
         }
       ]
@@ -100,13 +100,13 @@
         {
           "archivo": "gun-turret.0.glb",
           "giro": "fijo",
-          "triangulos": 9578,
+          "triangulos": 7330,
           "verts": 3718
         },
         {
           "archivo": "gun-turret.1.glb",
           "giro": "orientacion",
-          "triangulos": 9532,
+          "triangulos": 8116,
           "verts": 4217
         }
       ]
@@ -119,7 +119,7 @@
         {
           "archivo": "inserter.0.glb",
           "giro": "direccion",
-          "triangulos": 5501,
+          "triangulos": 5306,
           "verts": 2704
         },
         {
@@ -151,7 +151,7 @@
         {
           "archivo": "lab.glb",
           "giro": "direccion",
-          "triangulos": 37856,
+          "triangulos": 20999,
           "verts": 10807
         }
       ]
@@ -164,7 +164,7 @@
         {
           "archivo": "logistic-chest.glb",
           "giro": "direccion",
-          "triangulos": 3244,
+          "triangulos": 3164,
           "verts": 1691
         }
       ]
@@ -188,7 +188,7 @@
         {
           "archivo": "medium-electric-pole.glb",
           "giro": "direccion",
-          "triangulos": 4864,
+          "triangulos": 3092,
           "verts": 1585
         }
       ]
@@ -201,13 +201,13 @@
         {
           "archivo": "radar.0.glb",
           "giro": "direccion",
-          "triangulos": 22596,
+          "triangulos": 16990,
           "verts": 9059
         },
         {
           "archivo": "radar.1.glb",
           "giro": "giro",
-          "triangulos": 6208,
+          "triangulos": 5664,
           "verts": 2906
         }
       ]
@@ -220,7 +220,7 @@
         {
           "archivo": "roboport.glb",
           "giro": "direccion",
-          "triangulos": 60838,
+          "triangulos": 41212,
           "verts": 21257
         }
       ]
@@ -233,7 +233,7 @@
         {
           "archivo": "small-electric-pole.glb",
           "giro": "direccion",
-          "triangulos": 3120,
+          "triangulos": 2148,
           "verts": 1044
         }
       ]
@@ -259,7 +259,7 @@
         {
           "archivo": "steel-furnace.glb",
           "giro": "direccion",
-          "triangulos": 34846,
+          "triangulos": 25390,
           "verts": 12961
         }
       ]
@@ -272,7 +272,7 @@
         {
           "archivo": "stone-furnace.glb",
           "giro": "direccion",
-          "triangulos": 13158,
+          "triangulos": 11290,
           "verts": 5741
         }
       ]
@@ -285,7 +285,7 @@
         {
           "archivo": "storage-tank.glb",
           "giro": "direccion",
-          "triangulos": 23614,
+          "triangulos": 20238,
           "verts": 10453
         }
       ]

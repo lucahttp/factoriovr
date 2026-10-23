@@ -37,6 +37,13 @@ GLIBC_DIR="${GLIBC_DIR:-/data/local/tmp/glibc}"
 LOADER="$GLIBC_DIR/lib/ld-linux-aarch64.so.1"
 GLIBC_LIB="$GLIBC_DIR/lib"
 
+# Camino de busqueda de librerias. IMPORTANTE: sin la carpeta de Mesa aqui,
+# el dlopen de libGL.so.1 / libEGL.so.1 del motor no encuentra nada y el
+# cliente muere con "Could not initialize OpenGL / GLES library". El motor
+# trae SDL2 estatico y carga la capa grafica en runtime, asi que la ruta tiene
+# que estar en el entorno (LD_LIBRARY_PATH) y no solo en el enlazador.
+LIB_PATH="$MESA_LIB:$GLIBC_LIB"
+
 if [ ! -f "$MESA_LIB/dri/zink_dri.so" ]; then
     log "ERROR: no esta el payload de Mesa en $MESA_DIR"
     log "       genera con: python3 scripts/prepare_mesa.py"
@@ -98,6 +105,24 @@ else
 fi
 
 # --- 3. Entorno de Mesa -----------------------------------------------------
+# --- glvnd: donde encuentra el driver EGL de Mesa -------------------------
+# libEGL.so.1 es el DESPACHADOR de glvnd, y el vendor real (libEGL_mesa.so.0)
+# lo busca en /usr/share/glvnd/egl_vendor.d, que en el visor no existe.  Sin
+# vendor, glvnd no expone ni extensiones ni devices, y SDL2 muere con
+# "Could not find a valid EGL device to initialize".
+# glvnd deja indicar donde esta con estas variables de entorno.
+export __EGL_VENDOR_LIBRARY_DIRS="$MESA_DIR/glvnd_egl_vendor"
+export __EGL_VENDOR_LIBRARY_FILENAMES="$MESA_LIB/libEGL_mesa.so.0"
+mkdir -p "$__EGL_VENDOR_LIBRARY_DIRS"
+cat > "$__EGL_VENDOR_LIBRARY_DIRS/10_mesa.json" <<JSON
+{
+    "file_format_version" : "1.0.0",
+    "ICD" : {
+        "library_path" : "$MESA_LIB/libEGL_mesa.so.0"
+    }
+}
+JSON
+
 export LIBGL_DRIVERS_PATH="$MESA_LIB/dri"
 export MESA_LOADER_DRIVER_OVERRIDE=zink
 export ZINK_DESCRIPTORS=auto
@@ -105,17 +130,44 @@ export GALLIUM_DRIVER=zink
 export LIBGL_ALWAYS_SOFTWARE=0
 export LD_LIBRARY_PATH="$MESA_LIB:${LD_LIBRARY_PATH:-}"
 
-if [ -f "$ICD_JSON" ]; then
+# El ICD de Vulkan que se va a usar. Hay tres posibilidades y se eligen en este
+# orden:
+#   1. TURNIP  (driver abierto de Adreno de Mesa). Habla con el kernel por
+#      /dev/kgsl-3d0 y NO es bionic, asi que se puede cargar dentro de un
+#      proceso glibc sin meter dos libc en el mismo proceso. Es la via para
+#      que el cliente grafico use la GPU de verdad en vez de lavapipe.
+#      Necesita root (o permiso sobre /dev/kgsl-3d0).
+#   2. El ICD del fabricante (/vendor/lib64/hw/vulkan.adreno.so): es bionic y
+#      revienta dentro de un proceso glibc. Solo si lo pides a mano.
+#   3. lavapipe (Vulkan por software): siempre funciona, pero sin GPU.
+TURNIP_SO="$MESA_LIB/libvulkan_freedreno.so"
+TURNIP_JSON="$MESA_DIR/turnip_icd.json"
+LVP_SO="$MESA_LIB/libvulkan_lvp.so"
+LVP_JSON="$MESA_DIR/lvp_icd.json"
+
+if [ "${XFACTORVR_USE_TURNIP:-0}" = "1" ] && [ -f "$TURNIP_SO" ]; then
+    cat > "$TURNIP_JSON" <<JSON
+{
+    "file_format_version": "1.0.0",
+    "ICD": {
+        "library_path": "$TURNIP_SO",
+        "api_version": "1.1.230"
+    }
+}
+JSON
+    export VK_ICD_FILENAMES="$TURNIP_JSON"
+    export VK_DRIVER_FILES="$TURNIP_JSON"
+    log "turnip (Adreno por KGSL): $TURNIP_SO"
+elif [ -f "$ICD_JSON" ]; then
     export VK_ICD_FILENAMES="$ICD_JSON"
     export VK_DRIVER_FILES="$ICD_JSON"
+    log "ICD del fabricante: $ICD_SO"
 else
     # Sin ICD de Adreno: lavapipe (Vulkan por software) para que al menos arranque.
     # El JSON que trae el payload apunta a la ruta del host (/usr/lib/...), que
     # en el visor no existe: hay que rehacerlo con la ruta de aqui, o Mesa se
     # queda sin Vulkan y el cliente no puede crear el contexto OpenGL.
-    LVP_SO="$MESA_LIB/libvulkan_lvp.so"
     if [ -f "$MESA_DIR/usr/share/vulkan/icd.d/lvp_icd.aarch64.json" ] && [ -f "$LVP_SO" ]; then
-        LVP_JSON="$MESA_DIR/lvp_icd.json"
         cat > "$LVP_JSON" <<JSON
 {
     "file_format_version": "1.0.0",
@@ -271,7 +323,7 @@ if [ -n "${SERVER_ADDR:-}" ]; then
     # CLIENTE se conecta para aportar el jugador que el nivel de campana
     # exige (usa game.players[1]) y para pintar el mundo en 3D.
     log "Conectando al servidor $SERVER_ADDR:$SERVER_PORT..."
-    exec env LD_PRELOAD="$PRELOAD" "$LOADER" --library-path "$GLIBC_LIB" "$GAME_BIN" \
+    exec env LD_LIBRARY_PATH="$LIB_PATH" LD_PRELOAD="$PRELOAD" "$LOADER" --library-path "$LIB_PATH" "$GAME_BIN" \
         --config "$CLIENT_CONFIG" \
         --window-size "${WIDTH}x${HEIGHT}" \
         --mp-connect "$SERVER_ADDR:$SERVER_PORT"
@@ -282,7 +334,7 @@ fi
 SAVE="${SAVE:-$FACTORIO_DIR/saves/xfactorvr.zip}"
 if [ ! -f "$SAVE" ]; then
     log "Creando la partida inicial..."
-    env LD_PRELOAD="$PRELOAD" "$LOADER" --library-path "$GLIBC_LIB" "$GAME_BIN" --create "$SAVE" --config "$CLIENT_CONFIG" \
+    env LD_LIBRARY_PATH="$LIB_PATH" LD_PRELOAD="$PRELOAD" "$LOADER" --library-path "$LIB_PATH" "$GAME_BIN" --create "$SAVE" --config "$CLIENT_CONFIG" \
         2>&1 | tail -20
 fi
 
@@ -290,7 +342,7 @@ log "Arrancando el cliente grafico (Zink -> Vulkan) en $WIDTH x $HEIGHT..."
 log "  ICD: ${VK_ICD_FILENAMES:-ninguno}"
 log "  SDL: $SDL_VIDEODRIVER"
 
-exec env LD_PRELOAD="$PRELOAD" "$LOADER" --library-path "$GLIBC_LIB" "$GAME_BIN" \
+exec env LD_LIBRARY_PATH="$LIB_PATH" LD_PRELOAD="$PRELOAD" "$LOADER" --library-path "$LIB_PATH" "$GAME_BIN" \
     --config "$CLIENT_CONFIG" \
     --window-size "${WIDTH}x${HEIGHT}" \
     --fullscreen \

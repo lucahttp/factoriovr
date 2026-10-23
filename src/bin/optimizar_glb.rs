@@ -603,8 +603,10 @@ fn decimar(vertices: &[Vrt], indices: &[u32], grid: f32) -> (Vec<Vrt>, Vec<u32>)
         n_v: u32,
     }
     let mut acums: Vec<Acum> = Vec::with_capacity(vertices.len() / 2);
+    // indice original -> indice del cluster (para remapear los indices)
+    let mut remap: Vec<u32> = vec![0; vertices.len()];
 
-    for v in vertices {
+    for (vi, v) in vertices.iter().enumerate() {
         let key = (
             (v.p[0] * inv).round() as i32,
             (v.p[1] * inv).round() as i32,
@@ -626,6 +628,7 @@ fn decimar(vertices: &[Vrt], indices: &[u32], grid: f32) -> (Vec<Vrt>, Vec<u32>)
                 i
             }
         };
+        remap[vi] = idx;
         let a = &mut acums[idx as usize];
         a.p[0] += v.p[0];
         a.p[1] += v.p[1];
@@ -657,16 +660,27 @@ fn decimar(vertices: &[Vrt], indices: &[u32], grid: f32) -> (Vec<Vrt>, Vec<u32>)
         v.c = [a.c[0] * f, a.c[1] * f, a.c[2] * f, a.c[3] * f];
     }
 
-    // recorta triangulos degenerados (los que colapsaron en la rejilla)
+    // Remapea los indices a los vertices nuevos y recorta los triangulos
+    // degenerados (los que colapsaron en la rejilla).
+    //
+    // OJO: sin este remapeo los indices siguen apuntando a los vertices
+    // ORIGINALES y el GLB sale roto (indices por encima del numero de
+    // vertices: el cargador se come los triangulos y la maquina sale con
+    // agujeros).
     let mut salida_i = Vec::with_capacity(indices.len());
     for t in indices.chunks(3) {
         if t.len() < 3 {
             continue;
         }
-        if t[0] == t[1] || t[1] == t[2] || t[0] == t[2] {
+        let (a, b, c) = (
+            remap[t[0] as usize],
+            remap[t[1] as usize],
+            remap[t[2] as usize],
+        );
+        if a == b || b == c || a == c {
             continue;
         }
-        salida_i.extend_from_slice(t);
+        salida_i.extend_from_slice(&[a, b, c]);
     }
 
     (salida_v, salida_i)

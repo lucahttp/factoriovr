@@ -46,6 +46,9 @@ fi
     -DXR_USE_GRAPHICS_API_OPENGL_ES=1 \
     "$PROJECT_ROOT/android/src/launcher.cpp" \
     "$PROJECT_ROOT/android/src/openxr_engine.cpp" \
+    "$PROJECT_ROOT/android/src/puente_entrada.cpp" \
+    "$PROJECT_ROOT/android/src/panel_mesa.cpp" \
+    "$PROJECT_ROOT/android/src/ancla_espacial.cpp" \
     -L"$PROJECT_ROOT/android/lib/arm64-v8a" \
     -L"$BUILD_DIR/apk/lib/arm64-v8a" \
     -lopenxr_loader -lxfactorvr -lEGL -lGLESv3 \

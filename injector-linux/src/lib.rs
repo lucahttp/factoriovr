@@ -15,6 +15,22 @@
 //!   XFACTORVR_HOOK_TARGET=X  otro simbolo que enganchar (por defecto GameRenderer::render)
 //!   XFACTORVR_HOOK_PATCH=corto|largo  fuerza el estilo de parche
 //!
+//! # Modelos 3D
+//!
+//!   XFACTORVR_MODELOS_DIR=RUTA   directorio con `manifest.json` y los `.glb`
+//!                                (los mismos ficheros que
+//!                                `android/src/main/assets/models/`).  Es la
+//!                                variable que dice al inyector donde estan
+//!                                los modelos 3D de verdad.
+//!
+//!   XFACTORVR_3D=0        apaga el modulo 3D entero (no se instala ningun hook)
+//!   XFACTORVR_3D_CUBO=1   dibuja tambien el cubo de prueba (ademas de los modelos)
+//!   XFACTORVR_3D_SIN_SPRITE=1  el modelo 3D sustituye al sprite 2D de la entidad
+//!   XFACTORVR_3D_SIN_MODELOS=1  no busca modelos (solo el cubo)
+//!   XFACTORVR_3D_CADA_FLUSH=N   cada cuantos flush se redibujan los modelos
+//!   XFACTORVR_3D_CAPTURA=RUTA   guarda un PNG del framebuffer del mundo
+//!   XFACTORVR_3D_CAMARA=D   desplazamiento de la camara (estereo, en pixels)
+//!
 //! Solo std: ni una dependencia externa.
 
 pub mod autostart;
@@ -22,12 +38,18 @@ pub mod demangle;
 pub mod detour;
 pub mod diagnostico;
 pub mod elf;
+pub mod entrada;
 pub mod fase_juego;
+pub mod glb;
 pub mod gnu_unwind;
 pub mod hooks;
 pub mod log;
+pub mod json;
 pub mod maps;
 pub mod modelo3d;
+pub mod modelos;
+pub mod proto;
+pub mod render3d;
 pub mod resolver;
 pub mod stream;
 

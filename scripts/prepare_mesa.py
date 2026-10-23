@@ -28,8 +28,14 @@ import sys
 import tarfile
 import urllib.request
 
-MIRROR = "https://deb.debian.org/debian"
-DIST = "bookworm"
+# Ubuntu noble (24.04).  Se usa Ubuntu y no Debian por una razon concreta:
+# con el Mesa de Debian 22.3 el vendor EGL (libEGL_mesa.so.0) NO exporta los
+# simbolos egl*, asi que el despachador de glvnd se queda sin vendor y SDL2
+# muere con "Could not find a valid EGL device to initialize".  Con el Mesa de
+# Ubuntu 24.04 (25.2) la combinacion funciona: es exactamente la del
+# contenedor, donde el cliente grafico abre ventana sin problema.
+MIRROR = "http://archive.ubuntu.com/ubuntu"
+DIST = "noble"
 ARCH = "arm64"
 
 # Paquetes: runtime de Mesa con Zink, loader de Vulkan, lavapipe y glibc.
@@ -48,7 +54,8 @@ PAQUETES = [
     # cliente grafico arranca pero muere con "Could not initialize OpenGL /
     # GLES library".
     "libgles2-mesa", "libgles2",
-    "libvulkan1", "mesa-vulkan-drivers", "mesa-zink", "libllvm15", "libsensors5",
+    "libvulkan1", "mesa-vulkan-drivers", "mesa-zink", "mesa-libgallium",
+    "libllvm20", "libsensors5",
     "libxcb1", "libx11-6", "libxau6", "libxdmcp6", "libxext6", "libbsd0",
     "libmd0",
     # Dependencias DIRECTAS de zink_dri.so / libvulkan_*.so / libEGL_mesa.so.0.
@@ -67,7 +74,7 @@ PAQUETES = [
     # libffi...).  El enlazador tambien las exige al cargar, asi que si faltan
     # el vendor EGL de Mesa no llega a cargarse nunca.
     "libffi8", "libedit2", "libtinfo6", "libxml2", "libz3-4",
-    "libicu72", "liblzma5",
+    "libicu74", "liblzma5",
     # SDL2 (el cliente lo lleva estatico, pero lo dejamos por si acaso)
     "libsdl2-2.0-0",
 ]

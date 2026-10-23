@@ -735,6 +735,12 @@ static float s_last_mining_strike = 0.0f;
 // ============================================================================
 static const char* LAYOUT_FILE_PATH = "/sdcard/XFactorVR/layout.json";
 
+// El HUD NUEVO (src/ui/ en Rust) sustituye a la consola holografica dibujada a
+// mano: una sola tabla de controles para los pixeles y el hit-test, y el Rust
+// decide que hace cada boton.  Se deja el interruptor para poder volver a la
+// consola vieja en un segundo si en el dispositivo se ve mejor.
+static const bool PREFERIR_HUD_NUEVO = true;
+
 static void update_table_matrix();
 
 static void save_tabletop_layout() {
@@ -2074,23 +2080,28 @@ static void draw_tabletop_scene(const float* vp_mat,
         draw_sprite_batch(s_sprite_batches[p], (uint32_t)p, active_model, vp_mat);
     }
 
-    // F) Consola UI Holográfica Espacial (Generals XR pattern)
+    // F) Consola UI Holográfica (la vieja, dibujada a mano).
+    //
+    // Con PREFERIR_HUD_NUEVO la consola la pinta el modulo Rust (src/ui/),
+    // que ademas trae el hit-test de la MISMA tabla: los pixeles y las zonas
+    // de pulsacion no pueden desincronizarse.
     float hd = TABLE_HALF_D;
     float ui_z = -hd - 0.08f;
     float ui_y = 0.18f;
+    if (!PREFERIR_HUD_NUEVO) {
+        if (!s_observer_mode) {
+            float ui_mvp[16];
+            mat4_multiply(vp_mat, active_model, ui_mvp);
+            glUniformMatrix4fv(s_model_loc, 1, GL_FALSE, active_model);
+            glUniformMatrix4fv(s_mvp_loc, 1, GL_FALSE, ui_mvp);
 
-    if (!s_observer_mode) {
-        float ui_mvp[16];
-        mat4_multiply(vp_mat, active_model, ui_mvp);
-        glUniformMatrix4fv(s_model_loc, 1, GL_FALSE, active_model);
-        glUniformMatrix4fv(s_mvp_loc, 1, GL_FALSE, ui_mvp);
-
-        glUniform1f(s_enable_clipping_loc, 0.0f); // Sin recorte para el panel flotante
-        glUniform1f(s_use_tex_loc, 0.0f);
-        glUniform1f(s_lit_loc, 0.35f);
-        glBindVertexArray(s_vao_ui);
-        glDrawArrays(GL_TRIANGLES, 0, s_count_ui);
-        glUniform1f(s_enable_clipping_loc, 1.0f); // Restaurar recorte de la mesa física
+            glUniform1f(s_enable_clipping_loc, 0.0f); // Sin recorte para el panel flotante
+            glUniform1f(s_use_tex_loc, 0.0f);
+            glUniform1f(s_lit_loc, 0.35f);
+            glBindVertexArray(s_vao_ui);
+            glDrawArrays(GL_TRIANGLES, 0, s_count_ui);
+            glUniform1f(s_enable_clipping_loc, 1.0f); // Restaurar recorte de la mesa fisica
+        }
     }
 
     // G) GEOMETRÍA DINÁMICA DE LA FÁBRICA Y PIEZAS MÓVILES (FASE 3)
@@ -2471,135 +2482,140 @@ static void draw_tabletop_scene(const float* vp_mat,
                 }
             }
         }
-        float ui_plane_z = -TABLE_HALF_D - 0.08f;
-        float ui_world_z = s_table_pos.z + (ui_plane_z * cosf(s_table_yaw));
-        float t_ui = (ui_world_z - rz) / (dz != 0 ? dz : 1e-4f);
-        if (t_ui > 0.0f && t_ui < ray_len) {
-            float ui_hit_x = rx + dx * t_ui;
-            float ui_hit_y = ry + dy * t_ui;
-            float rel_x = ui_hit_x - s_table_pos.x;
-            float rel_y = ui_hit_y - (s_table_pos.y + 0.18f);
+        // Si el HUD NUEVO ya ha dado un control, el rayo es suyo: la
+        // consola vieja y su quickbar se saltan (si no, un boton invisible
+        // del HUD activaria la consola de al lado).
+        if (hud_control < 0) {
+            float ui_plane_z = -TABLE_HALF_D - 0.08f;
+            float ui_world_z = s_table_pos.z + (ui_plane_z * cosf(s_table_yaw));
+            float t_ui = (ui_world_z - rz) / (dz != 0 ? dz : 1e-4f);
+            if (t_ui > 0.0f && t_ui < ray_len) {
+                float ui_hit_x = rx + dx * t_ui;
+                float ui_hit_y = ry + dy * t_ui;
+                float rel_x = ui_hit_x - s_table_pos.x;
+                float rel_y = ui_hit_y - (s_table_pos.y + 0.18f);
 
-            if (fabsf(rel_x) < 0.31f && fabsf(rel_y) < 0.14f) {
-                has_ui_hit = true;
-                ray_len = t_ui;
-                // El HUD esta delante de la mesa: si el rayo lo alcanza, el
-                // HUD gana el puntero y el panel del motor no se lleva el clic.
-                has_panel_hit = false;
+                if (fabsf(rel_x) < 0.31f && fabsf(rel_y) < 0.14f) {
+                    has_ui_hit = true;
+                    ray_len = t_ui;
+                    // El HUD esta delante de la mesa: si el rayo lo alcanza, el
+                    // HUD gana el puntero y el panel del motor no se lleva el clic.
+                    has_panel_hit = false;
 
-                // Botones de comando superiores (rel_y > 0.02)
-                if (rel_y > 0.02f) {
-                    float btn_w = 0.108f;
-                    for (int b = -2; b <= 2; ++b) {
-                        float bx = (float)b * (btn_w + 0.012f);
-                        if (fabsf(rel_x - bx) < btn_w * 0.5f && fabsf(rel_y - 0.065f) < 0.018f) {
-                            s_hovered_ui_btn = b + 2; // 0..4
-                            break;
-                        }
-                    }
-
-                    if (is_primary_eye && trigger_clicked && s_hovered_ui_btn >= 0) {
-                        trigger_controller_haptics(session, haptic_action, 0.45f, 25.0f);
-                        play_spatial_sound(SFX_CLICK, ui_hit_x, ui_hit_y, ui_world_z);
-                        if (s_hovered_ui_btn == 0) {
-                            s_observer_mode = !s_observer_mode;
-                            LOGI("Modo cambiado: %s", s_observer_mode ? "OBSERVADOR 1:1" : "TABLETOP DIORAMA");
-                        } else if (s_hovered_ui_btn == 1) {
-                            s_table_placed = false;
-                            LOGI("Re-anclando mesa...");
-                            // Ademas, si el runtime trae el sensing espacial,
-                            // se vuelve a buscar la mesa REAL (planos
-                            // horizontales) para clavar la fabrica en ella.
-                            if (xfv::ancla_espacial_disponible()) {
-                                if (xfv::ancla_espacial_preparar_mesa()) {
-                                    LOGI("Anclaje espacial: buscando la mesa real...");
-                                } else {
-                                    LOGI("Anclaje espacial: no se pudo buscar la mesa (%s)",
-                                         xfv::ancla_espacial_estado());
-                                }
-                            }
-                        } else {
-                            s_active_ui_tab = s_hovered_ui_btn - 2;
-                        }
-                    }
-                }
-                // Ranuras de Quickbar o Recetas de Crafteo (rel_y <= 0.0)
-                else if (rel_y <= 0.0f && rel_y >= -0.10f) {
-                    if (s_active_ui_tab == 2) {
-                        // Modo Crafteo: 7 botones de recetas
-                        float recipe_w = 0.088f;
-                        s_hovered_recipe = -1;
-                        for (int r = 0; r < CRAFT_RECIPE_COUNT; ++r) {
-                            float rx_btn = (float)(r - (CRAFT_RECIPE_COUNT - 1) / 2) * (recipe_w + 0.008f);
-                            if (fabsf(rel_x - rx_btn) < recipe_w * 0.5f && fabsf(rel_y - (-0.055f)) < 0.025f) {
-                                s_hovered_recipe = r;
+                    // Botones de comando superiores (rel_y > 0.02)
+                    if (rel_y > 0.02f) {
+                        float btn_w = 0.108f;
+                        for (int b = -2; b <= 2; ++b) {
+                            float bx = (float)b * (btn_w + 0.012f);
+                            if (fabsf(rel_x - bx) < btn_w * 0.5f && fabsf(rel_y - 0.065f) < 0.018f) {
+                                s_hovered_ui_btn = b + 2; // 0..4
                                 break;
                             }
                         }
 
-                        if (is_primary_eye && trigger_clicked && s_hovered_recipe >= 0) {
-                            // Horno(11), Engranaje(7), Circuito(8), Cinta(12), Minera(10),
-                            // Insertador(13), Ensambladora(9)
-                            const uint32_t recipe_item_ids[CRAFT_RECIPE_COUNT] = { 11, 7, 8, 12, 10, 13, 9 };
-                            if (s_craft_item) {
-                                bool crafted = s_craft_item(recipe_item_ids[s_hovered_recipe], 1);
-                                if (crafted) {
-                                    LOGI("Crafteado item_id=%d con éxito", recipe_item_ids[s_hovered_recipe]);
-                                    trigger_controller_haptics(session, haptic_action, 0.8f, 50.0f);
-                                    play_spatial_sound(SFX_CRAFT, ui_hit_x, ui_hit_y, ui_world_z);
-                                    for (int k = 0; k < 18; ++k) {
-                                        spawn_particle(ui_hit_x, ui_hit_y, ui_world_z,
-                                                       ((rand() % 100) - 50) * 0.001f, 0.02f + (rand() % 40) * 0.0005f, ((rand() % 100) - 50) * 0.001f,
-                                                       1.0f, 0.88f, 0.20f, 0.95f, 0.009f, 0.6f);
+                        if (is_primary_eye && trigger_clicked && s_hovered_ui_btn >= 0) {
+                            trigger_controller_haptics(session, haptic_action, 0.45f, 25.0f);
+                            play_spatial_sound(SFX_CLICK, ui_hit_x, ui_hit_y, ui_world_z);
+                            if (s_hovered_ui_btn == 0) {
+                                s_observer_mode = !s_observer_mode;
+                                LOGI("Modo cambiado: %s", s_observer_mode ? "OBSERVADOR 1:1" : "TABLETOP DIORAMA");
+                            } else if (s_hovered_ui_btn == 1) {
+                                s_table_placed = false;
+                                LOGI("Re-anclando mesa...");
+                                // Ademas, si el runtime trae el sensing espacial,
+                                // se vuelve a buscar la mesa REAL (planos
+                                // horizontales) para clavar la fabrica en ella.
+                                if (xfv::ancla_espacial_disponible()) {
+                                    if (xfv::ancla_espacial_preparar_mesa()) {
+                                        LOGI("Anclaje espacial: buscando la mesa real...");
+                                    } else {
+                                        LOGI("Anclaje espacial: no se pudo buscar la mesa (%s)",
+                                             xfv::ancla_espacial_estado());
+                                    }
+                                }
+                            } else {
+                                s_active_ui_tab = s_hovered_ui_btn - 2;
+                            }
+                        }
+                    }
+                    // Ranuras de Quickbar o Recetas de Crafteo (rel_y <= 0.0)
+                    else if (rel_y <= 0.0f && rel_y >= -0.10f) {
+                        if (s_active_ui_tab == 2) {
+                            // Modo Crafteo: 7 botones de recetas
+                            float recipe_w = 0.088f;
+                            s_hovered_recipe = -1;
+                            for (int r = 0; r < CRAFT_RECIPE_COUNT; ++r) {
+                                float rx_btn = (float)(r - (CRAFT_RECIPE_COUNT - 1) / 2) * (recipe_w + 0.008f);
+                                if (fabsf(rel_x - rx_btn) < recipe_w * 0.5f && fabsf(rel_y - (-0.055f)) < 0.025f) {
+                                    s_hovered_recipe = r;
+                                    break;
+                                }
+                            }
+
+                            if (is_primary_eye && trigger_clicked && s_hovered_recipe >= 0) {
+                                // Horno(11), Engranaje(7), Circuito(8), Cinta(12), Minera(10),
+                                // Insertador(13), Ensambladora(9)
+                                const uint32_t recipe_item_ids[CRAFT_RECIPE_COUNT] = { 11, 7, 8, 12, 10, 13, 9 };
+                                if (s_craft_item) {
+                                    bool crafted = s_craft_item(recipe_item_ids[s_hovered_recipe], 1);
+                                    if (crafted) {
+                                        LOGI("Crafteado item_id=%d con éxito", recipe_item_ids[s_hovered_recipe]);
+                                        trigger_controller_haptics(session, haptic_action, 0.8f, 50.0f);
+                                        play_spatial_sound(SFX_CRAFT, ui_hit_x, ui_hit_y, ui_world_z);
+                                        for (int k = 0; k < 18; ++k) {
+                                            spawn_particle(ui_hit_x, ui_hit_y, ui_world_z,
+                                                           ((rand() % 100) - 50) * 0.001f, 0.02f + (rand() % 40) * 0.0005f, ((rand() % 100) - 50) * 0.001f,
+                                                           1.0f, 0.88f, 0.20f, 0.95f, 0.009f, 0.6f);
+                                        }
                                     }
                                 }
                             }
-                        }
-                    } else if (s_active_ui_tab == 0) {
-                        // Modo Quickbar: 9 ranuras de construcción
-                        float slot_w = 0.055f;
-                        for (int s = 0; s < 9; ++s) {
-                            float sx = (float)(s - 4) * (slot_w + 0.010f);
-                            if (fabsf(rel_x - sx) < slot_w * 0.5f && fabsf(rel_y - (-0.055f)) < 0.022f) {
-                                s_hovered_quickbar_slot = s;
-                                break;
+                        } else if (s_active_ui_tab == 0) {
+                            // Modo Quickbar: 9 ranuras de construcción
+                            float slot_w = 0.055f;
+                            for (int s = 0; s < 9; ++s) {
+                                float sx = (float)(s - 4) * (slot_w + 0.010f);
+                                if (fabsf(rel_x - sx) < slot_w * 0.5f && fabsf(rel_y - (-0.055f)) < 0.022f) {
+                                    s_hovered_quickbar_slot = s;
+                                    break;
+                                }
                             }
-                        }
 
-                        if (is_primary_eye && trigger_clicked && s_hovered_quickbar_slot >= 0) {
-                            const int slot_to_entity[9] = {
-                                ENTITY_ASSEMBLING_MACHINE, ENTITY_MINING_DRILL, ENTITY_FURNACE,
-                                ENTITY_GUN_TURRET, ENTITY_RADAR, ENTITY_ROBOPORT,
-                                ENTITY_CHEST, ENTITY_ELECTRIC_POLE, ENTITY_NONE
-                            };
-                            s_selected_build_tool = slot_to_entity[s_hovered_quickbar_slot];
-                            LOGI("Quickbar: Herramienta seleccionada = %d (slot %d)", s_selected_build_tool, s_hovered_quickbar_slot);
-                            trigger_controller_haptics(session, haptic_action, 0.5f, 30.0f);
-                            play_spatial_sound(SFX_CLICK, ui_hit_x, ui_hit_y, ui_world_z);
-                            for (int k = 0; k < 12; ++k) {
-                                spawn_particle(ui_hit_x, ui_hit_y, ui_world_z,
-                                               ((rand() % 100) - 50) * 0.001f, ((rand() % 100) - 50) * 0.001f, 0.02f,
-                                               0.20f, 0.95f, 1.0f, 0.9f, 0.008f, 0.4f);
+                            if (is_primary_eye && trigger_clicked && s_hovered_quickbar_slot >= 0) {
+                                const int slot_to_entity[9] = {
+                                    ENTITY_ASSEMBLING_MACHINE, ENTITY_MINING_DRILL, ENTITY_FURNACE,
+                                    ENTITY_GUN_TURRET, ENTITY_RADAR, ENTITY_ROBOPORT,
+                                    ENTITY_CHEST, ENTITY_ELECTRIC_POLE, ENTITY_NONE
+                                };
+                                s_selected_build_tool = slot_to_entity[s_hovered_quickbar_slot];
+                                LOGI("Quickbar: Herramienta seleccionada = %d (slot %d)", s_selected_build_tool, s_hovered_quickbar_slot);
+                                trigger_controller_haptics(session, haptic_action, 0.5f, 30.0f);
+                                play_spatial_sound(SFX_CLICK, ui_hit_x, ui_hit_y, ui_world_z);
+                                for (int k = 0; k < 12; ++k) {
+                                    spawn_particle(ui_hit_x, ui_hit_y, ui_world_z,
+                                                   ((rand() % 100) - 50) * 0.001f, ((rand() % 100) - 50) * 0.001f, 0.02f,
+                                                   0.20f, 0.95f, 1.0f, 0.9f, 0.008f, 0.4f);
+                                }
                             }
                         }
                     }
                 }
             }
-        }
 
-        // --- EL GATILLO SE ENTREGA AL GANADOR ------------------------------
-        // Ya han competido el panel del motor (XFCE), el HUD y la mesa, y ha
-        // ganado el MAS CERCANO (criterio de Generals-Zero-Hour-XR).  El panel
-        // esta tumbado en la mesa, 5 mm por encima, asi que si el rayo lo
-        // toca el clic va al motor y el diorama no dispara nada debajo.
-        if (has_panel_hit && trigger_clicked && !s_observer_mode) {
-            s_juego_click_x = panel_px;
-            s_juego_click_y = panel_py;
-            s_juego_click_armado = true;
-            // ARMAR: accion = 1 (boton abajo).  La soltura se envia cuando el
-            // dedo se levanta, sobre la MISMA posicion (ver el bucle de frames).
-            xfv::puente_entrada_arma_soltar(panel_px, panel_py, 1);
-            LOGI("Clic XFCE ARMADO en pixel (%d, %d) del motor", panel_px, panel_py);
+            // --- EL GATILLO SE ENTREGA AL GANADOR ------------------------------
+            // Ya han competido el panel del motor (XFCE), el HUD y la mesa, y ha
+            // ganado el MAS CERCANO (criterio de Generals-Zero-Hour-XR).  El panel
+            // esta tumbado en la mesa, 5 mm por encima, asi que si el rayo lo
+            // toca el clic va al motor y el diorama no dispara nada debajo.
+            if (has_panel_hit && trigger_clicked && !s_observer_mode) {
+                s_juego_click_x = panel_px;
+                s_juego_click_y = panel_py;
+                s_juego_click_armado = true;
+                // ARMAR: accion = 1 (boton abajo).  La soltura se envia cuando el
+                // dedo se levanta, sobre la MISMA posicion (ver el bucle de frames).
+                xfv::puente_entrada_arma_soltar(panel_px, panel_py, 1);
+                LOGI("Clic XFCE ARMADO en pixel (%d, %d) del motor", panel_px, panel_py);
+            }
         }
 
         // 3. Rejilla Magnética (Grid Snapping) y Ghost Preview 6DoF sobre la mesa (Fase 2)

@@ -1,18 +1,16 @@
 /* probe_egl.c — Sonda EGL minima para el visor (Pico 4 Ultra).
  *
- * Responde: ¿que ve Mesa en este dispositivo?  Con esto se diagnostica el
- * "Could not find a valid EGL device to initialize" que SDL2 tira al crear
- * la ventana: el cliente grafico de Factorio lo dice sin mas detalle.
- *
- * NO lleva includes a proposito: el sysroot de glibc del proyecto trae las
+ * Sin includes a proposito: el sysroot de glibc del proyecto trae las
  * librerias pero no las cabeceras, y las de la NDK son de bionic.  Se
- * declaran a mano las cuatro funciones que se usan.
+ * declaran a mano las funciones que se usan.
  *
- * Se compila contra el sysroot de glibc ARM64:
+ * Compilacion (ARM64, glibc):
  *   aarch64-linux-android34-clang --target=aarch64-linux-gnu \
- *       --sysroot=build/glibc_sysroot -O2 -o probe_egl probe_egl.c \
- *       -Lbuild/glibc_sysroot/link -ldl
- * y se ejecuta en el visor con el loader de glibc del payload.
+ *     --sysroot=build/glibc_sysroot -O2 -o probe_egl probe_egl.c \
+ *     -Lbuild/glibc_sysroot/link -ldl
+ *
+ * Uso en el visor:
+ *   LD_LIBRARY_PATH=... ./glibc/lib/ld-linux-aarch64.so.1 --library-path ... ./probe_egl
  */
 
 extern int printf(const char *fmt, ...);
@@ -27,6 +25,7 @@ extern const char *dlerror(void);
 #define EGL_EXTENSIONS 0x3055
 #define EGL_VERSION 0x3054
 #define EGL_PLATFORM_SURFACELESS_MESA 0x31DD
+#define EGL_PLATFORM_DEVICE_EXT 0x3138
 
 typedef const char *(*fn_query_string)(void *display, int name);
 typedef unsigned int (*fn_query_devices)(int max, void **devices, int *count);
@@ -45,45 +44,70 @@ static int contiene(const char *s, const char *needle) {
         while (*p && *p != ' ') p++;
         while (*p == ' ') p++;
     }
+    return 0;
+}
 
-    /* --- El vendor de Mesa por su cuenta: sin glvnd por medio --- */
-    {
-        void *vend = dlopen("libEGL_mesa.so.0", RTLD_NOW | RTLD_LOCAL);
-        if (!vend) {
-            printf("dlopen libEGL_mesa.so.0 fallo: %s\n", dlerror());
-        } else {
-            printf("libEGL_mesa.so.0: cargada\n");
-            fn_query_string vq = (fn_query_string)dlsym(vend, "eglQueryString");
-            fn_get_platform_display vgp = (fn_get_platform_display)dlsym(vend, "eglGetPlatformDisplay");
-            fn_initialize vi = (fn_initialize)dlsym(vend, "eglInitialize");
-            fn_get_error vge = (fn_get_error)dlsym(vend, "eglGetError");
-            if (vq) {
-                const char *ve = vq(EGL_NO_DISPLAY, EGL_EXTENSIONS);
-                printf("  extensions del vendor: %s\n", ve ? ve : "(null)");
-                printf("  EGL_EXT_device_base: %s\n", contiene(ve, "EGL_EXT_device_base") ? "SI" : "NO");
-                printf("  EGL_MESA_platform_surfaceless: %s\n",
-                       contiene(ve, "EGL_MESA_platform_surfaceless") ? "SI" : "NO");
+static void inspecciona_vendor(const char *nombre, void *lib) {
+    fn_query_string q = (fn_query_string)dlsym(lib, "eglQueryString");
+    fn_query_devices qd = (fn_query_devices)dlsym(lib, "eglQueryDevicesEXT");
+    fn_get_platform_display gp = (fn_get_platform_display)dlsym(lib, "eglGetPlatformDisplay");
+    fn_initialize ini = (fn_initialize)dlsym(lib, "eglInitialize");
+    fn_get_error ge = (fn_get_error)dlsym(lib, "eglGetError");
+
+    printf("--- %s ---\n", nombre);
+    if (!q) { printf("  sin eglQueryString\n"); return; }
+    const char *ext = q(EGL_NO_DISPLAY, EGL_EXTENSIONS);
+    printf("  extensions de cliente: [%s]\n", ext ? ext : "(null)");
+    printf("  EGL_EXT_device_base: %s\n", contiene(ext, "EGL_EXT_device_base") ? "SI" : "NO");
+    printf("  EGL_MESA_platform_surfaceless: %s\n",
+           contiene(ext, "EGL_MESA_platform_surfaceless") ? "SI" : "NO");
+    printf("  EGL_MESA_device_software: %s\n",
+           contiene(ext, "EGL_MESA_device_software") ? "SI" : "NO");
+
+    if (qd) {
+        void *devs[16];
+        int n = 0;
+        if (qd(16, devs, &n)) {
+            printf("  eglQueryDevicesEXT -> %d device(s)\n", n);
+            for (int i = 0; i < n && i < 8; ++i) {
+                const char *de = q(devs[i], EGL_EXTENSIONS);
+                printf("    device %d: %s\n", i, de ? de : "(sin extensions)");
             }
-            if (vgp && vi) {
-                void *vdpy = vgp(EGL_PLATFORM_SURFACELESS_MESA, 0, 0);
-                if (vdpy) {
+            /* Se intenta inicializar el primero, como hace SDL. */
+            if (gp && ini && n > 0) {
+                void *dpy = gp(EGL_PLATFORM_DEVICE_EXT, devs[0], 0);
+                if (dpy) {
                     int a = 0, b = 0;
-                    if (vi(vdpy, &a, &b)) {
-                        printf("  vendor SURFACELESS: EGL %d.%d OK\n", a, b);
-                        const char *v = vq(vdpy, EGL_VERSION);
-                        printf("    version: %s\n", v ? v : "(?)");
-                        const char *de = vq(vdpy, EGL_EXTENSIONS);
-                        printf("    extensions del display: %s\n", de ? de : "(null)");
+                    if (ini(dpy, &a, &b)) {
+                        printf("    device 0: EGL %d.%d INICIALIZADO\n", a, b);
                     } else {
-                        printf("  vendor SURFACELESS: eglInitialize fallo 0x%x\n", vge ? vge() : 0);
+                        printf("    device 0: eglInitialize fallo 0x%x\n", ge ? ge() : 0);
                     }
                 } else {
-                    printf("  vendor SURFACELESS: NULL (eglGetError=0x%x)\n", vge ? vge() : 0);
+                    printf("    device 0: eglGetPlatformDisplay(DEVICE_EXT) = NULL (0x%x)\n",
+                           ge ? ge() : 0);
                 }
             }
+        } else {
+            printf("  eglQueryDevicesEXT -> fallo\n");
+        }
+    } else {
+        printf("  NO exporta eglQueryDevicesEXT\n");
+    }
+
+    if (gp && ini) {
+        void *dpy = gp(EGL_PLATFORM_SURFACELESS_MESA, 0, 0);
+        if (dpy) {
+            int a = 0, b = 0;
+            if (ini(dpy, &a, &b)) {
+                printf("  SURFACELESS: EGL %d.%d OK\n", a, b);
+            } else {
+                printf("  SURFACELESS: eglInitialize fallo 0x%x\n", ge ? ge() : 0);
+            }
+        } else {
+            printf("  SURFACELESS: NULL (0x%x)\n", ge ? ge() : 0);
         }
     }
-    return 0;
 }
 
 int main(void) {
@@ -92,58 +116,13 @@ int main(void) {
         printf("dlopen libEGL.so.1 fallo: %s\n", dlerror());
         return 1;
     }
-    printf("libEGL.so.1: cargada\n");
+    inspecciona_vendor("libEGL.so.1 (despachador glvnd)", egl);
 
-    fn_query_string query_string = (fn_query_string)dlsym(egl, "eglQueryString");
-    fn_query_devices query_devices = (fn_query_devices)dlsym(egl, "eglQueryDevicesEXT");
-    fn_get_platform_display get_platform_display =
-        (fn_get_platform_display)dlsym(egl, "eglGetPlatformDisplay");
-    fn_initialize initialize = (fn_initialize)dlsym(egl, "eglInitialize");
-    fn_get_error get_error = (fn_get_error)dlsym(egl, "eglGetError");
-
-    if (query_string) {
-        const char *exts = query_string(EGL_NO_DISPLAY, EGL_EXTENSIONS);
-        printf("extensiones del cliente EGL:\n  %s\n", exts ? exts : "(ninguna)");
-        printf("  EGL_EXT_device_base: %s\n", contiene(exts, "EGL_EXT_device_base") ? "SI" : "NO");
-        printf("  EGL_MESA_platform_surfaceless: %s\n",
-               contiene(exts, "EGL_MESA_platform_surfaceless") ? "SI" : "NO");
-        printf("  EGL_MESA_device_software: %s\n",
-               contiene(exts, "EGL_MESA_device_software") ? "SI" : "NO");
+    void *vend = dlopen("libEGL_mesa.so.0", RTLD_NOW | RTLD_LOCAL);
+    if (!vend) {
+        printf("dlopen libEGL_mesa.so.0 fallo: %s\n", dlerror());
     } else {
-        printf("no hay eglQueryString\n");
-    }
-
-    if (query_devices) {
-        void *devs[16];
-        int n = 0;
-        if (query_devices(16, devs, &n)) {
-            printf("eglQueryDevicesEXT -> %d device(s)\n", n);
-            for (int i = 0; i < n && i < 8; ++i) {
-                const char *exts = query_string(devs[i], EGL_EXTENSIONS);
-                printf("  device %d: %s\n", i, exts ? exts : "(sin extensions)");
-            }
-        } else {
-            printf("eglQueryDevicesEXT -> fallo\n");
-        }
-    } else {
-        printf("no hay eglQueryDevicesEXT (EGL_EXT_device_base no presente)\n");
-    }
-
-    if (get_platform_display && initialize) {
-        void *dpy = get_platform_display(EGL_PLATFORM_SURFACELESS_MESA, 0, 0);
-        if (dpy) {
-            int maj = 0, min = 0;
-            if (initialize(dpy, &maj, &min)) {
-                printf("plataforma SURFACELESS: EGL %d.%d inicializada\n", maj, min);
-                const char *v = query_string(dpy, EGL_VERSION);
-                printf("  version: %s\n", v ? v : "(?)");
-            } else {
-                printf("plataforma SURFACELESS: eglInitialize fallo, eglGetError=0x%x\n",
-                       get_error ? get_error() : 0);
-            }
-        } else {
-            printf("plataforma SURFACELESS: eglGetPlatformDisplay devolvio NULL\n");
-        }
+        inspecciona_vendor("libEGL_mesa.so.0 (vendor de Mesa)", vend);
     }
     return 0;
 }

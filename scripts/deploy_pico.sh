@@ -334,6 +334,17 @@ if [ -f "$LOCAL_ASSETS/manifest.json" ]; then
         [ -f "$f" ] || continue
         "$ADB" push "$f" "$REMOTE_DATA/assets/$(basename "$f")"
     done
+    # El atlas de SUELO va en ficheros aparte (terrain_atlas_N.rgba).  Sin esto
+    # el visor avisa "no hay atlas de suelo (paginas=0)" y el suelo de la mesa
+    # se dibuja sin textura.
+    for f in "$LOCAL_ASSETS"/terrain_atlas_*.rgba; do
+        [ -f "$f" ] || continue
+        "$ADB" push "$f" "$REMOTE_DATA/assets/$(basename "$f")"
+    done
+    for f in "$LOCAL_ASSETS"/terrain_atlas_*.png; do
+        [ -f "$f" ] || continue
+        "$ADB" push "$f" "$REMOTE_DATA/assets/$(basename "$f")"
+    done
     "$ADB" shell "chmod 644 $REMOTE_DATA/assets/*" 2>/dev/null || true
 else
     echo "[6/7] AVISO: sin atlas de sprites; se dibujaran primitivas."

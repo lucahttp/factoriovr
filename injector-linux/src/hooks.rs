@@ -75,6 +75,11 @@ pub extern "C" fn xfv_hook_process_events(this: *mut c_void, in_game: u8) -> u8 
     // se puede llamar desde dentro de `AppManager::process()` (es
     // reentrante: el motor esta recorriendo la pila de estados).
     crate::autostart::tick_carga();
+    // Una llamada al motor EN PROCESO por segundo (diagnostico del puente).
+    // Aqui se fija tambien el hilo principal: el puente de Lua solo puede
+    // tocar los estados de Lua de ESE hilo (ver lua_bridge.rs).
+    crate::lua_bridge::fijar_hilo_principal();
+    crate::lua_bridge::tick();
 
     let tramp = TRAMPOLIN_EVENTS.load(Ordering::Relaxed);
     if tramp == 0 {
@@ -266,6 +271,23 @@ pub fn instalar() {
     // --- envio de la imagen real del juego al visor VR ---
     // Se activa con `XFACTORVR_STREAM=host:puerto`. Si no esta, no hace nada.
     crate::stream::configurar();
+
+    // --- puente de Lua: hablar con el motor POR DENTRO, sin RCON ---
+    // Engancha `lua_pcallk` (y `lua_pushstring`/`lua_rawgeti`/`lua_gettable`,
+    // que son las que el motor usa de verdad) para capturar el `lua_State*`;
+    // con el se puede llamar a `remote.call(...)` en proceso (ver ADR-018).
+    //
+    // OJO: va APAGADO por defecto.  La captura del estado funciona (medido:
+    // 38 738 llamadas a lua_pushstring y 3 estados vistos), pero la llamada
+    // en proceso todavia revienta el motor con "invalid index" en
+    // `lua_rawgeti` (SIGABRT).  El motor tiene Lua en varios hilos y el
+    // `lua_State*` capturado no parece el del hilo principal.  Hasta
+    // resolverlo, se activa solo con XFACTORVR_LUA_BRIDGE=1.
+    if std::env::var("XFACTORVR_LUA_BRIDGE").ok().as_deref() == Some("1") {
+        crate::lua_bridge::instalar(&simbolos);
+    } else {
+        log::info("lua_bridge: apagado (activalo con XFACTORVR_LUA_BRIDGE=1)");
+    }
 
     // --- puente de entrada: la mano del VR entra como el raton del motor ---
     // Se activa con `XFACTORVR_ENTRADA_PUERTO`. Con esto el motor deja de

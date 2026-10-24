@@ -3806,15 +3806,6 @@ static void* openxr_thread_main(void* arg) {
     eglMakeCurrent(egl_display, egl_surface, egl_surface, egl_context);
     LOGI("Contexto EGL / OpenGL ES 3.2 creado y activo");
 
-    // El renderer 3D del visor necesita el contexto GL corriente: se prepara
-    // una sola vez, aqui.
-    if (s_3d_iniciar) {
-        if (s_3d_iniciar()) {
-            LOGI("Renderer 3D instanciado listo (modelos GLB por prototipo)");
-        } else {
-            LOGE("El renderer 3D no arranco: las maquinas se veran con su sprite 2D");
-        }
-    }
 
     // 6. Crear XrSession
     XrGraphicsBindingOpenGLESAndroidKHR glesBinding = {
@@ -4128,10 +4119,16 @@ static void* openxr_thread_main(void* arg) {
     init_tabletop_scene();
     init_audio_system();
 
-    // SGSR (upscaling de Qualcomm): la escena se dibuja a 1440x1440 y se
-    // reescala a la resolucion del visor (2160x2160 en la Pico 4 Ultra).
-    // Solo se usa si el modulo Rust lo deja preparado: si falla, se dibuja
-    // directamente al framebuffer del visor como siempre.
+    // El renderer 3D y el SGSR se preparan DESPUES de init_tabletop_scene(),
+    // que es donde se enlazan las FFI del crate de Rust: antes los punteros
+    // eran nulos y ni el renderer ni el SGSR llegaban a arrancar.
+    if (s_3d_iniciar) {
+        if (s_3d_iniciar()) {
+            LOGI("Renderer 3D instanciado listo (modelos GLB por prototipo)");
+        } else {
+            LOGE("El renderer 3D no arranco: las maquinas se veran con su sprite 2D");
+        }
+    }
     if (s_sgsr_preparar) {
         const uint32_t ancho_entrada = 1440;
         const uint32_t alto_entrada = 1440;

@@ -137,6 +137,23 @@ siguiente sin el criterio verde (salvo F6/F7, que son explícitamente opcionales
 > alterna el ojo en cada frame, así que para 90 Hz hacen falta **90 frames/s del
 > motor** (45 FPS por ojo). El número de FPS decide entre V1 (el motor dibuja) y
 > V2 (dibuja el visor). Si hay red de seguridad: `XR_EXT_frame_synthesis`.
+>
+> **Revisado por ADR-015 y ADR-016: el spike va desde TERMUX, no desde
+> `adb shell`.** El acceso a la GPU en Android es **de las apps**, no del shell:
+> medido en la Pico, el kernel rechaza el trabajo de GPU del usuario `shell`
+> (`kgsl: illegal gpu render pid`, no está en el grupo `graphics`). Dentro de
+> Termux (ya instalado en la Pico) hay tres vías, todas sin root:
+> **A)** Termux:X11 → el servidor X (bionic) hace el trabajo de GPU y el
+> cliente glibc habla GLX por el socket (la receta de r/termux, y la que ya
+> describe `scripts/start_factorio_termux.sh`); **B)** *Android Vulkan Wrapper*
+> (termux-packages#22500, ya mergeado): expone el driver Vulkan bionic de
+> Android como un ICD para programas glibc → Zink encima → OpenGL 3.3 para el
+> Factorio; **C)** Turnip con `MESA_LOADER_DRIVER_OVERRIDE=kgsl` (la GPU se
+> conduce desde dentro del contenedor).
+>
+> Ojo: los 3,5 FPS del post de r/termux son de la vía **VirGL/ANGLE sobre
+> Mali**, la más pesada. En Adreno con Turnip la documentación dice "near
+> native": nuestro pesimismo sobre el FPS puede ser infundado.
 
 **Objetivo**: medir **cuántos FPS da el cliente gráfico con GPU real en la Pico**,
 y de paso el techo del dispositivo para el visor.

@@ -124,7 +124,12 @@ cat > "$__EGL_VENDOR_LIBRARY_DIRS/10_mesa.json" <<JSON
 JSON
 
 export LIBGL_DRIVERS_PATH="$MESA_LIB/dri"
-export MESA_LOADER_DRIVER_OVERRIDE=zink
+# El override del driver DRI (capa GL).  En Android no hay /dev/dri/renderD*
+# y sin esto el DRI no autodetecta nada y no encuentra zink_dri.so.
+# OJO: el loader de VULKAN no lee esta variable (ver scripts/spike_turnip_pico.sh);
+# el ICD de Vulkan se elige aparte, con VK_ICD_FILENAMES.
+# Se respeta el valor que venga puesto de fuera (lo usa el barrido del spike).
+export MESA_LOADER_DRIVER_OVERRIDE="${MESA_LOADER_DRIVER_OVERRIDE:-zink}"
 export ZINK_DESCRIPTORS=auto
 export GALLIUM_DRIVER=zink
 export LIBGL_ALWAYS_SOFTWARE=0
@@ -145,7 +150,11 @@ TURNIP_JSON="$MESA_DIR/turnip_icd.json"
 LVP_SO="$MESA_LIB/libvulkan_lvp.so"
 LVP_JSON="$MESA_DIR/lvp_icd.json"
 
-if [ "${XFACTORVR_USE_TURNIP:-0}" = "1" ] && [ -f "$TURNIP_SO" ]; then
+# Si el llamante ya ha elegido un ICD (VK_ICD_FILENAMES puesto), se RESPETA:
+# es lo que hace el barrido del spike para comparar turnip y lavapipe.
+if [ -n "${VK_ICD_FILENAMES:-}" ]; then
+    log "ICD elegido por el llamante: $VK_ICD_FILENAMES"
+elif [ "${XFACTORVR_USE_TURNIP:-0}" = "1" ] && [ -f "$TURNIP_SO" ]; then
     cat > "$TURNIP_JSON" <<JSON
 {
     "file_format_version": "1.0.0",

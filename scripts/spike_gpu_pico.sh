@@ -4,6 +4,10 @@ set -uo pipefail
 # spike_gpu_pico.sh — F0: ¿hay GPU real en la Pico 4 Ultra y cuántos FPS da
 # el cliente grafico de Factorio?
 #
+# OJO: para el diagnostico del kernel (¿SELinux deja reservar memoria de GPU?)
+# y para el barrido de ICD hay una version mas nueva y mas fina:
+# scripts/spike_turnip_pico.sh.  Esta se queda con la version simple.
+#
 # Este es el spike BLOQUEANTE de la variante V1 (el motor dibuja).
 #
 # Que mide:

@@ -264,6 +264,30 @@ if grep -qE "hook vivo: [1-9][0-9]* frames" "$LOG" 2>/dev/null; then
     exit 0
 fi
 
+# Aqui no hay frames.  Hay que distinguir DOS cosas muy distintas:
+#
+#   a) El motor se quedo a medias (no llego a inicializar el juego).  El hook
+#      de `GameRenderer::render` SOLO se ejecuta cuando el motor dibuja el
+#      mundo: si el juego no llega a esa fase, que no haya frames no dice
+#      NADA del inyector.  Es el caso de un motor que se cuelga al cargar los
+#      sprites bajo render por software (lavapipe): se queda al 100% de CPU
+#      cargando el atlas y nunca llega a "Factorio initialised".
+#      Eso NO es un fallo del inyector: no se ha podido VALIDAR (codigo 2).
+#
+#   b) El motor SI llego a inicializar y a dibujar y aun asi no hay frames:
+#      ahi si el hook esta muerto (codigo 1).
 say ""
-say "FALLO: el hook no llego a ejecutarse (no hay 'hook vivo: N frames' con N > 0)"
+if ! grep -q "Factorio initialised" "$LOG" 2>/dev/null; then
+    say "NO VALIDABLE: el motor no llego a inicializar el juego."
+    say "    (no aparece 'Factorio initialised' en el log del cliente)"
+    say "    El hook de GameRenderer::render solo corre cuando el motor dibuja"
+    say "    el mundo, asi que sin inicializacion no se puede probar el hook."
+    say "    Diagnostico: el motor se queda cargando los sprites bajo render por"
+    say "    software (lavapipe), que es lento de mas.  Se puede subir el"
+    say "    --timeout o darle mas margen."
+    exit 2
+fi
+
+say "FALLO: el motor inicializo pero el hook no llego a ejecutarse"
+say "       (no hay 'hook vivo: N frames' con N > 0)"
 exit 1

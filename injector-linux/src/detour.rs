@@ -13,8 +13,10 @@
 //!   * La forma canonica de AArch64 para saltar a una direccion de 64 bits es
 //!     cargar el destino en un registro y ramificar a traves de el:
 //!
+//!       ```text
 //!         ldr  x16, #<literal>      ; 0x58000050 + imm19<<5  (literal PC-relativo)
 //!         br   x16                 ; 0xD61F0200
+//!       ```
 //!
 //!     El "literal" (8 bytes con la direccion) tiene que vivir en algun sitio.
 //!     Hay dos formas:
@@ -779,9 +781,11 @@ fn extender_signo(valor: u32, bits: u32) -> i64 {
 ///
 /// Por ejemplo, el prologo de `SpriteDrawOrder::setup` empieza con
 ///
+///   ```text
 ///     ldrb w8, [x1, #0x40]
 ///     ldr  d1, [x3]
 ///     tbz  w8, #7, +0x18      <- salta a destino+0x18
+///   ```
 ///
 /// asi que el bloque tiene que crecer hasta incluir `destino + 0x18 + 4`.
 fn tamanho_del_bloque(destino: u64, bytes: &[u8], maximo: usize) -> usize {

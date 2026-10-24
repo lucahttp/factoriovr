@@ -54,7 +54,9 @@
 //!   * `SpriteDrawOrder::setup` (desensamblado del motor 2.1.22) deja claro
 //!     como pasa el motor de coordenadas del mapa a coordenadas del mundo:
 //!
+//!       ```text
 //!         mundo = (mapa / 256) * (32 * escala) - camara
+//!       ```
 //!
 //!     (es exactamente la cuenta de `0x179cf6c` y `0x179cf74`). Ojo: `mundo`
 //!     NO es una posicion relativa a la camara, son **pixeles del framebuffer
@@ -67,8 +69,10 @@
 //!
 //! La proyeccion queda entonces:
 //!
+//!   ```text
 //!     ndc_x = mundo_x * 2 / W - 1
 //!     ndc_y = mundo_y * 2 / H - 1
+//!   ```
 //!
 //! donde W y H son los del viewport del framebuffer del mundo.
 //!
@@ -906,9 +910,11 @@ fn crear_cubo(gl: &Gl) -> Option<Cubo> {
 
 /// Tipo del trampolin de `DrawQueue::draw`.
 ///
+///   ```cpp
 ///     draw(DrawQueue* this, Sprite const& sprite, MapPosition const& position,
 ///          DrawingFlags flags, RenderLayer::Enum layer, Vector const& shift,
 ///          float size_x, float size_y)
+///   ```
 ///
 /// Los dos `float` van en los registros s0 y s1 (AAPCS64: los argumentos
 /// en coma flotante tienen sus propios registros).
@@ -927,8 +933,10 @@ type HookDraw = unsafe extern "C" fn(*mut c_void, *mut c_void);
 /// Es un metodo de `GraphicsInterfaceOpenGL`, asi que lleva el `this`
 /// implicito delante:
 ///
+///   ```cpp
 ///     bindUniformBuffer(GraphicsInterfaceOpenGL* this, uint index,
 ///                       PipelineStateObject const* pso, UniformBuffer const* ub)
+///   ```
 type HookUniformBuffer = unsafe extern "C" fn(*mut c_void, u32, *mut c_void, *mut c_void);
 
 /// Tipo del trampolin de `flushSpritesBatch`.
@@ -1145,7 +1153,9 @@ fn leer_direccion(this: *mut c_void) -> u8 {
 /// convierte las coordenadas del mapa en coordenadas del mundo (la misma
 /// cuenta que hace `SpriteDrawOrder::setup`, desensamblada):
 ///
+///   ```text
 ///     mundo = (mapa / 256) * (32 * escala) - camara
+///   ```
 
 // --------------------------------------------------------------------------
 // Estereo real: desplazar la camara del motor por ojo
@@ -1603,7 +1613,9 @@ const INCLINACION: f32 = 0.55;
 /// Transformacion (en el espacio del mundo del motor: x derecha, y abajo en
 /// pantalla, z arriba):
 ///
+///   ```text
 ///     M = T(base) * Rx(inclinacion) * Rz(direccion) * S * T(0, 0, 1/2)
+///   ```
 ///
 ///   * `Rz(direccion)` es la orientacion real de la entidad (16 pasos de
 ///     22,5 grados),
@@ -1957,8 +1969,10 @@ fn dibujar_cajas(gl: &Gl, vp: &[i32; 4], cajas: &[Caja]) {
 ///
 /// La cuenta es la de siempre:
 ///
+///   ```text
 ///     ndc_x = mundo_x * 2 / W - 1
 ///     ndc_y = mundo_y * 2 / H - 1
+///   ```
 ///
 /// con W y H los del viewport del framebuffer del mundo.
 ///

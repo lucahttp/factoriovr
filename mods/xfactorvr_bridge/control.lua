@@ -835,6 +835,19 @@ end
 -- ---------------------------------------------------------------------------
 
 local MAX_ENTITIES = 3000
+
+-- Radio (en casillas) del area que se instantanea para el visor.
+local RADIO_SNAPSHOT = 32
+
+-- Cada cuantos ticks se empuja la instantanea al fichero del visor.
+-- 20 ticks son ~1/3 de segundo a 60 UPS: suficiente para que la mesa se
+-- mueva sin que el motor se atasque escribiendo (la instantanea con el
+-- terreno es de varios cientos de KB).
+local TICK_EMPUJE = 20
+
+-- Nombre del fichero de estado (dentro de script-output).  El visor lo lee
+-- directamente: es el canal de estado SIN RCON.
+local FICHERO_ESTADO = "xfactorvr_bridge/estado.json"
 local RESOURCE_CELL = 4.0
 
 local function status_of(e)
@@ -1088,60 +1101,92 @@ end
 -- Interfaz remota
 -- ---------------------------------------------------------------------------
 
+-- Instantanea completa del area visible alrededor de (cx, cy).
+--
+-- Se separa en una funcion propia porque hoy hay DOS consumidores:
+--   1. el remoto (RCON), que la pedia el visor con get_world_snapshot;
+--   2. el FICHERO que el mod escribe en script-output, que es el canal de
+--      estado SIN RCON (ADR-020): un mod de Factorio no puede abrir puertos
+--      (el sandbox de Lua no tiene sockets ni io), pero si puede escribir
+--      ficheros con helpers.write_file.
+local function construir_snapshot(cx, cy, radius)
+    radius = radius or RADIO_SNAPSHOT
+    cx = cx or 0
+    cy = cy or 0
+
+    local surface = game.surfaces[1]
+    if not surface then
+        return '{"entities":[],"patches":[],"loose":[],"terrain":{}}'
+    end
+
+    local area = {
+        { cx - radius, cy - radius },
+        { cx + radius, cy + radius },
+    }
+
+    local ok, found = pcall(function() return surface.find_entities(area) end)
+    if not ok or not found then
+        return '{"entities":[],"patches":[],"loose":[],"terrain":{}}'
+    end
+
+    local entities = {}
+    local patches = collect_patches(found)
+
+    for _, e in ipairs(found) do
+        if #entities >= MAX_ENTITIES then break end
+        local s = serialize_entity(e)
+        if s then table.insert(entities, s) end
+    end
+
+    -- Items sueltos en el suelo (van en su propia seccion: el cliente los
+    -- usa para saber si la mano debe coger algo).
+    local loose = collect_loose(found)
+
+    -- El terreno se recoge aparte: son miles de tiles y no deben
+    -- romper el caso de que get_tile falle en alguna posicion.
+    local terreno = "{}"
+    local ok_t, t_err = pcall(function()
+        return collect_terrain(surface, area)
+    end)
+    if ok_t and t_err then
+        terreno = t_err
+    end
+
+    return '{"entities":[' .. table.concat(entities, ",") ..
+        '],"patches":[' .. table.concat(patches, ",") ..
+        '],"loose":[' .. table.concat(loose, ",") ..
+        '],"terrain":' .. terreno .. '}'
+end
+
+-- Centro de la vista que pide el visor por el canal de ordenes.
+--
+-- El mod no puede leer ficheros, asi que el centro de vista viaja como una
+-- orden (set_view_center) y se guarda en storage; el empuje periodico usa
+-- ese centro.  Si el visor no ha dicho nada, se usa la posicion del jugador.
+local function centro_de_la_vista()
+    local st = state()
+    local c = st.xfactorvr_centro
+    if c then return c[1], c[2] end
+    local p = real_player() or virtual_character()
+    if p and p.position then
+        return math.floor(p.position.x), math.floor(p.position.y)
+    end
+    return 0, 0
+end
+
 remote.add_interface("xfactorvr", {
+
+    -- El visor dice donde esta mirando: es el area que se quiere en la
+    -- instantanea que el mod empuja al fichero.
+    set_view_center = function(cx, cy)
+        local st = state()
+        st.xfactorvr_centro = { math.floor(cx or 0), math.floor(cy or 0) }
+        return true
+    end,
 
     -- Instantanea completa del area visible alrededor de (cx, cy).
     get_world_snapshot = function(radius, cx, cy)
-        radius = radius or 32
-        cx = cx or 0
-        cy = cy or 0
-
-        local surface = game.surfaces[1]
-        if not surface then
-            local empty = '{"entities":[],"patches":[],"loose":[],"terrain":{}}'
-            rcon.print(empty)
-            return empty
-        end
-
-        local area = {
-            { cx - radius, cy - radius },
-            { cx + radius, cy + radius },
-        }
-
-        local ok, found = pcall(function() return surface.find_entities(area) end)
-        if not ok or not found then
-            local empty = '{"entities":[],"patches":[],"loose":[],"terrain":{}}'
-            rcon.print(empty)
-            return empty
-        end
-
-        local entities = {}
-        local patches = collect_patches(found)
-
-        for _, e in ipairs(found) do
-            if #entities >= MAX_ENTITIES then break end
-            local s = serialize_entity(e)
-            if s then table.insert(entities, s) end
-        end
-
-        -- Items sueltos en el suelo (van en su propia seccion: el cliente los
-        -- usa para saber si la mano debe coger algo).
-        local loose = collect_loose(found)
-
-        -- El terreno se recoge aparte: son miles de tiles y no deben
-        -- romper el caso de que get_tile falle en alguna posicion.
-        local terreno = "{}"
-        local ok_t, t_err = pcall(function()
-            return collect_terrain(surface, area)
-        end)
-        if ok_t and t_err then
-            terreno = t_err
-        end
-
-        local out = '{"entities":[' .. table.concat(entities, ",") ..
-            '],"patches":[' .. table.concat(patches, ",") ..
-            '],"loose":[' .. table.concat(loose, ",") ..
-            '],"terrain":' .. terreno .. '}'
+        local out = construir_snapshot(cx, cy, radius)
         rcon.print(out)
         return out
     end,
@@ -2029,6 +2074,22 @@ if event_tick and script.on_event then
         end
 
         st.xfactorvr_tick = (st.xfactorvr_tick or 0) + 1
+
+        -- CANAL DE ESTADO SIN RCON (ADR-020): el mod empuja la instantanea a
+        -- un fichero de script-output y el visor la lee.  Es la alternativa
+        -- al remoto porque un mod de Factorio no puede abrir puertos (su
+        -- sandbox de Lua no tiene sockets ni io), pero SI puede escribir
+        -- ficheros.  El remoto se sigue mantendo por compatibilidad.
+        if (st.xfactorvr_tick % TICK_EMPUJE) == 0 then
+            local cx, cy = centro_de_la_vista()
+            local out = construir_snapshot(cx, cy, RADIO_SNAPSHOT)
+            local ok_w, err_w = pcall(function()
+                helpers.write_file(FICHERO_ESTADO, out, false)
+            end)
+            if not ok_w then
+                log("[XFactorVR] no se pudo escribir el estado: " .. tostring(err_w))
+            end
+        end
 
         -- La barra rapida virtual se refresca dos veces por segundo: puede
         -- que el actor coja items sin pasar por un remoto del mod (por

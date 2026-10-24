@@ -213,19 +213,19 @@ struct PosMapa {
 
 /// Una caja pendiente de dibujar.
 #[derive(Clone, Copy, Default)]
-struct Caja {
+pub struct Caja {
     /// Posicion en el espacio del mundo del motor (x, y).
-    wx: f32,
-    wy: f32,
+    pub wx: f32,
+    pub wy: f32,
     /// Tamano del sprite de la entidad (ancho y alto) en unidades del motor.
-    sx: f32,
-    sy: f32,
+    pub sx: f32,
+    pub sy: f32,
     /// Direccion de la entidad (0..15).
-    direccion: u8,
+    pub direccion: u8,
     /// Indice del modelo 3D en el registro (-1 = sin modelo).
-    modelo: i32,
+    pub modelo: i32,
     /// Pixels por casilla (el zoom del motor).
-    escala: f32,
+    pub escala: f32,
 }
 
 /// Las cajas pendientes y las entidades vistas.
@@ -350,6 +350,24 @@ impl Estado {
         }
         out
     }
+}
+
+/// Las entidades visibles del frame actual.
+///
+/// Es lo que viaja al visor por el canal de geometria (ADR-021): la
+/// posicion, el tamano, la direccion y el modelo 3D de cada entidad, tal
+/// cual las dibuja el motor (no estimadas como las del snapshot).
+pub fn entidades_visibles() -> Vec<Caja> {
+    con_estado(|e| {
+        let n = e.n_visibles.min(MAX_PENDIENTES);
+        let mut out = Vec::with_capacity(n);
+        let mut i = 0usize;
+        while i < n {
+            out.push(e.visibles[i]);
+            i += 1;
+        }
+        out
+    })
 }
 
 /// Toma el estado compartido sin propagar un posible envenenamiento.

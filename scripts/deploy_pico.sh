@@ -405,7 +405,16 @@ echo "Iniciando XFactorVR Tabletop en la Pico 4 Ultra..."
 "$ADB" shell am start -n "$PACKAGE/android.app.NativeActivity"
 
 echo "=== Despliegue completado con éxito ==="
-echo "El visor ya tiene el motor real: la mesa OpenXR muestra Factorio 2.0 en vivo."
+if [ "$MODO_CLIENT" -eq 1 ]; then
+    echo "El visor tiene el motor REAL: el cliente grafico dibuja Factorio en la"
+    echo "GPU del visor y su imagen llega a la mesa (panel del juego)."
+else
+    echo "OJO: sin --client solo se ha desplegado el SERVIDOR headless."
+    echo "Lo que se ve en la mesa es la RECONSTRUCCION que hace el visor con el"
+    echo "estado del juego (terreno y sprites), NO el render real del motor."
+    echo "Para ver el juego real hay que desplegar el cliente grafico:"
+    echo "    bash scripts/deploy_pico.sh --client"
+fi
 if [ "$STREAM" -eq 1 ]; then
     echo "Monitoreando logs en tiempo real (Ctrl+C para salir):"
     "$ADB" logcat -s XFactorVR_Launcher:V libxfactorvr:V

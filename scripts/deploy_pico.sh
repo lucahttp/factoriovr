@@ -390,7 +390,12 @@ fi
 # aporta el JUGADOR que el nivel de campana exige.
 if [ "$MODO_CAMPANA" -eq 1 ] && [ "$MODO_CLIENT" -eq 1 ]; then
     echo "Arrancando el cliente grafico (conecta al servidor, aporta el jugador)..."
-    "$ADB" shell "SERVER_ADDR=127.0.0.1 GAME_DIR=$REMOTE_CLIENT/factorio sh $REMOTE_CLIENT_SCRIPT" \
+    # XFACTORVR_USE_TURNIP=1: el ICD de Vulkan de la GPU de verdad (turnip
+    # sobre KGSL).  Sin esto el cliente usa lavapipe (Vulkan por software).
+    # Medido en la Pico 4 Ultra con esto:
+    #   Initialised OpenGL:[1] zink Vulkan 1.4(Turnip Adreno (TM) 740v3
+    #                            (MESA_TURNIP)); driver: 4.6 (Core Profile)
+    "$ADB" shell "XFACTORVR_USE_TURNIP=1 SERVER_ADDR=127.0.0.1 GAME_DIR=$REMOTE_CLIENT/factorio sh $REMOTE_CLIENT_SCRIPT" \
         >/dev/null 2>&1 &
     sleep 3
 fi

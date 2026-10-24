@@ -111,8 +111,15 @@ fi
 # vendor, glvnd no expone ni extensiones ni devices, y SDL2 muere con
 # "Could not find a valid EGL device to initialize".
 # glvnd deja indicar donde esta con estas variables de entorno.
+# El vendor de EGL se busca POR DIRECTORIO (glvnd lee los manifiestos JSON
+# de ahi).  NO se pone __EGL_VENDOR_LIBRARY_FILENAMES: medido en el visor,
+# con esa variable puesta glvnd NO llega a cargar el vendor (el trace del
+# cargador muestra que nunca hace dlopen de libEGL_mesa.so.0), y el motor se
+# queda sin devices EGL -> "Could not find a valid EGL device to initialize".
+# Con solo __EGL_VENDOR_LIBRARY_DIRS: el vendor carga, aparece 1 device y el
+# contexto sale sobre el Adreno (zink -> Turnip).
 export __EGL_VENDOR_LIBRARY_DIRS="$MESA_DIR/glvnd_egl_vendor"
-export __EGL_VENDOR_LIBRARY_FILENAMES="$MESA_LIB/libEGL_mesa.so.0"
+unset __EGL_VENDOR_LIBRARY_FILENAMES
 mkdir -p "$__EGL_VENDOR_LIBRARY_DIRS"
 cat > "$__EGL_VENDOR_LIBRARY_DIRS/10_mesa.json" <<JSON
 {

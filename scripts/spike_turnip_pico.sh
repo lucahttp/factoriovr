@@ -84,10 +84,10 @@ say "    GPU:     $("$ADB" shell cat /sys/class/kgsl/kgsl-3d0/gpu_model 2>/dev/n
 say "    SELinux: $("$ADB" shell getenforce 2>/dev/null | tr -d '\r')"
 say "    nodo:    $("$ADB" shell ls -l /dev/kgsl-3d0 2>/dev/null | tr -d '\r')"
 
-if [ ! -d "$REMOTO_MESA" ]; then
+if ! "$ADB" shell test -d "$REMOTO_MESA" 2>/dev/null; then
     nada "no esta el payload de Mesa en el dispositivo (bash scripts/deploy_pico.sh)"
 fi
-if [ ! -f "$MESA_LIB/libvulkan_freedreno.so" ]; then
+if ! "$ADB" shell test -f "$MESA_LIB/libvulkan_freedreno.so" 2>/dev/null; then
     say "    AVISO: no esta Turnip (libvulkan_freedreno.so): no se podra probar la GPU real"
 fi
 
@@ -99,10 +99,10 @@ if [ ! -x "$CLANG" ]; then
 fi
 say "    compilando la sonda..."
 "$CLANG" -O2 -Wall -o build/probe_kgsl scripts/probe_kgsl.c || nada "no se pudo compilar la sonda"
-"$ADB" push build/probe_kgsl "$REMOTE_PROBE" >/dev/null 2>&1 || nada "no se pudo subir la sonda"
-"$ADB" shell chmod 755 "$REMOTE_PROBE" >/dev/null 2>&1 || true
+"$ADB" push build/probe_kgsl "$REMOTO_PROBE" >/dev/null 2>&1 || nada "no se pudo subir la sonda"
+"$ADB" shell chmod 755 "$REMOTO_PROBE" >/dev/null 2>&1 || true
 
-"$ADB" shell "$REMOTE_PROBE" 2>&1 | tr -d '\r' | sed 's/^/    /'
+"$ADB" shell "$REMOTO_PROBE" 2>&1 | tr -d '\r' | sed 's/^/    /'
 KERNEL_RC=$?
 
 # El veredicto del kernel decide si tiene sentido seguir con el barrido.
@@ -122,7 +122,7 @@ fi
 # --------------------------------------------------------------------------
 say ""
 say "=== 2. Barrido de ICD de Vulkan con el motor real ==="
-if [ ! -f "$REMOTE_LAUNCHER" ]; then
+if ! "$ADB" shell test -f "$REMOTO_LAUNCHER" 2>/dev/null; then
     nada "no esta el launcher del cliente en el dispositivo"
 fi
 
@@ -134,7 +134,7 @@ fi
     \"ICD\": { \"library_path\": \"$MESA_LIB/libvulkan_freedreno.so\", \"api_version\": \"1.1.230\" }
 }
 JSON
-cat > $REMOTE_MESA/lvp_icd.json <<'JSON'
+cat > $REMOTO_MESA/lvp_icd.json <<'JSON'
 {
     \"file_format_version\": \"1.0.0\",
     \"ICD\": { \"library_path\": \"$MESA_LIB/libvulkan_lvp.so\", \"api_version\": \"1.1.230\" }
@@ -154,13 +154,13 @@ for CASO in "${CASOS[@]}"; do
     IFS='|' read -r NOMBRE ICD OVERRIDE EXTRA <<< "$CASO"
     say ""
     say "--- caso $NOMBRE ---"
-    "$ADB" shell rm -f "$REMOTE_LOG" >/dev/null 2>&1 || true
+    "$ADB" shell rm -f "$REMOTO_LOG" >/dev/null 2>&1 || true
     "$ADB" shell "pkill -9 -f 'bin/arm64/factorio'" >/dev/null 2>&1 || true
     sleep 2
     "$ADB" shell rm -f /data/local/tmp/factorio/.lock >/dev/null 2>&1 || true
 
     ENTORNO="MESA_LOADER_DRIVER_OVERRIDE=$OVERRIDE"
-    ENTORNO="$ENTORNO VK_ICD_FILENAMES=$REMOTE_MESA/${ICD}_icd.json"
+    ENTORNO="$ENTORNO VK_ICD_FILENAMES=$REMOTO_MESA/${ICD}_icd.json"
     ENTORNO="$ENTORNO VK_DRIVER_FILES=$REMOTO_MESA/${ICD}_icd.json"
     ENTORNO="$ENTORNO __EGL_VENDOR_LIBRARY_FILENAMES=$MESA_LIB/libEGL_mesa.so.0"
     ENTORNO="$ENTORNO LIBGL_DRIVERS_PATH=$MESA_LIB/dri"
@@ -169,11 +169,11 @@ for CASO in "${CASOS[@]}"; do
     ENTORNO="$ENTORNO WIDTH=640 HEIGHT=360 XFACTORVR_HOOK_EVERY=60"
     [ -n "$EXTRA" ] && ENTORNO="$ENTORNO $EXTRA"
 
-    "$ADB" shell "cd /data/local/tmp && nohup env $ENTORNO sh $REMOTE_LAUNCHER > $REMOTE_LOG 2>&1 &" >/dev/null 2>&1
+    "$ADB" shell "cd /data/local/tmp && nohup env $ENTORNO sh $REMOTO_LAUNCHER > $REMOTO_LOG 2>&1 &" >/dev/null 2>&1
 
     LINEA=""
     for i in $(seq 1 "$TIMEOUT"); do
-        LOG=$("$ADB" shell cat "$REMOTE_LOG" 2>/dev/null | tr -d '\r')
+        LOG=$("$ADB" shell cat "$REMOTO_LOG" 2>/dev/null | tr -d '\r')
         LINEA=$(echo "$LOG" | grep -m1 "Initialised OpenGL" || true)
         [ -n "$LINEA" ] && break
         sleep 1
@@ -181,7 +181,7 @@ for CASO in "${CASOS[@]}"; do
 
     if [ -z "$LINEA" ]; then
         say "    el motor NO inicializo OpenGL en ${TIMEOUT}s"
-        LOG=$("$ADB" shell cat "$REMOTE_LOG" 2>/dev/null | tr -d '\r')
+        LOG=$("$ADB" shell cat "$REMOTO_LOG" 2>/dev/null | tr -d '\r')
         echo "$LOG" | grep -iE 'vulkan|egl|adreno|turnip|llvmpipe|zink|error' | tail -5 | sed 's/^/      /'
         continue
     fi

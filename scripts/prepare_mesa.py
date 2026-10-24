@@ -36,8 +36,51 @@ import urllib.request
 # contenedor, donde el cliente grafico abre ventana sin problema.
 MIRROR = "http://ports.ubuntu.com/ubuntu-ports"
 DIST = "noble"
-COMPONENTES = ("main", "universe")
+# IMPORTANTE: noble-updates entra tambien.  Ahi estan el Mesa 25.x y el
+# libllvm20 que pide la libgallium del Mesa de contenedores (que pide
+# libLLVM.so.20.1).  Sin este suite el indice solo daba el Mesa 24.0.5 de
+# noble, con su libLLVM-17, y el payload se quedaba sin la libreria que
+# necesita el vendor EGL: "FALTAN librerias: libLLVM.so.20.1".
+# Cada par es (suite, componente).
+COMPONENTES = (
+    ("noble", "main"),
+    ("noble", "universe"),
+    ("noble-updates", "main"),
+    ("noble-updates", "universe"),
+)
 ARCH = "arm64"
+
+# ---------------------------------------------------------------------------
+# Mesa para CONTENEDORES en Android (lfdevs/mesa-for-android-container).
+#
+# POR QUE hace falta aparte del Mesa de Ubuntu:
+#
+#   En el visor, SELinux niega al dominio "shell" los nodos /dev/dri/*
+#   (etiqueta graphics_device):
+#       avc: denied { read } for name="renderD128"
+#             scontext=u:r:shell:s0 tcontext=u:r:object_r:graphics_device:s0
+#
+#   La plataforma de devices de Mesa (la que usa el driver "offscreen" de
+#   SDL2) enumera los devices por DRM: al no poder abrirlos, Mesa devuelve
+#   CERO devices y SDL2 muere con
+#       "Could not find a valid EGL device to initialize".
+#
+#   El Mesa de Ubuntu (el de arriba) NO abre contexto en el visor: medido,
+#   0 devices con el mismo entorno que si funciona en el contenedor.
+#   El fork de lfdevs si abre: trae los parches para contenedores en Android
+#   (backend KGSL de freedreno).  Medido en la Pico 4 Ultra:
+#       Initialised OpenGL:[1] zink Vulkan 1.4(Turnip Adreno (TM) 740v3
+#                                      (MESA_TURNIP)); driver: 4.6 (Core Profile)
+#
+#   Ademas este Mesa declara el ICD de turnip con api_version 1.4.359 y su
+#   libgallium pide libLLVM.so.20.1 (el libllvm20 de noble lo trae).
+# ---------------------------------------------------------------------------
+MESA_CONTENEDOR_VERSION = "26.3.0-devel-20260824"
+MESA_CONTENEDOR_URL = (
+    "https://github.com/lfdevs/mesa-for-android-container/releases/download/"
+    f"mesa-{MESA_CONTENEDOR_VERSION}/"
+    f"mesa-for-android-container_{MESA_CONTENEDOR_VERSION}_ubuntu_noble_arm64.tar.gz"
+)
 
 # Paquetes: runtime de Mesa con Zink, loader de Vulkan, lavapipe y glibc.
 PAQUETES = [
@@ -100,6 +143,13 @@ ESPERADOS = [
     # La glibc no va en este payload: la aporta el runtime del visor
     # (prepare_glibc.sh), que es mas nueva y no choca con el motor grafico.
     "usr/lib/aarch64-linux-gnu/libgcc_s.so.1",
+    # Mesa de contenedores en Android: el vendor EGL que SI abre contexto
+    # sobre el Adreno del visor, y el ICD de turnip (Vulkan sobre KGSL).
+    "usr/lib/aarch64-linux-gnu/libvulkan_freedreno.so",
+    # La libgallium del Mesa de contenedores la pide (libLLVM 20).
+    "usr/lib/aarch64-linux-gnu/libLLVM.so.20.1",
+    # El manifiesto de glvnd: sin el, el despachador no encuentra al vendor.
+    "usr/share/glvnd/egl_vendor.d/50_mesa.json",
 ]
 
 
@@ -123,13 +173,13 @@ def indice_dependencias():
     universe, y algunos de sus acompañantes en main.
     """
     out = {}
-    for comp in COMPONENTES:
-        url = f"{MIRROR}/dists/{DIST}/{comp}/binary-{ARCH}/Packages.gz"
-        log(f"Descargando el indice de paquetes ({DIST}/{comp}/{ARCH})...")
+    for suite, comp in COMPONENTES:
+        url = f"{MIRROR}/dists/{suite}/{comp}/binary-{ARCH}/Packages.gz"
+        log(f"Descargando el indice de paquetes ({suite}/{comp}/{ARCH})...")
         try:
             crudo = descargar(url)
         except Exception as exc:  # noqa: BLE001
-            log(f"  aviso: no se pudo descargar {comp}: {exc}")
+            log(f"  aviso: no se pudo descargar {suite}/{comp}: {exc}")
             continue
         txt = gzip.decompress(crudo).decode("utf-8", "replace")
         for bloque in txt.split("\n\n"):
@@ -168,8 +218,11 @@ def extraer_deb(ruta_deb, destino):
                 try:
                     os.write(fd, body)
                     os.close(fd)
-                    with open(tmp, "rb") as origen, open(tmp + ".out", "wb") as destino:
-                        subprocess.run(["zstd", "-d", "-c", origen], stdout=destino, check=True)
+                    with open(tmp + ".out", "wb") as salida:
+                        # subprocess necesita la RUTA del fichero, no el
+                        # fichero abierto (TypeError: expected str, bytes or
+                        # os.PathLike object, not BufferedReader).
+                        subprocess.run(["zstd", "-d", "-c", tmp], stdout=salida, check=True)
                     payload = open(tmp + ".out", "rb").read()
                 finally:
                     for f in (tmp, tmp + ".out"):
@@ -537,6 +590,38 @@ def verificar_dependencias(out):
     return True
 
 
+def aplicar_mesa_contenedor(out, cache):
+    """Superpone el Mesa de contenedores en Android sobre el payload.
+
+    Se hace DESPUES de podar: la poda convierte los alias del megadriver de
+    DRI en enlaces a zink_dri.so, y el Mesa de contenedores trae sus
+    propios drivers (kgsl_dri.so, msm_dri.so) que hay que respetar.
+
+    Se superpone (no borra) lo que ya hay: el payload conserva glvnd, el
+    loader de Vulkan y las librerias del sistema de Ubuntu noble.
+    """
+    destino = os.path.join(cache, f"mesa-contenedor-{MESA_CONTENEDOR_VERSION}.tar.gz")
+    if not os.path.exists(destino):
+        log(f"  descargando Mesa de contenedores {MESA_CONTENEDOR_VERSION}...")
+        descargar(MESA_CONTENEDOR_URL, destino)
+
+    tmp = os.path.join(cache, "mesa_contenedor_tmp")
+    if os.path.isdir(tmp):
+        shutil.rmtree(tmp)
+    os.makedirs(tmp, exist_ok=True)
+    with tarfile.open(destino, "r:gz") as tf:
+        tf.extractall(tmp)
+
+    src = os.path.join(tmp, "usr")
+    if not os.path.isdir(src):
+        raise RuntimeError("el tar del Mesa de contenedores no trae usr/")
+    shutil.copytree(src, os.path.join(out, "usr"), dirs_exist_ok=True)
+
+    # El ICD de turnip se deja con la ruta de Ubuntu: el launcher del visor
+    # reescribe una copia con la ruta del dispositivo (turnip_icd.json).
+    log("  Mesa de contenedores superpuesto (vendor EGL + turnip + gallium).")
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", default="build/mesa")
@@ -590,6 +675,13 @@ def main():
     podar_alias_dri(out)
     log("Quitando la glibc de Debian (la del visor es mas nueva)...")
     podar_glibc_debian(out)
+
+    log("Superponiendo el Mesa de contenedores en Android...")
+    try:
+        aplicar_mesa_contenedor(out, cache)
+    except Exception as exc:  # noqa: BLE001
+        log(f"  AVISO: no se pudo aplicar el Mesa de contenedores: {exc}")
+        log("  Sin el, el cliente grafico NO abre contexto EGL en el visor.")
 
     log("")
     log("Comprobando los ficheros clave:")

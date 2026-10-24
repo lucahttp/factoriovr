@@ -20,7 +20,7 @@ use serde::Deserialize;
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::TcpStream;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock, RwLock};
 use std::time::Duration;
 
@@ -1228,159 +1228,150 @@ fn read_host_override() -> Option<String> {
 
 /// Sondea el servidor Factorio. La E/S de red ocurre SIN el lock del mundo
 /// para no congelar el renderizado de la mesa holografica.
+/// Sondeo del estado del motor.
+///
+/// YA NO HACE E/S: solo anota donde quiere el render mirar y devuelve lo
+/// que el hilo de sondeo tenga listo.  La E/S va en `hilo_sondeo`.
 pub fn poll_rcon_sync(dt: f32, view_center: (f32, f32)) -> RconPoll {
-    let (host, port, password, do_poll, do_connect, do_inventory, verbose) = {
-        let mut cfg = match get_rcon_config().lock() {
-            Ok(c) => c,
-            Err(_) => {
-                return RconPoll {
-                    connected: false,
-                    snapshot: None,
-                    inventory: None,
-                }
-            }
-        };
-        cfg.poll_timer += dt;
-        cfg.connect_timer += dt;
-        cfg.inventory_timer += dt;
+    let _ = dt;
 
-        let do_poll = cfg.poll_timer >= RCON_POLL_INTERVAL;
-        if do_poll {
-            cfg.poll_timer = 0.0;
-        }
-        // Cada cuanto se reintenta la conexion cuando la sesion esta caida.
-        let do_connect = cfg.connect_timer >= RCON_RECONNECT_INTERVAL;
-        if do_connect {
-            cfg.connect_timer = 0.0;
-        }
-        // El inventario se pide con mucha menos frecuencia que el snapshot.
-        let do_inventory = do_poll && cfg.inventory_timer >= RCON_INVENTORY_INTERVAL;
-        if do_inventory {
-            cfg.inventory_timer = 0.0;
-        }
-        (
-            cfg.host.clone(),
-            cfg.port,
-            cfg.password.clone(),
-            do_poll,
-            do_connect,
-            do_inventory,
-            cfg.verbose_fallback,
-        )
-    };
-
-    let mut rcon = match get_rcon_client().lock() {
-        Ok(r) => r,
-        Err(_) => {
-            return RconPoll {
-                connected: false,
-                snapshot: None,
-                inventory: None,
-            }
-        }
-    };
-
-    // --- Sesion: se REUTILIZA, no se reinicia en cada poll ------------------
-    //
-    // Antes el poll abria una conexion TCP nueva en CADA consulta (unas 8
-    // por segundo) y mandaba DOS comandos de consola (inventario + snapshot):
-    // unos 16 comandos de consola por segundo contra el motor.  En la Pico
-    // eso es delaying puro (el motor va delaying y el render se resiente).
-    //
-    // Ahora la sesion se mantiene viva y solo se reconecta si no hay sesion
-    // o si un comando no responde (ver ejecutar_con_reconexion).
-    let addr = format!(
-        "{}:{}",
-        read_host_override().unwrap_or_else(|| host.clone()),
-        port
-    );
-    if !rcon.is_connected() {
-        if !do_connect {
-            // Todavia no toca reintentar: no se martillea al motor.
-            return RconPoll {
-                connected: false,
-                snapshot: None,
-                inventory: None,
-            };
-        }
-        traza_rcon(&format!("poll: conectando a {addr}"));
-        if !rcon.connect(&addr, &password) {
-            rcon.disconnect();
-            if let Ok(mut cfg) = get_rcon_config().lock() {
-                cfg.last_error = Some(format!("no se pudo conectar a {}", addr));
-            }
-            return RconPoll {
-                connected: false,
-                snapshot: None,
-                inventory: None,
-            };
-        }
-        log::info!("RCON conectado al motor de Factorio en {addr}");
-        if let Ok(mut cfg) = get_rcon_config().lock() {
-            cfg.last_error = None;
+    // 1) Donde quiere el render mirar (el hilo de sondeo lo lee).
+    {
+        let buzon = get_buzon();
+        if let Ok(b) = buzon.lock() {
+            b.vista_x.store(view_center.0.to_bits(), Ordering::Relaxed);
+            b.vista_y.store(view_center.1.to_bits(), Ordering::Relaxed);
         }
     }
 
-    if !do_poll {
-        return RconPoll {
-            connected: rcon.is_connected(),
-            snapshot: None,
-            inventory: None,
-        };
+    // 2) Asegurar que el hilo de sondeo esta en marcha.
+    arrancar_hilo_sondeo();
+
+    // 3) Recoger lo que haya llegado (se consume: el render no reparsea el
+    //    mismo JSON 90 veces por segundo).
+    let mut snapshot = None;
+    let mut inventory = None;
+    let mut conectado = false;
+    if let Ok(mut b) = get_buzon().lock() {
+        snapshot = b.snapshot.take();
+        inventory = b.inventory.take();
+        conectado = b.conectado;
     }
-
-    // Pedir la instantanea del mundo alrededor del centro de la vista.
-    let prefix = if verbose { "" } else { "/silent-command " };
-    let snap_cmd = comando_snapshot(prefix, view_center.0, view_center.1);
-
-    // Un comando por poll (antes eran dos).  Factorio rechaza el PRIMER
-    // comando de consola de cada sesion (ver execute_collect_retry) y ese
-    // comando NO se ejecuta; como la sesion se REUTILIZA, ese rechazo solo
-    // se produce al conectar (connect() lo gasta con un comando de
-    // calentamiento) y execute_collect_retry cubre el resto de casos.
-    //
-    // En modo silencioso la respuesta trae el JSON (rcon.print vuelve por
-    // el RCON).  En modo verbose la salida va a la consola del SERVIDOR y el
-    // cliente no recibe el JSON, asi que no se puede usar como criterio de
-    // "la sesion responde".
-    let snapshot = if verbose {
-        ejecutar_con_reconexion(&mut rcon, &addr, &password, &snap_cmd, 3, |_| true)
-    } else {
-        ejecutar_con_reconexion(&mut rcon, &addr, &password, &snap_cmd, 3, trae_json)
-    };
-    traza_rcon(&format!(
-        "poll: snapshot -> {}",
-        match &snapshot {
-            Some(c) => format!("{} bytes", c.len()),
-            None => "NADA".to_string(),
-        }
-    ));
-
-    // El inventario se pide con MUCHA menos frecuencia: cambia muy de tarde
-    // en tarde y cada comando de consola se nota en el motor (y en la Pico).
-    let inventory = if do_inventory {
-        let inv_cmd = format!("{}remote.call('xfactorvr', 'get_inventory')", prefix);
-        let inv = if verbose {
-            ejecutar_con_reconexion(&mut rcon, &addr, &password, &inv_cmd, 2, |_| true)
-        } else {
-            ejecutar_con_reconexion(&mut rcon, &addr, &password, &inv_cmd, 2, |c| !c.trim().is_empty())
-        };
-        traza_rcon(&format!(
-            "poll: inventario -> {}",
-            match &inv {
-                Some(c) => format!("{} bytes", c.len()),
-                None => "NADA".to_string(),
-            }
-        ));
-        inv
-    } else {
-        None
-    };
 
     RconPoll {
-        connected: rcon.is_connected(),
+        connected: conectado,
         snapshot,
         inventory,
+    }
+}
+
+/// Arranca (una sola vez) el hilo que consulta al motor.
+fn arrancar_hilo_sondeo() {
+    let buzon = get_buzon();
+    {
+        let b = match buzon.lock() {
+            Ok(b) => b,
+            Err(_) => return,
+        };
+        if b.arrancado.swap(true, Ordering::SeqCst) {
+            return;
+        }
+    }
+    let _ = std::thread::Builder::new()
+        .name("xfv-sondeo".to_string())
+        .spawn(hilo_sondeo);
+}
+
+/// Hilo que consulta el estado al motor y lo deja en el buzon.
+///
+/// Es el unico sitio donde se habla con el motor por la via de la instantanea.
+/// La sesion se mantiene viva; si el motor no responde, se reinicia UNA vez.
+fn hilo_sondeo() {
+    let mut ultimo_inventario = 0.0f32;
+    loop {
+        std::thread::sleep(Duration::from_millis((RCON_POLL_INTERVAL * 1000.0) as u64));
+
+        // Centro de la vista que quiere el render ahora mismo.
+        let (cx, cy) = {
+            let b = match get_buzon().lock() {
+                Ok(b) => b,
+                Err(_) => continue,
+            };
+            (
+                f32::from_bits(b.vista_x.load(Ordering::Relaxed)),
+                f32::from_bits(b.vista_y.load(Ordering::Relaxed)),
+            )
+        };
+
+        let (host, port, password, verbose) = {
+            let cfg = match get_rcon_config().lock() {
+                Ok(c) => c,
+                Err(_) => continue,
+            };
+            (
+                cfg.host.clone(),
+                cfg.port,
+                cfg.password.clone(),
+                cfg.verbose_fallback,
+            )
+        };
+        let addr = format!(
+            "{}:{}",
+            read_host_override().unwrap_or_else(|| host.clone()),
+            port
+        );
+
+        let mut rcon = match RCON_SONDEO_CLIENT.get_or_init(|| Mutex::new(RconClient::new())).lock()
+        {
+            Ok(r) => r,
+            Err(_) => continue,
+        };
+
+        if !rcon.is_connected() {
+            if !rcon.connect(&addr, &password) {
+                rcon.disconnect();
+                if let Ok(mut b) = get_buzon().lock() {
+                    b.conectado = false;
+                }
+                continue;
+            }
+            log::info!("RCON (sondeo) conectado al motor de Factorio en {addr}");
+        }
+
+        let prefix = if verbose { "" } else { "/silent-command " };
+        let snap_cmd = comando_snapshot(prefix, cx, cy);
+        let snapshot = if verbose {
+            ejecutar_con_reconexion(&mut rcon, &addr, &password, &snap_cmd, 3, |_| true)
+        } else {
+            ejecutar_con_reconexion(&mut rcon, &addr, &password, &snap_cmd, 3, trae_json)
+        };
+
+        // El inventario se pide con mucha menos frecuencia.
+        ultimo_inventario += RCON_POLL_INTERVAL;
+        let inventory = if ultimo_inventario >= RCON_INVENTORY_INTERVAL {
+            ultimo_inventario = 0.0;
+            let inv_cmd = format!("{}remote.call('xfactorvr', 'get_inventory')", prefix);
+            if verbose {
+                ejecutar_con_reconexion(&mut rcon, &addr, &password, &inv_cmd, 2, |_| true)
+            } else {
+                ejecutar_con_reconexion(&mut rcon, &addr, &password, &inv_cmd, 2, |c| {
+                    !c.trim().is_empty()
+                })
+            }
+        } else {
+            None
+        };
+
+        let conectado = rcon.is_connected();
+        if let Ok(mut b) = get_buzon().lock() {
+            if snapshot.is_some() {
+                b.snapshot = snapshot;
+            }
+            if inventory.is_some() {
+                b.inventory = inventory;
+            }
+            b.conectado = conectado;
+        }
     }
 }
 
@@ -1453,6 +1444,50 @@ pub fn get_simulation_world() -> &'static RwLock<SimulationWorld> {
 }
 
 pub static RCON_CLIENT: OnceLock<Mutex<RconClient>> = OnceLock::new();
+
+/// Cliente RCON del HILO DE SONDEO.
+///
+/// El render y el sondeo usan clientes DISTINTOS a proposito: las ordenes del
+/// jugador (minar, construir) van por `RCON_CLIENT` y son raras; el snapshot
+/// va por este y es el que se pide 8 veces por segundo.  Si compartieran
+/// socket, una consulta lenta congelaria el render (y al reves).
+pub static RCON_SONDEO_CLIENT: OnceLock<Mutex<RconClient>> = OnceLock::new();
+
+/// Buzon del hilo de sondeo.
+///
+/// El hilo de render NUNCA debe esperar al motor:measured en la Pico, la
+/// consulta del snapshot tarda ~60 ms (26 KB de JSON) y, hecha en el hilo de
+/// render, hundia el visor a 13 FPS (medido en el dispositivo: 62 ms de CPU
+/// por frame con la GPU en 2,5 ms).  Ahora el motor se consulta en un hilo
+/// aparte y el render solo recoge lo ultimo que haya llegado.
+pub struct BuzonSondeo {
+    /// Snapshot crudo listo para aplicar (lo consume el render una vez).
+    pub snapshot: Option<String>,
+    /// Inventario crudo listo para aplicar.
+    pub inventory: Option<String>,
+    /// Hay sesion con el motor.
+    pub conectado: bool,
+    /// Centro de la vista pedido por el render (f32 en bits).
+    pub vista_x: AtomicU32,
+    pub vista_y: AtomicU32,
+    /// El hilo de sondeo ya arranco.
+    pub arrancado: AtomicBool,
+}
+
+pub static BUZON: OnceLock<Mutex<BuzonSondeo>> = OnceLock::new();
+
+pub fn get_buzon() -> &'static Mutex<BuzonSondeo> {
+    BUZON.get_or_init(|| {
+        Mutex::new(BuzonSondeo {
+            snapshot: None,
+            inventory: None,
+            conectado: false,
+            vista_x: AtomicU32::new(0),
+            vista_y: AtomicU32::new(0),
+            arrancado: AtomicBool::new(false),
+        })
+    })
+}
 
 pub fn get_rcon_client() -> &'static Mutex<RconClient> {
     RCON_CLIENT.get_or_init(|| Mutex::new(RconClient::new()))

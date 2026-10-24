@@ -34,8 +34,9 @@ import urllib.request
 # muere con "Could not find a valid EGL device to initialize".  Con el Mesa de
 # Ubuntu 24.04 (25.2) la combinacion funciona: es exactamente la del
 # contenedor, donde el cliente grafico abre ventana sin problema.
-MIRROR = "http://archive.ubuntu.com/ubuntu"
+MIRROR = "http://ports.ubuntu.com/ubuntu-ports"
 DIST = "noble"
+COMPONENTES = ("main", "universe")
 ARCH = "arm64"
 
 # Paquetes: runtime de Mesa con Zink, loader de Vulkan, lavapipe y glibc.
@@ -116,19 +117,29 @@ def descargar(url, destino=None):
 
 
 def indice_dependencias():
-    """Mapa paquete -> (version, ruta en el pool) para arm64."""
-    url = f"{MIRROR}/dists/{DIST}/main/binary-{ARCH}/Packages.gz"
-    log(f"Descargando el indice de paquetes ({DIST}/{ARCH})...")
-    txt = gzip.decompress(descargar(url)).decode("utf-8", "replace")
+    """Mapa paquete -> (version, ruta en el pool) para arm64.
+
+    Se leen los componentes main y universe: los paquetes de Mesa estan en
+    universe, y algunos de sus acompañantes en main.
+    """
     out = {}
-    for bloque in txt.split("\n\n"):
-        m = re.search(r"^Package: (\S+)$", bloque, re.M)
-        if not m:
+    for comp in COMPONENTES:
+        url = f"{MIRROR}/dists/{DIST}/{comp}/binary-{ARCH}/Packages.gz"
+        log(f"Descargando el indice de paquetes ({DIST}/{comp}/{ARCH})...")
+        try:
+            crudo = descargar(url)
+        except Exception as exc:  # noqa: BLE001
+            log(f"  aviso: no se pudo descargar {comp}: {exc}")
             continue
-        f = re.search(r"^Filename: (\S+)$", bloque, re.M)
-        v = re.search(r"^Version: (\S+)$", bloque, re.M)
-        if f:
-            out[m.group(1)] = (v.group(1) if v else "?", f.group(1))
+        txt = gzip.decompress(crudo).decode("utf-8", "replace")
+        for bloque in txt.split("\n\n"):
+            m = re.search(r"^Package: (\S+)$", bloque, re.M)
+            if not m:
+                continue
+            f = re.search(r"^Filename: (\S+)$", bloque, re.M)
+            v = re.search(r"^Version: (\S+)$", bloque, re.M)
+            if f:
+                out[m.group(1)] = (v.group(1) if v else "?", f.group(1))
     return out
 
 
@@ -148,6 +159,22 @@ def extraer_deb(ruta_deb, destino):
         body = data[off + 60:off + 60 + size]
         if name.startswith("data.tar"):
             payload = body
+            if name.endswith(".zst"):
+                # Ubuntu 24.04 comprime los .deb con zstd y Python 3.13 no lo
+                # trae de serie: se descomprime con la CLI de zstd.
+                import subprocess
+                import tempfile
+                fd, tmp = tempfile.mkstemp(suffix=".tar")
+                try:
+                    os.write(fd, body)
+                    os.close(fd)
+                    with open(tmp, "rb") as origen, open(tmp + ".out", "wb") as destino:
+                        subprocess.run(["zstd", "-d", "-c", origen], stdout=destino, check=True)
+                    payload = open(tmp + ".out", "rb").read()
+                finally:
+                    for f in (tmp, tmp + ".out"):
+                        if os.path.exists(f):
+                            os.remove(f)
         off += 60 + size + (size % 2)
     if payload is None:
         raise RuntimeError(f"{ruta_deb} no contiene data.tar")

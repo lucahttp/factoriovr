@@ -36,6 +36,7 @@
 pub mod autostart;
 pub mod demangle;
 pub mod detour;
+pub mod consola;
 pub mod diagnostico;
 pub mod elf;
 pub mod entrada;

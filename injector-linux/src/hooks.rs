@@ -294,6 +294,11 @@ pub fn instalar() {
     // necesitar comandos: recibe un raton y decide el (ver docs/ADR-013).
     crate::entrada::instalar(&simbolos);
 
+    // La consola del motor: por ahi llegan las ordenes del visor cuando no
+    // hay RCON (ADR-020).  Vigila un directorio y las escribe en el stdin
+    // del propio motor.
+    crate::consola::instalar();
+
     // --- resolver ---
     let encontrado = match simbolos.resolver(&objetivo) {
         Some(r) => r,

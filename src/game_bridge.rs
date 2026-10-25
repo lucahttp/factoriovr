@@ -1318,37 +1318,43 @@ fn ruta_inventario() -> Option<std::path::PathBuf> {
 ///
 /// Se compara el tamano y la fecha de modificacion: el fichero se escribe
 /// varias veces por segundo y no tiene sentido releerlo entero cada vez.
-fn leer_si_cambio(ruta: &std::path::Path, marca: &mut Option<(u64, u64)>) -> Option<String> {
-    let meta = std::fs::metadata(ruta).ok()?;
-    let mtime = meta
-        .modified()
-        .ok()
-        .and_then(|m| m.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    let clave = (meta.len(), mtime);
-    if *marca == Some(clave) {
-        return None; // no ha cambiado: no hay nada nuevo
-    }
-    let datos = std::fs::read_to_string(ruta).ok()?;
-    if datos.len() < 4 || !datos.trim_start().starts_with('{') && !datos.trim_start().starts_with('[') {
+/// Lee un fichero del canal de estado, solo si ha cambiado.
+///
+/// Se compara con el ULTIMO contenido leido, no con la metadata del
+/// fichero: la metadata sale obsoleta justo despues de escribir (medido: el
+/// tamano salia 0 con el fichero ya escrito) y hacia que el fichero se
+/// releiese cada vez.  Los ficheros son pequenos (unos cientos de KB) y se
+/// leen unas pocas veces por segundo: da igual.
+fn leer_si_cambio(ruta: &std::path::Path, ultimo: &mut Option<String>) -> Option<String> {
+    let datos = match std::fs::read_to_string(ruta) {
+        Ok(d) => d,
+        Err(_) => return None,
+    };
+    if datos.len() < 4 {
         return None;
     }
-    *marca = Some(clave);
+    let cabeza = datos.trim_start();
+    if !cabeza.starts_with('{') && !cabeza.starts_with('[') {
+        return None;
+    }
+    if ultimo.as_deref() == Some(datos.as_str()) {
+        return None; // no ha cambiado: no hay nada nuevo
+    }
+    *ultimo = Some(datos.clone());
     Some(datos)
 }
 
 /// El estado del mundo, del fichero que empuja el mod (sin RCON).
-fn leer_estado_de_fichero(ruta: &std::path::Path, marca: &mut Option<(u64, u64)>) -> Option<String> {
-    leer_si_cambio(ruta, marca)
+fn leer_estado_de_fichero(ruta: &std::path::Path, ultimo: &mut Option<String>) -> Option<String> {
+    leer_si_cambio(ruta, ultimo)
 }
 
 /// El inventario, del fichero que empuja el mod (sin RCON).
 fn leer_inventario_de_fichero(
     ruta: &std::path::Path,
-    marca: &mut Option<(u64, u64)>,
+    ultimo: &mut Option<String>,
 ) -> Option<String> {
-    leer_si_cambio(ruta, marca)
+    leer_si_cambio(ruta, ultimo)
 }
 
 /// Sondeo por el remoto RCON (el camino antiguo, se mantiene de reserva).
@@ -1419,8 +1425,8 @@ fn sondeo_por_rcon(
 
 fn hilo_sondeo() {
     let mut ultimo_inventario = 0.0f32;
-    let mut marca_estado: Option<(u64, u64)> = None;
-    let mut marca_inventario: Option<(u64, u64)> = None;
+    let mut ultimo_estado: Option<String> = None;
+    let mut ultimo_texto_inventario: Option<String> = None;
     loop {
         std::thread::sleep(Duration::from_millis((RCON_POLL_INTERVAL * 1000.0) as u64));
 
@@ -1444,7 +1450,7 @@ fn hilo_sondeo() {
         let ruta_inv = ruta_inventario();
         let (snapshot, inventory, conectado) = match ruta_estado
             .as_deref()
-            .and_then(|r| leer_estado_de_fichero(r, &mut marca_estado))
+            .and_then(|r| leer_estado_de_fichero(r, &mut ultimo_estado))
         {
             Some(s) => {
                 // El inventario va en su propio fichero y se pide menos seguido.
@@ -1453,7 +1459,7 @@ fn hilo_sondeo() {
                     ultimo_inventario = 0.0;
                     ruta_inv
                         .as_deref()
-                        .and_then(|r| leer_inventario_de_fichero(r, &mut marca_inventario))
+                        .and_then(|r| leer_inventario_de_fichero(r, &mut ultimo_texto_inventario))
                 } else {
                     None
                 };
@@ -1586,6 +1592,64 @@ pub fn get_buzon() -> &'static Mutex<BuzonSondeo> {
             arrancado: AtomicBool::new(false),
         })
     })
+}
+
+
+/// El directorio donde el visor deja las ordenes para la consola del motor.
+///
+/// En /sdcard, que es lo unico que la app puede escribir con el
+/// almacenamiento con ambito (SELinux le impide tocar /data/local/tmp).
+fn directorio_consola() -> Option<std::path::PathBuf> {
+    if let Ok(d) = std::env::var("XFACTORVR_CONSOLA_DIR") {
+        if !d.trim().is_empty() {
+            return Some(std::path::PathBuf::from(d));
+        }
+    }
+    Some(std::path::PathBuf::from("/sdcard/XFactorVR/consola"))
+}
+
+/// Envia una orden al motor por la CONSOLA (sin RCON).
+///
+/// La orden se deja en un fichero y el inyector (que vive DENTRO del motor)
+/// la escribe en su stdin, que es la consola de Factorio.  Ahi se ejecuta
+/// como cualquier orden tecleeada, con lo que un `remote.call` al mod del
+/// servidor llega a el (ADR-020).
+///
+/// Devuelve false si no se pudo dejar la orden.
+fn enviar_orden_por_consola(orden: &str) -> bool {
+    let Some(dir) = directorio_consola() else {
+        return false;
+    };
+    if std::fs::create_dir_all(&dir).is_err() {
+        return false;
+    }
+    static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = std::sync::atomic::AtomicU64::fetch_add(
+        &N,
+        1,
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    let millis = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    // El nombre lleva el tiempo para que dos reinicios de la app no se pisen.
+    let ruta = dir.join(format!("pendiente-{millis}-{n}.txt"));
+    std::fs::write(&ruta, format!("{orden}\n")).is_ok()
+}
+
+/// Envia una orden al motor.
+///
+/// Primero por la CONSOLA (sin RCON); si no esta configurada, por el remoto
+/// RCON de siempre (el camino antiguo, que se mantiene de reserva).
+pub fn enviar_orden(orden: &str) -> bool {
+    if enviar_orden_por_consola(orden) {
+        return true;
+    }
+    if let Ok(mut rcon) = get_rcon_client().lock() {
+        return rcon.execute(orden).is_some();
+    }
+    false
 }
 
 pub fn get_rcon_client() -> &'static Mutex<RconClient> {
@@ -1917,13 +1981,13 @@ mod tests {
                        "tiles":[[42,0,1],[43,0,1]]}}"#;
         std::fs::write(&ruta, json).expect("no se pudo escribir");
 
-        let mut marca: Option<(u64, u64)> = None;
-        let leido = leer_estado_de_fichero(&ruta, &mut marca);
+        let mut ultimo: Option<String> = None;
+        let leido = leer_estado_de_fichero(&ruta, &mut ultimo);
         assert_eq!(leido.as_deref(), Some(json), "tiene que leer el fichero");
 
         // Si no ha cambiado, no se vuelve a leer: el buzon conserva lo anterior.
         assert!(
-            leer_estado_de_fichero(&ruta, &mut marca).is_none(),
+            leer_estado_de_fichero(&ruta, &mut ultimo).is_none(),
             "un fichero sin cambios no se relee"
         );
 

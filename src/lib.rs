@@ -245,27 +245,25 @@ pub unsafe extern "C" fn xfactorvr_place_or_update_entity(
     // La orientación se envía en radianes: el mod la convierte a las 16
     // direcciones de Factorio 2.0. Antes se enviaba fija en 0 y todo salía
     // mirando al norte, que rompía las cadenas de cintas.
-    if let Ok(mut rcon) = game_bridge::get_rcon_client().lock() {
-        let name_str = match entity_type {
-            tabletop::ENTITY_ASSEMBLING_MACHINE => "assembling-machine-1",
-            tabletop::ENTITY_MINING_DRILL => "electric-mining-drill",
-            tabletop::ENTITY_FURNACE => "stone-furnace",
-            tabletop::ENTITY_GUN_TURRET => "gun-turret",
-            tabletop::ENTITY_RADAR => "radar",
-            tabletop::ENTITY_ROBOPORT => "roboport",
-            tabletop::ENTITY_CHEST => "wooden-chest",
-            tabletop::ENTITY_ELECTRIC_POLE => "small-electric-pole",
-            tabletop::ENTITY_TRANSPORT_BELT => "transport-belt",
-            tabletop::ENTITY_INSERTER => "inserter",
-            _ => "",
-        };
-        if !name_str.is_empty() {
-            let cmd = format!(
-                "/silent-command remote.call('xfactorvr', 'place_entity', '{}', {:.2}, {:.2}, {:.3})",
-                name_str, tile_x, tile_y, orientation
-            );
-            rcon.execute(&cmd);
-        }
+    let name_str = match entity_type {
+        tabletop::ENTITY_ASSEMBLING_MACHINE => "assembling-machine-1",
+        tabletop::ENTITY_MINING_DRILL => "electric-mining-drill",
+        tabletop::ENTITY_FURNACE => "stone-furnace",
+        tabletop::ENTITY_GUN_TURRET => "gun-turret",
+        tabletop::ENTITY_RADAR => "radar",
+        tabletop::ENTITY_ROBOPORT => "roboport",
+        tabletop::ENTITY_CHEST => "wooden-chest",
+        tabletop::ENTITY_ELECTRIC_POLE => "small-electric-pole",
+        tabletop::ENTITY_TRANSPORT_BELT => "transport-belt",
+        tabletop::ENTITY_INSERTER => "inserter",
+        _ => "",
+    };
+    if !name_str.is_empty() {
+        let cmd = format!(
+            "/silent-command remote.call('xfactorvr', 'place_entity', '{}', {:.2}, {:.2}, {:.3})",
+            name_str, tile_x, tile_y, orientation
+        );
+        game_bridge::enviar_orden(&cmd);
     }
 
     let lock = get_live_entities_lock();
@@ -318,10 +316,8 @@ pub unsafe extern "C" fn xfactorvr_mine_entity(
         }
 
         // Si hay conexión RCON con Factorio, emitir comando de minado a la simulación nativa
-        if let Ok(mut rcon) = game_bridge::get_rcon_client().lock() {
-            let cmd = format!("/c remote.call('xfactorvr', 'mine_entity', {}, {})", tile_x, tile_y);
-            rcon.execute(&cmd);
-        }
+        let cmd = format!("/c remote.call('xfactorvr', 'mine_entity', {}, {})", tile_x, tile_y);
+        game_bridge::enviar_orden(&cmd);
         true
     } else {
         false
@@ -336,17 +332,12 @@ pub unsafe extern "C" fn xfactorvr_mine_entity(
 /// al sitio que se ha点了.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn xfactorvr_teleport_player(tile_x: f32, tile_y: f32) -> bool {
-    let ok = if let Ok(mut rcon) = game_bridge::get_rcon_client().lock() {
-        let cmd = format!(
-            "/silent-command remote.call('xfactorvr', 'teleport_player', {:.2}, {:.2})",
-            tile_x, tile_y
-        );
-        rcon.execute(&cmd);
-        true
-    } else {
-        false
-    };
-    ok
+    let cmd = format!(
+        "/silent-command remote.call('xfactorvr', 'teleport_player', {:.2}, {:.2})",
+        tile_x, tile_y
+    );
+    game_bridge::enviar_orden(&cmd);
+    true
 }
 
 /// Interactua con una entidad: abre su GUI y le recoge el contenido.
@@ -355,16 +346,12 @@ pub unsafe extern "C" fn xfactorvr_teleport_player(tile_x: f32, tile_y: f32) -> 
 /// campana, coger las piezas, activar una maquina.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn xfactorvr_interact_entity(tile_x: f32, tile_y: f32) -> bool {
-    if let Ok(mut rcon) = game_bridge::get_rcon_client().lock() {
-        let cmd = format!(
-            "/silent-command remote.call('xfactorvr', 'interact_entity', {:.2}, {:.2})",
-            tile_x, tile_y
-        );
-        rcon.execute(&cmd);
-        true
-    } else {
-        false
-    }
+    let cmd = format!(
+        "/silent-command remote.call('xfactorvr', 'interact_entity', {:.2}, {:.2})",
+        tile_x, tile_y
+    );
+    game_bridge::enviar_orden(&cmd);
+    true
 }
 
 /// Actualiza el ciclo de simulación y animaciones continuas de las entidades vivas
@@ -603,9 +590,7 @@ pub unsafe extern "C" fn xfactorvr_craft_item(
         "/silent-command remote.call('xfactorvr', 'craft', '{}', {})",
         recipe_name, count
     );
-    if let Ok(mut rcon) = game_bridge::get_rcon_client().lock() {
-        rcon.execute(&cmd);
-    }
+    game_bridge::enviar_orden(&cmd);
     true
 }
 
@@ -754,12 +739,10 @@ pub unsafe extern "C" fn xfactorvr_connect_rcon(
     // El lock del cliente RCON se libera ANTES de tomar el del mundo: el
     // sondeo periodico toma mundo -> rcon, y al revés se produciria un
     // interbloqueo clasico (ABBA).
-    let success = {
-        if let Ok(mut rcon) = game_bridge::get_rcon_client().lock() {
-            rcon.connect(&addr, &c_pwd)
-        } else {
-            false
-        }
+    let success = if let Ok(mut rcon) = game_bridge::get_rcon_client().lock() {
+        rcon.connect(&addr, &c_pwd)
+    } else {
+        false
     };
 
     if let Ok(mut world) = game_bridge::get_simulation_world().write() {
@@ -905,9 +888,7 @@ pub unsafe extern "C" fn xfactorvr_set_quick_bar(
         slot.max(1),
         nombre
     );
-    if let Ok(mut rcon) = game_bridge::get_rcon_client().lock() {
-        rcon.execute(&cmd);
-    }
+    game_bridge::enviar_orden(&cmd);
     true
 }
 
@@ -944,9 +925,7 @@ pub unsafe extern "C" fn xfactorvr_insert_item(
         "/silent-command remote.call('xfactorvr', 'insert_item', {:.2}, {:.2}, '{}', {}, {})",
         x, y, nombre, count.max(1), inv_index.max(1)
     );
-    if let Ok(mut rcon) = game_bridge::get_rcon_client().lock() {
-        rcon.execute(&cmd);
-    }
+    game_bridge::enviar_orden(&cmd);
     true
 }
 
@@ -1194,9 +1173,7 @@ pub unsafe extern "C" fn xfactorvr_pick_up_item(tile_x: f32, tile_y: f32) -> boo
         "/silent-command remote.call('xfactorvr', 'pick_up_item', {:.2}, {:.2})",
         tile_x, tile_y
     );
-    if let Ok(mut rcon) = game_bridge::get_rcon_client().lock() {
-        rcon.execute(&cmd);
-    }
+    game_bridge::enviar_orden(&cmd);
     true
 }
 
@@ -1237,9 +1214,7 @@ pub unsafe extern "C" fn xfactorvr_take_from_container(
         nombre,
         count.max(1)
     );
-    if let Ok(mut rcon) = game_bridge::get_rcon_client().lock() {
-        rcon.execute(&cmd);
-    }
+    game_bridge::enviar_orden(&cmd);
     true
 }
 
@@ -1288,9 +1263,7 @@ pub unsafe extern "C" fn xfactorvr_insert_carried_item(
         count.max(1),
         inv_index.max(1)
     );
-    if let Ok(mut rcon) = game_bridge::get_rcon_client().lock() {
-        rcon.execute(&cmd);
-    }
+    game_bridge::enviar_orden(&cmd);
     true
 }
 

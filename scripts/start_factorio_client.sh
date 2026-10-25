@@ -330,6 +330,29 @@ if ! grep -q "^sound-enabled" "$CLIENT_CONFIG" 2>/dev/null; then
     printf '\n[sound]\nsound-enabled=false\n' >> "$CLIENT_CONFIG"
 fi
 
+# --- 5b. La consola del motor (canal de ordenes sin RCON, ADR-020) ---------
+#
+# El motor lee ordenes por su stdin (la consola de Factorio).  Si el stdin
+# esta a EOF, el motor CIERRA el lector y ya no acepta ni una orden mas
+# ("Got EOF on stdin; closing").  Con una FIFO abierta en lectura-escritura
+# nunca hay EOF, y el inyector (que vive dentro del motor) puede escribir en
+# el fd 0 del propio motor.
+CONSOLA_FIFO="${CONSOLA_FIFO:-/data/local/tmp/factorio/consola.fifo}"
+CONSOLA_DIR="${XFACTORVR_CONSOLA_DIR:-/sdcard/XFactorVR/consola}"
+mkdir -p "$(dirname "$CONSOLA_FIFO")" "$CONSOLA_DIR" 2>/dev/null || true
+if [ ! -p "$CONSOLA_FIFO" ]; then
+    mkfifo "$CONSOLA_FIFO" 2>/dev/null || true
+fi
+if [ -p "$CONSOLA_FIFO" ]; then
+    # Se abre en lectura-escritura: el motor lee del fd 0 y no hay EOF.
+    exec 3<>"$CONSOLA_FIFO" 2>/dev/null || true
+    export XFACTORVR_CONSOLA_DIR="$CONSOLA_DIR"
+    log "Consola del motor: FIFO $CONSOLA_FIFO, ordenes en $CONSOLA_DIR"
+else
+    log "AVISO: no se pudo crear la FIFO de la consola ($CONSOLA_FIFO):"
+    log "       el motor no aceptara ordenes por consola (solo RCON)."
+fi
+
 # --- 6. Arranque ------------------------------------------------------------
 GAME_BIN="$GAME_DIR/bin/arm64/factorio"
 
@@ -342,7 +365,7 @@ if [ -n "${SERVER_ADDR:-}" ]; then
     exec env LD_LIBRARY_PATH="$LIB_PATH" LD_PRELOAD="$PRELOAD" "$LOADER" --library-path "$LIB_PATH" "$GAME_BIN" \
         --config "$CLIENT_CONFIG" \
         --window-size "${WIDTH}x${HEIGHT}" \
-        --mp-connect "$SERVER_ADDR:$SERVER_PORT"
+        --mp-connect "$SERVER_ADDR:$SERVER_PORT" <&3
 fi
 
 # Modo simple: el cliente juega en single-player (sin RCON, que en single
@@ -362,4 +385,4 @@ exec env LD_LIBRARY_PATH="$LIB_PATH" LD_PRELOAD="$PRELOAD" "$LOADER" --library-p
     --config "$CLIENT_CONFIG" \
     --window-size "${WIDTH}x${HEIGHT}" \
     --fullscreen \
-    "$SAVE"
+    "$SAVE" <&3

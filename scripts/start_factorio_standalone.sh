@@ -114,7 +114,13 @@ mkdir -p "$FACTORIO_DIR/logs" 2>/dev/null || true
 # El motor lee los ajustes de servidor del directorio de configuracion, que
 # con config-path.cfg es <raiz>/config (config-path=__PATH__executable__/../../config).
 CONFIG_DIR="$FACTORIO_DIR/config"
-SETTINGS_FILE="$CONFIG_DIR/server-settings.json"
+# OJO: el motor lee server-settings.json del WRITE-DATA, no del directorio de
+# configuracion.  Con el write-data en /sdcard (ADR-020, para que el estado
+# que empuja el mod llegue al visor), dejarlo en $CONFIG_DIR hacia que el
+# servidor no lo encontrase: se quedaba con los valores por defecto, que
+# tienen auto_pause=true, y sin jugadores el nivel NO TICKEABA: el mod no
+# empujaba el estado y el visor se quedaba con la foto vieja.
+SETTINGS_FILE="$WRITE_DIR/server-settings.json"
 mkdir -p "$CONFIG_DIR" 2>/dev/null || true
 # El write-data tiene que existir y ser escribible: si no, el motor no
 # arranca y no hay estado que leer.
@@ -170,27 +176,12 @@ if [ -n "${SCENARIO:-}" ]; then
   "autosave_slots": 3
 }
 JSON
-elif [ ! -f "$SETTINGS_FILE" ]; then
-    log "Creando $SETTINGS_FILE con auto_pause desactivado..."
-    cp /data/local/tmp/server-settings.json "$SETTINGS_FILE" 2>/dev/null \
-        || cat > "$SETTINGS_FILE" <<'JSON'
-{
-  "name": "XFactorVR",
-  "description": "Factorio para VR",
-  "visibility": { "public": false, "lan": true },
-  "require_user_verification": false,
-  "auto_pause": false,
-  "auto_pause_when_players_connect": false,
-  "autosave_interval": 10,
-  "autosave_slots": 3
-}
-JSON
 else
-    # Si existe, se asegura de que auto_pause siga desactivado.
-    if ! grep -q '"auto_pause"[[:space:]]*:[[:space:]]*false' "$SETTINGS_FILE" 2>/dev/null; then
-        log "Forzando auto_pause=false en $SETTINGS_FILE"
-        cp "$SETTINGS_FILE" "$SETTINGS_FILE.bak" 2>/dev/null || true
-        cat > "$SETTINGS_FILE" <<'JSON'
+    # El ajuste se escribe SIEMPRE (no solo si no existe): lo que importa es
+    # que auto_pause siga en false, porque sin jugadores el nivel no
+    # tickea y el mod no empuja el estado.
+    log "Escribiendo $SETTINGS_FILE con auto_pause desactivado..."
+    cat > "$SETTINGS_FILE" <<'JSON'
 {
   "name": "XFactorVR",
   "description": "Factorio para VR",
@@ -202,7 +193,6 @@ else
   "autosave_slots": 3
 }
 JSON
-    fi
 fi
 log "Ajustes de servidor: $SETTINGS_FILE"
 

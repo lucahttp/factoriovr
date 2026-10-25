@@ -1161,10 +1161,21 @@ local function construir_snapshot(cx, cy, radius)
         terreno = t_err
     end
 
+    -- La posicion del JUGADOR: el visor la necesita para saber donde
+    -- poner la mesa (su camara), porque sin RCON ya no puede pedir el
+    -- centro de vista por otro lado.  Sin esto el visor se queda en (0,0)
+    -- y pinta un trozo de mapa que no es donde esta la fabrica.
+    local jugador = "{\"x\":0,\"y\":0}"
+    local p = real_player()
+    if p and p.position then
+        jugador = string.format('{"x":%.2f,"y":%.2f}', p.position.x, p.position.y)
+    end
+
     return '{"entities":[' .. table.concat(entities, ",") ..
         '],"patches":[' .. table.concat(patches, ",") ..
         '],"loose":[' .. table.concat(loose, ",") ..
-        '],"terrain":' .. terreno .. '}'
+        '],"jugador":' .. jugador ..
+        ',"terrain":' .. terreno .. '}'
 end
 
 -- Centro de la vista que pide el visor por el canal de ordenes.

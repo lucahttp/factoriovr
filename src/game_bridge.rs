@@ -344,6 +344,12 @@ impl SimulationWorld {
             }
         };
 
+        // El centro de vista es donde esta el jugador: sin esto la mesa se
+        // queda en (0,0) y pinta un trozo de mapa que no es la fabrica.
+        if let Some(j) = snap.jugador {
+            self.view_center = (j.x, j.y);
+        }
+
         entities.clear();
         entities.reserve(snap.entities.len());
         for e in snap.entities {
@@ -1427,6 +1433,7 @@ fn hilo_sondeo() {
     let mut ultimo_inventario = 0.0f32;
     let mut ultimo_estado: Option<String> = None;
     let mut ultimo_texto_inventario: Option<String> = None;
+    let mut centro_enviado: Option<(i32, i32)> = None;
     loop {
         std::thread::sleep(Duration::from_millis((RCON_POLL_INTERVAL * 1000.0) as u64));
 
@@ -1441,6 +1448,30 @@ fn hilo_sondeo() {
                 f32::from_bits(b.vista_y.load(Ordering::Relaxed)),
             )
         };
+
+        // DIRELE AL MOD DONDE ESTAMOS MIRANDO.
+        //
+        // Sin esto el mod empuja la instantanea del sitio donde esta el
+        // jugador virtual (0,0) y el visor recibe un mapa vacio (unas rocas)
+        // en vez de la fabrica.  El mod no puede leer ficheros, asi que el
+        // centro viaja como ORDEN por la consola del motor (ADR-020).
+        //
+        // Solo se manda cuando cambia (o al principio), para no spamear la
+        // consola.
+        let centro = (cx.round() as i32, cy.round() as i32);
+        if centro_enviado != Some(centro) {
+            let cmd = format!(
+                "/silent-command remote.call('xfactorvr', 'set_view_center', {}, {})",
+                centro.0, centro.1
+            );
+            enviar_orden(&cmd);
+            centro_enviado = Some(centro);
+            log::info!(
+                "sondeo: centro de vista enviado al mod ({}, {})",
+                centro.0,
+                centro.1
+            );
+        }
 
         // El estado puede venir de dos sitios: del FICHERO que empuja el mod
         // (canal sin RCON, ADR-020) o del remoto RCON (el camino antiguo).
@@ -1785,6 +1816,20 @@ pub struct Snapshot {
     /// Terreno real del mapa (hierba, tierra, arena, agua...).
     #[serde(default)]
     pub terrain: TerrainSnapshot,
+    /// Posicion del JUGADOR real.
+    ///
+    /// Sin RCON el visor no puede preguntar el centro de vista por otro
+    /// lado, asi que el mod lo manda en la instantanea: con el, el visor
+    /// sabe donde poner la mesa (su camara) y por que area pedir.
+    #[serde(default)]
+    pub jugador: Option<PosicionJugador>,
+}
+
+/// Posicion del jugador real en el mapa (en tiles).
+#[derive(Debug, Default, Clone, Copy, Deserialize)]
+pub struct PosicionJugador {
+    pub x: f32,
+    pub y: f32,
 }
 
 /// Terreno del area visible.

@@ -54,24 +54,35 @@ El protocolo actual (XFV1) es:
 ```
 
 **Se añade el flag bit 1 (`0x02`) = "este mensaje es geometría, no píxeles"**,
-y en ese caso la carga es:
+el formato de carga pasa a 1 (GEOMETRIA) y entonces la carga es:
 
 ```text
-  u32  numero de entidades
-  u32  origen_x  (f32)  -- posicion del jugador en el mundo (para el marco)
-  u32  origen_y  (f32)
-  f32  escala    (px por tile del motor)
-  u32  ojo
-  por entidad (24 bytes):
-     f32  wx
-     f32  wy
-     f32  sx
-     f32  sy
-     u32  direccion
-     i32  modelo
+  cabecera: w (u16) = numero de nombres de prototipo
+            h (u16) = numero de entidades
+            flags    = ojo | 0x02
+            formato  = 1
+  carga:
+    u32  numero de nombres
+      por nombre: u8 longitud + bytes ASCII
+    u32  numero de entidades
+      por entidad (24 bytes):
+         f32  wx
+         f32  wy
+         f32  sx
+         f32  sy
+         u32  direccion
+         u32  modelo
 ```
 
  little-endian, igual que el resto del protocolo.
+
+**El origen NO viaja**: las posiciones son absolutas y el visor las resta
+del `view_center` (donde está el jugador), igual que hacía con el snapshot.
+
+**La tabla de nombres viaja entera en cada mensaje** (unos 300 bytes): los
+dos lados numeran los modelos de forma distinta, así que el visor recibe
+el NOMBRE y lo convierte con su propio `id_de_prototipo`. Sin estado que
+sincronizar y sin possibility de desajuste.
 
 **Por qué no un puerto nuevo**: el inyector ya está conectado al visor y
 tiene el estado de la escena en memoria justo cuando compone el frame.

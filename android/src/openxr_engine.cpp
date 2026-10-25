@@ -726,6 +726,19 @@ static pfn_xfactorvr_ui_pulsar s_ui_pulsar = nullptr;
 static pfn_xfactorvr_3d_iniciar s_3d_iniciar = nullptr;
 static pfn_xfactorvr_dibujar_modelos_3d_ex s_dibujar_modelos_3d = nullptr;
 static pfn_xfactorvr_geometria s_geometria = nullptr;
+/// Una entidad tal como la dibuja el motor (canal de geometria, ADR-021).
+struct GeoEntidad {
+    float wx, wy;   // posicion en el mundo del motor (tiles)
+    float sx, sy;   // tamano del sprite (tiles)
+    uint32_t direccion;
+    uint32_t modelo;  // indice en la tabla de nombres
+};
+
+static std::mutex s_geo_mutex;
+static std::vector<GeoEntidad> s_geo_entidades;
+/// La tabla de prototipos, separada por '\n' (el indice de modelo apunta aqui).
+static std::string s_geo_nombres;
+static std::atomic<uint64_t> s_geo_mensajes{0};
 static pfn_xfactorvr_sgsr_preparar s_sgsr_preparar = nullptr;
 static pfn_xfactorvr_sgsr_fbo s_sgsr_fbo = nullptr;
 static pfn_xfactorvr_sgsr_escalar s_sgsr_escalar = nullptr;
@@ -3107,19 +3120,6 @@ static GLuint s_vbo_juego = 0;
 static int s_juego_vertices = 0;
 static pthread_t s_game_thread = 0;
 
-/// Una entidad tal como la dibuja el motor (canal de geometria, ADR-021).
-struct GeoEntidad {
-    float wx, wy;   // posicion en el mundo del motor (tiles)
-    float sx, sy;   // tamano del sprite (tiles)
-    uint32_t direccion;
-    uint32_t modelo;  // indice en la tabla de nombres
-};
-
-static std::mutex s_geo_mutex;
-static std::vector<GeoEntidad> s_geo_entidades;
-/// La tabla de prototipos, separada por '\n' (el indice de modelo apunta aqui).
-static std::string s_geo_nombres;
-static std::atomic<uint64_t> s_geo_mensajes{0};
 
 /// Lee exactamente N bytes del socket. Devuelve false si se corta.
 static bool leer_exacto(int fd, uint8_t* buf, size_t n) {

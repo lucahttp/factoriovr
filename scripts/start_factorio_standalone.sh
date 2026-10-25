@@ -129,9 +129,13 @@ fi
 # /usr/share/factorio: "There is no package core".  Se le da un config.ini
 # propio con las rutas en absoluto, igual que hace el cliente grafico.
 SERVER_CONFIG="$CONFIG_DIR/config.ini"
-if [ ! -f "$SERVER_CONFIG" ]; then
-    log "Creando el config.ini del servidor (rutas absolutas)..."
-    cat > "$SERVER_CONFIG" <<CFG
+# Se reescribe SIEMPRE: las rutas son absolutas y el write-data puede haber
+# cambiado (ahora esta en /sdcard, para que el estado llegue al visor sin
+# RCON).  Si solo se creara cuando no existe, el visor se quedaria con el
+# write-data viejo.
+log "Escribiendo el config.ini del servidor (rutas absolutas)..."
+{
+    cat <<CFG
 [path]
 read-data=$FACTORIO_DIR/data
 write-data=$WRITE_DIR
@@ -139,7 +143,7 @@ write-data=$WRITE_DIR
 [other]
 check-updates=false
 CFG
-fi
+} > "$SERVER_CONFIG"
 
 # En modo CAMPANA el auto_pause va DESACTIVADO.
 #

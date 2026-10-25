@@ -53,6 +53,12 @@ pub const MAGIC: u32 = 0x3156_4658;
 pub const TAM_CABECERA: usize = 16;
 /// RGBA de 8 bits por canal.
 pub const FORMATO_RGBA8: u8 = 0;
+
+/// Formato del mensaje de GEOMETRIA (ver `enviar_geometria`).
+pub const FORMATO_GEOMETRIA: u8 = 1;
+
+/// Flag bit 1: el mensaje lleva geometria, no pixeles.
+pub const FLAG_GEOMETRIA: u8 = 0x02;
 /// La imagen va invertida verticalmente respecto a lo normal.
 pub const FLAG_INVERTIDA: u8 = 1;
 
@@ -306,14 +312,131 @@ pub fn enviar(pix: &[u8], w: u32, h: u32, ojo: u8) -> bool {
     }
 }
 
+/// Encola un paquete ya montado en el canal del emisor.
+///
+/// Lo usan el frame de pixeles y el de geometria: van por el mismo socket y
+/// el hilo emisor los escribe tal cual.
+fn despachar(paquete: Vec<u8>) -> bool {
+    let canal = {
+        let c = estado().canal.lock().unwrap_or_else(|p| p.into_inner());
+        c.clone()
+    };
+    match canal {
+        Some(tx) => {
+            let r = tx.try_send(paquete);
+            match r {
+                Ok(()) => {
+                    let mut e = estado().enviados.lock().unwrap_or_else(|p| p.into_inner());
+                    *e += 1;
+                    true
+                }
+                Err(TrySendError::Full(_)) => {
+                    let mut p = estado().perdidos.lock().unwrap_or_else(|p| p.into_inner());
+                    *p += 1;
+                    false
+                }
+                Err(TrySendError::Disconnected(_)) => false,
+            }
+        }
+        None => false,
+    }
+}
+
+/// Empaqueta la geometria (cabecera + carga) SIN enviarla.
+///
+/// Se separa del envio para poder comprobar el formato en un banco sin
+/// tocar el socket (y sin que dos bancos se pisen el canal).
+pub fn empaquetar_geometria(
+    numero: u32,
+    cajas: &[crate::modelo3d::Caja],
+    nombres: &[String],
+    ojo: u8,
+) -> Vec<u8> {
+    // Solo las entidades con modelo 3D: las demas se ven con su sprite.
+    let utiles: Vec<&crate::modelo3d::Caja> = cajas
+        .iter()
+        .filter(|c| c.modelo >= 0 && c.sx > 0.0 && c.sy > 0.0)
+        .collect();
+
+    let mut carga = Vec::with_capacity(64 + utiles.len() * 24);
+    carga.extend_from_slice(&(nombres.len() as u32).to_le_bytes());
+    for n in nombres {
+        let b = n.as_bytes();
+        carga.push(b.len() as u8);
+        carga.extend_from_slice(b);
+    }
+    carga.extend_from_slice(&(utiles.len() as u32).to_le_bytes());
+    for c in utiles.iter() {
+        carga.extend_from_slice(&c.wx.to_le_bytes());
+        carga.extend_from_slice(&c.wy.to_le_bytes());
+        carga.extend_from_slice(&c.sx.to_le_bytes());
+        carga.extend_from_slice(&c.sy.to_le_bytes());
+        carga.extend_from_slice(&(c.direccion as u32).to_le_bytes());
+        carga.extend_from_slice(&(c.modelo as u32).to_le_bytes());
+    }
+
+    let mut paquete = Vec::with_capacity(TAM_CABECERA + carga.len());
+    escribir_cabecera_con_formato(
+        &mut paquete,
+        numero,
+        nombres.len() as u32,
+        utiles.len() as u32,
+        (ojo & 1) | FLAG_GEOMETRIA,
+        FORMATO_GEOMETRIA,
+    );
+    paquete.extend_from_slice(&carga);
+    paquete
+}
+
+/// Envia la GEOMETRIA de las entidades visibles al visor.
+///
+/// Es el canal del ADR-021: la posicion, el tamano, la direccion y el modelo
+/// 3D de cada entidad TAL CUAL las dibuja el motor (no estimadas como las
+/// del snapshot).  El visor las usa para colocar los modelos 3D en la mesa,
+/// en estereo, con la posicion exacta.
+///
+/// Va por el MISMO socket que los pixeles: se distingue por el flag bit 1
+/// y por el formato de la carga.  El formato esta descrito en
+/// `empaquetar_geometria`.
+pub fn enviar_geometria(cajas: &[crate::modelo3d::Caja], nombres: &[String], ojo: u8) -> bool {
+    if cajas.iter().all(|c| c.modelo < 0 || c.sx <= 0.0 || c.sy <= 0.0) {
+        // Nada que mandar (ninguna entidad tiene modelo 3D).
+        return false;
+    }
+
+    let numero = {
+        let mut c = estado().contador.lock().unwrap_or_else(|p| p.into_inner());
+        *c = c.wrapping_add(1);
+        *c
+    };
+
+    let paquete = empaquetar_geometria(numero, cajas, nombres, ojo);
+    despachar(paquete)
+}
+
 /// Escribe la cabecera del protocolo en un buffer.
 pub fn escribir_cabecera(buf: &mut Vec<u8>, numero: u32, w: u32, h: u32, flags: u8) {
+    escribir_cabecera_con_formato(buf, numero, w, h, flags, FORMATO_RGBA8);
+}
+
+/// Igual que `escribir_cabecera`, pero con otro formato de carga.
+///
+/// El formato dice como se interpretan los bytes que siguen: 0 = RGBA8888
+/// (un frame de pixeles), 1 = geometria (ver `enviar_geometria`).
+pub fn escribir_cabecera_con_formato(
+    buf: &mut Vec<u8>,
+    numero: u32,
+    w: u32,
+    h: u32,
+    flags: u8,
+    formato: u8,
+) {
     buf.extend_from_slice(&MAGIC.to_le_bytes());
     buf.extend_from_slice(&numero.to_le_bytes());
     buf.extend_from_slice(&(w as u16).to_le_bytes());
     buf.extend_from_slice(&(h as u16).to_le_bytes());
     buf.push(flags);
-    buf.push(FORMATO_RGBA8);
+    buf.push(formato);
     buf.extend_from_slice(&0u16.to_le_bytes());
 }
 
@@ -543,5 +666,68 @@ mod tests {
         assert_eq!(p.len(), TAM_CABECERA + 4);
         assert_eq!(&p[0..4], &MAGIC.to_le_bytes());
         assert_eq!(&p[TAM_CABECERA..], &carga[..]);
+    }
+
+    /// El mensaje de GEOMETRIA: cabecera con su flag y su formato, y la carga
+    /// con la tabla de nombres y las entidades.
+    ///
+    /// Es el canal del ADR-021: con esto el visor coloca los modelos 3D en la
+    /// mesa con la posicion EXACTA con la que los dibuja el motor.
+    #[test]
+    fn el_mensaje_de_geometria_lleva_las_entidades() {
+        use crate::modelo3d::Caja;
+
+        let n1 = "assembling-machine-1";
+        let n2 = "furnace";
+        let nombres = vec![n1.to_string(), n2.to_string()];
+        let cajas = vec![
+            Caja { wx: 10.5, wy: -3.25, sx: 2.0, sy: 2.0, direccion: 4, modelo: 0, escala: 32.0 },
+            Caja { wx: -1.0, wy: 7.5, sx: 1.0, sy: 1.0, direccion: 8, modelo: 1, escala: 32.0 },
+            // Sin modelo 3D: no se manda (esa entidad se ve con su sprite).
+            Caja { wx: 0.0, wy: 0.0, sx: 1.0, sy: 1.0, direccion: 0, modelo: -1, escala: 32.0 },
+        ];
+
+        let p = empaquetar_geometria(9, &cajas, &nombres, 1);
+
+        // Cabecera: magic, numero, w = nombres, h = entidades, flags, formato.
+        assert_eq!(&p[0..4], &MAGIC.to_le_bytes());
+        assert_eq!(u32::from_le_bytes([p[4], p[5], p[6], p[7]]), 9);
+        assert_eq!(u16::from_le_bytes([p[8], p[9]]), 2, "numero de nombres");
+        assert_eq!(u16::from_le_bytes([p[10], p[11]]), 2, "numero de entidades");
+        assert_eq!(p[12] & FLAG_GEOMETRIA, FLAG_GEOMETRIA, "tiene que ir el flag");
+        assert_eq!(p[12] & 1, 1, "y el ojo");
+        assert_eq!(p[13], FORMATO_GEOMETRIA);
+
+        // Carga: numero de nombres, los nombres, numero de entidades, las
+        // entidades.
+        let c = &p[TAM_CABECERA..];
+        let mut i = 0usize;
+        assert_eq!(u32::from_le_bytes([c[i], c[i + 1], c[i + 2], c[i + 3]]), 2);
+        i += 4;
+        assert_eq!(c[i] as usize, n1.len());
+        i += 1;
+        assert_eq!(&c[i..i + n1.len()], n1.as_bytes());
+        i += n1.len();
+        assert_eq!(c[i] as usize, n2.len());
+        i += 1;
+        assert_eq!(&c[i..i + n2.len()], n2.as_bytes());
+        i += n2.len();
+        assert_eq!(u32::from_le_bytes([c[i], c[i + 1], c[i + 2], c[i + 3]]), 2);
+        i += 4;
+
+        // La primera entidad: posicion, tamano, direccion y modelo.
+        let f = |j: usize| f32::from_le_bytes([c[j], c[j + 1], c[j + 2], c[j + 3]]);
+        let u = |j: usize| u32::from_le_bytes([c[j], c[j + 1], c[j + 2], c[j + 3]]);
+        assert_eq!(f(i), 10.5);
+        assert_eq!(f(i + 4), -3.25);
+        assert_eq!(f(i + 8), 2.0);
+        assert_eq!(f(i + 12), 2.0);
+        assert_eq!(u(i + 16), 4, "direccion");
+        assert_eq!(u(i + 20), 0, "modelo");
+        i += 24;
+        assert_eq!(f(i), -1.0);
+        assert_eq!(f(i + 4), 7.5);
+        assert_eq!(u(i + 16), 8, "direccion");
+        assert_eq!(u(i + 20), 1, "modelo");
     }
 }

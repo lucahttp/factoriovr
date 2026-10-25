@@ -403,6 +403,16 @@ fn registro() -> std::sync::MutexGuard<'static, Registro> {
     r.lock().unwrap_or_else(|p| p.into_inner())
 }
 
+/// Los nombres de prototipo del registro, en el orden de sus indices.
+///
+/// Es la tabla que viaja al visor junto con la geometria (ADR-021): los dos
+/// lados numeran los modelos de forma distinta (aqui el indice en el vector
+/// de prototipos, en el visor un id contador), asi que el visor recibe el
+/// NOMBRE y lo convierte con su propio `id_de_prototipo`.
+pub fn nombres_de_prototipos() -> Vec<String> {
+    registro().prototipos.clone()
+}
+
 /// Carga el manifiesto (una sola vez) y deja el registro listo.
 pub fn configurar() {
     let dir = match modelos::dir_modelos() {

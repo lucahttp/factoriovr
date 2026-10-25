@@ -1616,6 +1616,16 @@ pub fn capturar_frame_completo() {
                 crate::stream::perdidos()
             ));
         }
+
+        // Y la GEOMETRIA de las entidades visibles (canal del ADR-021): con
+        // ella el visor coloca los modelos 3D en la mesa con la posicion y la
+        // direccion EXACTAS con las que el motor los dibuja, en vez de
+        // estimarlas con el snapshot.
+        crate::stream::enviar_geometria(
+            &entidades_visibles(),
+            &crate::render3d::nombres_de_prototipos(),
+            ojo_actual(),
+        );
     });
 }
 

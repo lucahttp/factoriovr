@@ -124,6 +124,10 @@ pub unsafe extern "C" fn xfactorvr_geometria(
     *geometria_nombres_lock().write().unwrap_or_else(|e| e.into_inner()) = tabla;
     let total = ents.len() as u32;
     *geometria_lock().write().unwrap_or_else(|e| e.into_inner()) = ents;
+    log::info!(
+        "geometria del motor: {} entidades (canal XFV1)",
+        total
+    );
     total
 }
 

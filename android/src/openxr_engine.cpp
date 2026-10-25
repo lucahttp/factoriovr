@@ -685,6 +685,13 @@ typedef long long (*pfn_xfactorvr_ui_hit)(uint32_t ventana, float u, float v);
 // una llamada de dibujo por prototipo, con una matriz por instancia.
 typedef bool  (*pfn_xfactorvr_3d_iniciar)(void);
 typedef uint32_t (*pfn_xfactorvr_dibujar_modelos_3d_ex)(const float* vp16, const float* tabla16);
+
+/// Recibe la geometria que el motor dibuja (canal del ADR-021).
+///
+/// `datos` son 6 floats por entidad (wx, wy, sx, sy, direccion, modelo) y
+/// `nombres` la tabla de prototipos, separados por '\n' (el indice de
+/// modelo apunta a esa tabla).  Devuelve cuantas entidades se han guardado.
+typedef uint32_t (*pfn_xfactorvr_geometria)(const float* datos, uint32_t n, const char* nombres);
 typedef bool  (*pfn_xfactorvr_sgsr_preparar)(int w_in, int h_in, int w_out, int h_out);
 typedef uint32_t (*pfn_xfactorvr_sgsr_fbo)(void);
 typedef bool  (*pfn_xfactorvr_sgsr_escalar)(void);
@@ -718,6 +725,7 @@ static pfn_xfactorvr_ui_ventana_geom s_ui_ventana_geom = nullptr;
 static pfn_xfactorvr_ui_pulsar s_ui_pulsar = nullptr;
 static pfn_xfactorvr_3d_iniciar s_3d_iniciar = nullptr;
 static pfn_xfactorvr_dibujar_modelos_3d_ex s_dibujar_modelos_3d = nullptr;
+static pfn_xfactorvr_geometria s_geometria = nullptr;
 static pfn_xfactorvr_sgsr_preparar s_sgsr_preparar = nullptr;
 static pfn_xfactorvr_sgsr_fbo s_sgsr_fbo = nullptr;
 static pfn_xfactorvr_sgsr_escalar s_sgsr_escalar = nullptr;
@@ -1382,6 +1390,7 @@ static void init_glb_loader() {
     s_ui_pulsar = (pfn_xfactorvr_ui_pulsar)dlsym(handle, "xfactorvr_ui_pulsar");
     s_3d_iniciar = (pfn_xfactorvr_3d_iniciar)dlsym(handle, "xfactorvr_3d_iniciar");
     s_dibujar_modelos_3d = (pfn_xfactorvr_dibujar_modelos_3d_ex)dlsym(handle, "xfactorvr_dibujar_modelos_3d_ex");
+    s_geometria = (pfn_xfactorvr_geometria)dlsym(handle, "xfactorvr_geometria");
     s_sgsr_preparar = (pfn_xfactorvr_sgsr_preparar)dlsym(handle, "xfactorvr_sgsr_preparar");
     s_sgsr_fbo = (pfn_xfactorvr_sgsr_fbo)dlsym(handle, "xfactorvr_sgsr_fbo");
     s_sgsr_escalar = (pfn_xfactorvr_sgsr_escalar)dlsym(handle, "xfactorvr_sgsr_escalar");
@@ -1426,6 +1435,7 @@ static void init_glb_loader() {
             s_ui_pulsar = (pfn_xfactorvr_ui_pulsar)dlsym(mod_handle, "xfactorvr_ui_pulsar");
             s_3d_iniciar = (pfn_xfactorvr_3d_iniciar)dlsym(mod_handle, "xfactorvr_3d_iniciar");
             s_dibujar_modelos_3d = (pfn_xfactorvr_dibujar_modelos_3d_ex)dlsym(mod_handle, "xfactorvr_dibujar_modelos_3d_ex");
+            s_geometria = (pfn_xfactorvr_geometria)dlsym(mod_handle, "xfactorvr_geometria");
             s_sgsr_preparar = (pfn_xfactorvr_sgsr_preparar)dlsym(mod_handle, "xfactorvr_sgsr_preparar");
             s_sgsr_fbo = (pfn_xfactorvr_sgsr_fbo)dlsym(mod_handle, "xfactorvr_sgsr_fbo");
             s_sgsr_escalar = (pfn_xfactorvr_sgsr_escalar)dlsym(mod_handle, "xfactorvr_sgsr_escalar");
@@ -2942,6 +2952,33 @@ static void draw_tabletop_scene(const float* vp_mat,
         glDrawArrays(GL_TRIANGLES, 0, (GLsizei)dyn_verts.size());
     }
 
+    // LA GEOMETRIA QUE DIBUJO EL MOTOR (canal del ADR-021).
+    //
+    // El inyector manda, en cada frame, la posicion y la direccion EXACTAS
+    // de cada entidad visible (las que el motor acaba de dibujar).  Rust las
+    // usa para colocar los modelos 3D en la mesa: asi las maquinas estan
+    // donde de verdad estan, no donde las estima el snapshot.
+    if (s_geometria) {
+        std::vector<float> plano;
+        std::string nombres;
+        {
+            std::lock_guard<std::mutex> lock(s_geo_mutex);
+            plano.reserve(s_geo_entidades.size() * 6);
+            for (const auto& e : s_geo_entidades) {
+                plano.push_back(e.wx);
+                plano.push_back(e.wy);
+                plano.push_back(e.sx);
+                plano.push_back(e.sy);
+                plano.push_back(static_cast<float>(e.direccion));
+                plano.push_back(static_cast<float>(e.modelo));
+            }
+            nombres = s_geo_nombres;
+        }
+        if (!plano.empty()) {
+            s_geometria(plano.data(), static_cast<uint32_t>(plano.size() / 6), nombres.c_str());
+        }
+    }
+
     // LAS MAQUINAS CON MODELO 3D DE VERDAD.
     //
     // El renderer vive en Rust (src/renderer/): sube cada GLB a la GPU una
@@ -3070,6 +3107,20 @@ static GLuint s_vbo_juego = 0;
 static int s_juego_vertices = 0;
 static pthread_t s_game_thread = 0;
 
+/// Una entidad tal como la dibuja el motor (canal de geometria, ADR-021).
+struct GeoEntidad {
+    float wx, wy;   // posicion en el mundo del motor (tiles)
+    float sx, sy;   // tamano del sprite (tiles)
+    uint32_t direccion;
+    uint32_t modelo;  // indice en la tabla de nombres
+};
+
+static std::mutex s_geo_mutex;
+static std::vector<GeoEntidad> s_geo_entidades;
+/// La tabla de prototipos, separada por '\n' (el indice de modelo apunta aqui).
+static std::string s_geo_nombres;
+static std::atomic<uint64_t> s_geo_mensajes{0};
+
 /// Lee exactamente N bytes del socket. Devuelve false si se corta.
 static bool leer_exacto(int fd, uint8_t* buf, size_t n) {
     size_t leidos = 0;
@@ -3081,6 +3132,60 @@ static bool leer_exacto(int fd, uint8_t* buf, size_t n) {
         }
         leidos += (size_t)r;
     }
+    return true;
+}
+
+/// Lee un mensaje de GEOMETRIA del socket.
+///
+/// La carga es (el emisor esta en injector-linux/src/stream.rs):
+///   u32  numero de nombres de prototipo
+///     por nombre: u8 longitud + bytes ASCII
+///   u32  numero de entidades
+///     por entidad: f32 wx, f32 wy, f32 sx, f32 sy, u32 direccion, u32 modelo
+///
+/// La cabecera lleva w = numero de nombres y h = numero de entidades, y
+/// tienen que cuadrar con la carga: si no, el mensaje se descarta.
+static bool leer_geometria(int fd, uint16_t n_nombres, uint16_t n_entidades) {
+    uint8_t buf[4];
+    if (!leer_exacto(fd, buf, 4)) return false;
+    uint32_t nn = 0;
+    memcpy(&nn, buf, 4);
+    if (nn != n_nombres) return false;
+
+    std::string nombres;
+    for (uint16_t i = 0; i < nn; i++) {
+        uint8_t len = 0;
+        if (!leer_exacto(fd, &len, 1)) return false;
+        if (len > 96) return false;
+        std::string n(len, '\0');
+        if (len && !leer_exacto(fd, reinterpret_cast<uint8_t*>(&n[0]), len)) return false;
+        if (!nombres.empty()) nombres += '\n';
+        nombres += n;
+    }
+
+    if (!leer_exacto(fd, buf, 4)) return false;
+    uint32_t ne = 0;
+    memcpy(&ne, buf, 4);
+    if (ne != n_entidades) return false;
+
+    std::vector<GeoEntidad> ents(ne);
+    for (uint32_t i = 0; i < ne; i++) {
+        uint8_t e[24];
+        if (!leer_exacto(fd, e, 24)) return false;
+        memcpy(&ents[i].wx, e + 0, 4);
+        memcpy(&ents[i].wy, e + 4, 4);
+        memcpy(&ents[i].sx, e + 8, 4);
+        memcpy(&ents[i].sy, e + 12, 4);
+        memcpy(&ents[i].direccion, e + 16, 4);
+        memcpy(&ents[i].modelo, e + 20, 4);
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(s_geo_mutex);
+        s_geo_entidades.swap(ents);
+        s_geo_nombres = nombres;
+    }
+    s_geo_mensajes.fetch_add(1);
     return true;
 }
 
@@ -3133,6 +3238,11 @@ static void* game_receiver_thread(void* /*arg*/) {
                 if (magic != 0x31564658u) {
                     LOGE("Cabecera desconocida del render del juego: 0x%08x", magic);
                     break;
+                }
+                if (flags & 2) {
+                    // Mensaje de GEOMETRIA: la carga no son pixeles.
+                    if (!leer_geometria(cli, w, h)) break;
+                    continue;
                 }
                 if (w == 0 || h == 0 || formato != 0) break;
                 const size_t tam = (size_t)w * (size_t)h * 4;

@@ -42,7 +42,90 @@ use glam::Mat4;
 use gl::{Gl, GLboolean};
 use model::{Ajustes, ModelRenderer};
 use std::collections::HashMap;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Mutex, OnceLock, RwLock};
+
+// ---------------------------------------------------------------------------
+// GEOMETRIA QUE DIBUJA EL MOTOR (canal del ADR-021)
+// ---------------------------------------------------------------------------
+
+/// Una entidad tal como la dibuja el motor.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct GeoEntidad {
+    /// Posicion en el mundo del motor (tiles).
+    pub wx: f32,
+    pub wy: f32,
+    /// Tamano del sprite (tiles).
+    pub sx: f32,
+    pub sy: f32,
+    /// Direccion (0..15): 0 = norte, 4 = este, 8 = sur, 12 = oeste.
+    pub direccion: u32,
+    /// Indice en la tabla de nombres de prototipo.
+    pub modelo: u32,
+}
+
+static GEOMETRIA: OnceLock<RwLock<Vec<GeoEntidad>>> = OnceLock::new();
+static GEOMETRIA_NOMBRES: OnceLock<RwLock<Vec<String>>> = OnceLock::new();
+
+fn geometria_lock() -> &'static RwLock<Vec<GeoEntidad>> {
+    GEOMETRIA.get_or_init(|| RwLock::new(Vec::new()))
+}
+
+fn geometria_nombres_lock() -> &'static RwLock<Vec<String>> {
+    GEOMETRIA_NOMBRES.get_or_init(|| RwLock::new(Vec::new()))
+}
+
+/// Las entidades que el motor ha dibujado (vacio si el canal no manda nada).
+pub fn geometria() -> Vec<GeoEntidad> {
+    geometria_lock()
+        .read()
+        .map(|v| v.clone())
+        .unwrap_or_default()
+}
+
+/// Recibe la geometria que dibuja el motor.
+///
+/// La llama el visor, que la recibe del inyector por el socket del render
+/// (canal del ADR-021).  `datos` son 6 floats por entidad (wx, wy, sx, sy,
+/// direccion, modelo) y `nombres` la tabla de prototipos, separada por '\\n'.
+///
+/// Devuelve cuantas entidades se han guardado.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn xfactorvr_geometria(
+    datos: *const f32,
+    n: u32,
+    nombres: *const std::ffi::c_char,
+) -> u32 {
+    if datos.is_null() || n == 0 {
+        return 0;
+    }
+    let mut ents = Vec::with_capacity(n as usize);
+    for i in 0..n as usize {
+        // SAFETY: el visor manda n*6 floats en un buffer valido.
+        let p = unsafe { datos.add(i * 6) };
+        ents.push(GeoEntidad {
+            wx: unsafe { *p },
+            wy: unsafe { *p.add(1) },
+            sx: unsafe { *p.add(2) },
+            sy: unsafe { *p.add(3) },
+            direccion: unsafe { *p.add(4) } as u32,
+            modelo: unsafe { *p.add(5) } as u32,
+        });
+    }
+    let tabla: Vec<String> = if nombres.is_null() {
+        Vec::new()
+    } else {
+        // SAFETY: el visor manda una cadena terminada en NUL.
+        unsafe { std::ffi::CStr::from_ptr(nombres) }
+            .to_string_lossy()
+            .split('\n')
+            .map(|s| s.to_string())
+            .collect()
+    };
+    *geometria_nombres_lock().write().unwrap_or_else(|e| e.into_inner()) = tabla;
+    let total = ents.len() as u32;
+    *geometria_lock().write().unwrap_or_else(|e| e.into_inner()) = ents;
+    total
+}
 
 /// Estado global del renderer (el motor de VR es mono-hilo en el render).
 struct Estado {
@@ -271,6 +354,14 @@ pub fn tiene_modelo(model_id: u32) -> bool {
 /// Es la parte "de CPU" del render: no necesita GL, asi que se puede
 /// comprobar en los tests.
 pub fn recopilar_instancias() -> HashMap<(String, String), Vec<Mat4>> {
+    // Si el motor manda geometria (canal del ADR-021), manda ella: sus
+    // posiciones y direcciones son las EXACTAS con las que dibuja, y el
+    // snapshot solo las estima.
+    let geo = geometria();
+    if !geo.is_empty() {
+        return recopilar_instancias_de_geometria(&geo);
+    }
+
     let mut grupos: HashMap<(String, String), Vec<Mat4>> = HashMap::new();
     let escala = modelos3d::escala_tile();
     let (pan_x, pan_y) = crate::game_bridge::get_simulation_world()
@@ -300,6 +391,54 @@ pub fn recopilar_instancias() -> HashMap<(String, String), Vec<Mat4>> {
                 e.tile_y - pan_y,
                 e.orientation,
                 e.anim_frame,
+                escala,
+            );
+            grupos
+                .entry((proto.clone(), parte.archivo.clone()))
+                .or_default()
+                .push(m);
+        }
+    }
+    grupos
+}
+
+/// Las instancias a partir de la geometria que dibuja el motor.
+///
+/// Es el camino "bueno": las posiciones y las direcciones son las que el
+/// motor ha dibujado de verdad (canal del ADR-021), no las estimadas por el
+/// snapshot.  El prototipo se saca de la tabla de nombres que llega con el
+/// mensaje, y el yaw de las 16 direcciones del motor (0 = norte).
+fn recopilar_instancias_de_geometria(
+    geo: &[GeoEntidad],
+) -> HashMap<(String, String), Vec<Mat4>> {
+    let mut grupos: HashMap<(String, String), Vec<Mat4>> = HashMap::new();
+    let escala = modelos3d::escala_tile();
+    let (pan_x, pan_y) = crate::game_bridge::get_simulation_world()
+        .read()
+        .map(|w| w.view_center)
+        .unwrap_or((0.0, 0.0));
+    let nombres = geometria_nombres_lock()
+        .read()
+        .map(|v| v.clone())
+        .unwrap_or_default();
+
+    for e in geo {
+        let Some(proto) = nombres.get(e.modelo as usize) else {
+            continue;
+        };
+        let Some(modelo) = modelos3d::modelo_instanciable(proto) else {
+            continue;
+        };
+        // Factorio 2.0 usa 16 direcciones; los radianes son dir * TAU/16.
+        let yaw = (e.direccion as f32) * (std::f32::consts::TAU / 16.0);
+        for parte in &modelo.partes {
+            let m = modelos3d::matriz_instancia(
+                &modelo,
+                parte,
+                e.wx - pan_x,
+                e.wy - pan_y,
+                yaw,
+                0,
                 escala,
             );
             grupos

@@ -1952,6 +1952,36 @@ mod tests {
     }
 
     #[test]
+    /// La geometria que manda el motor (canal del ADR-021) se guarda tal cual
+    /// y la tabla de nombres se separa bien.
+    ///
+    /// Es lo que permite colocar los modelos 3D en la mesa con la posicion
+    /// EXACTA con la que los dibuja el motor, en vez de la estimada por el
+    /// snapshot.
+    #[test]
+    fn test_la_geometria_del_motor_se_guarda() {
+        // 6 floats por entidad: wx, wy, sx, sy, direccion, modelo.
+        let datos: [f32; 12] = [
+            10.5, -3.25, 2.0, 2.0, 4.0, 0.0,   // maquina en (10.5, -3.25), este
+            -1.0, 7.5, 1.0, 1.0, 8.0, 1.0,      // cofre en (-1, 7.5), sur
+        ];
+        let nombres = c"assembling-machine-1\nwooden-chest";
+
+        // SAFETY: se pasan datos validos y un puntero a una cadena terminada.
+        let n = unsafe { renderer::xfactorvr_geometria(datos.as_ptr(), 2, nombres.as_ptr()) };
+        assert_eq!(n, 2, "tiene que guardar las dos entidades");
+
+        let geo = renderer::geometria();
+        assert_eq!(geo.len(), 2);
+        assert!((geo[0].wx - 10.5).abs() < 0.001);
+        assert!((geo[0].wy + 3.25).abs() < 0.001, "wy = {}", geo[0].wy);
+        assert_eq!(geo[0].direccion, 4);
+        assert_eq!(geo[0].modelo, 0);
+        assert!((geo[1].wx + 1.0).abs() < 0.001);
+        assert_eq!(geo[1].direccion, 8);
+        assert_eq!(geo[1].modelo, 1);
+    }
+
     fn test_hud_genera_geometria() {
         // El HUD tiene que producir triangulos de verdad: sin esto, el motor
         // de VR se queda con el HUD viejo y no se ve nada de lo nuevo.

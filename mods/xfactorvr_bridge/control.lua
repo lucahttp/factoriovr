@@ -848,6 +848,9 @@ local TICK_EMPUJE = 20
 -- Nombre del fichero de estado (dentro de script-output).  El visor lo lee
 -- directamente: es el canal de estado SIN RCON.
 local FICHERO_ESTADO = "xfactorvr_bridge/estado.json"
+
+-- El inventario, en su propio fichero (se pide mucho menos seguido).
+local FICHERO_INVENTARIO = "xfactorvr_bridge/inventario.json"
 local RESOURCE_CELL = 4.0
 
 local function status_of(e)
@@ -1085,15 +1088,21 @@ local function collect_terrain(surface, area)
         for x = 0, w - 1 do
             local i = grid[y + 1][x + 1]
             if i ~= base then
+                -- OJO: en Lua los indices son de 1, pero el JSON que consume
+                -- el visor es 0-based como cualquier otro.  Sin esta resta el
+                -- visor lee un tile que no es (el dominante sale del color
+                -- equivocado) y las excepciones con indice mayor se
+                -- descartan: el terreno salia como un quad plano de un solo
+                -- color.  Verificado contra el fichero real.
                 excepciones[#excepciones + 1] =
-                    string.format("[%d,%d,%d]", x, y, i)
+                    string.format("[%d,%d,%d]", x, y, i - 1)
             end
         end
     end
 
     return string.format(
         '{"base":%d,"names":[%s],"x0":%d,"y0":%d,"w":%d,"h":%d,"tiles":[%s]}',
-        base, '"' .. table.concat(names, '","') .. '"',
+        base - 1, '"' .. table.concat(names, '","') .. '"',
         x0, y0, w, h, table.concat(excepciones, ","))
 end
 
@@ -1172,6 +1181,40 @@ local function centro_de_la_vista()
         return math.floor(p.position.x), math.floor(p.position.y)
     end
     return 0, 0
+end
+
+-- El inventario en el formato del remoto (una lista de {"id":N,"count":M}).
+--
+-- Se separa del remoto porque ahora lo empuja ALSO el mod a un fichero
+-- (canal de estado sin RCON, ADR-020).
+local function construir_inventario()
+    local items = {}
+    local seen = {}
+
+    local inv = actor_inventory()
+    if inv then
+        for _, stack in ipairs(inventory_contents(inv)) do
+            if stack.count and stack.count > 0 then
+                local id = ITEM_IDS_MAP[stack.name]
+                if id and id > 0 and not seen[stack.name] then
+                    seen[stack.name] = true
+                    table.insert(items, string.format('{"id":%d,"count":%d}', id, stack.count))
+                end
+            end
+        end
+    else
+        for name, amount in pairs(virtual_inventory()) do
+            if type(amount) == "number" and amount > 0 then
+                local id = ITEM_IDS_MAP[name]
+                if id and id > 0 and not seen[name] then
+                    seen[name] = true
+                    table.insert(items, string.format('{"id":%d,"count":%d}', id, amount))
+                end
+            end
+        end
+    end
+
+    return "[" .. table.concat(items, ",") .. "]"
 end
 
 remote.add_interface("xfactorvr", {
@@ -1737,33 +1780,7 @@ remote.add_interface("xfactorvr", {
 
     -- Inventario completo del jugador en el formato compacto del protocolo.
     get_inventory = function()
-        local items = {}
-        local seen = {}
-
-        local inv = actor_inventory()
-        if inv then
-            for _, stack in ipairs(inventory_contents(inv)) do
-                if stack.count and stack.count > 0 then
-                    local id = ITEM_IDS_MAP[stack.name]
-                    if id and id > 0 and not seen[stack.name] then
-                        seen[stack.name] = true
-                        table.insert(items, string.format('{"id":%d,"count":%d}', id, stack.count))
-                    end
-                end
-            end
-        else
-            for name, amount in pairs(virtual_inventory()) do
-                if type(amount) == "number" and amount > 0 then
-                    local id = ITEM_IDS_MAP[name]
-                    if id and id > 0 and not seen[name] then
-                        seen[name] = true
-                        table.insert(items, string.format('{"id":%d,"count":%d}', id, amount))
-                    end
-                end
-            end
-        end
-
-        local out = "[" .. table.concat(items, ",") .. "]"
+        local out = construir_inventario()
         rcon.print(out)
         return out
     end,
@@ -2085,6 +2102,9 @@ if event_tick and script.on_event then
             local out = construir_snapshot(cx, cy, RADIO_SNAPSHOT)
             local ok_w, err_w = pcall(function()
                 helpers.write_file(FICHERO_ESTADO, out, false)
+                -- El inventario va aparte y menos seguido: cambia mucho menos
+                -- que el mundo.
+                helpers.write_file(FICHERO_INVENTARIO, construir_inventario(), false)
             end)
             if not ok_w then
                 log("[XFactorVR] no se pudo escribir el estado: " .. tostring(err_w))

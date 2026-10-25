@@ -1286,8 +1286,141 @@ fn arrancar_hilo_sondeo() {
 ///
 /// Es el unico sitio donde se habla con el motor por la via de la instantanea.
 /// La sesion se mantiene viva; si el motor no responde, se reinicia UNA vez.
+/// La ruta del fichero de estado que empuja el mod (canal SIN RCON).
+///
+/// El mod escribe la instantanea en script-output/xfactorvr_bridge/estado.json
+/// (ADR-020).  En el visor el servidor escribe su estado en /sdcard, que es lo
+/// unico que la app puede leer con el almacenamiento con ambito.  La variable
+/// de entorno la usa el banco del host.
+fn ruta_estado() -> Option<std::path::PathBuf> {
+    if let Ok(r) = std::env::var("XFACTORVR_ESTADO_FICHERO") {
+        if !r.trim().is_empty() {
+            return Some(std::path::PathBuf::from(r));
+        }
+    }
+    Some(std::path::PathBuf::from(
+        "/sdcard/XFactorVR/srv/script-output/xfactorvr_bridge/estado.json",
+    ))
+}
+
+fn ruta_inventario() -> Option<std::path::PathBuf> {
+    if let Ok(r) = std::env::var("XFACTORVR_INVENTARIO_FICHERO") {
+        if !r.trim().is_empty() {
+            return Some(std::path::PathBuf::from(r));
+        }
+    }
+    Some(std::path::PathBuf::from(
+        "/sdcard/XFactorVR/srv/script-output/xfactorvr_bridge/inventario.json",
+    ))
+}
+
+/// Lee un fichero del canal de estado, solo si ha cambiado.
+///
+/// Se compara el tamano y la fecha de modificacion: el fichero se escribe
+/// varias veces por segundo y no tiene sentido releerlo entero cada vez.
+fn leer_si_cambio(ruta: &std::path::Path, marca: &mut Option<(u64, u64)>) -> Option<String> {
+    let meta = std::fs::metadata(ruta).ok()?;
+    let mtime = meta
+        .modified()
+        .ok()
+        .and_then(|m| m.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let clave = (meta.len(), mtime);
+    if *marca == Some(clave) {
+        return None; // no ha cambiado: no hay nada nuevo
+    }
+    let datos = std::fs::read_to_string(ruta).ok()?;
+    if datos.len() < 4 || !datos.trim_start().starts_with('{') && !datos.trim_start().starts_with('[') {
+        return None;
+    }
+    *marca = Some(clave);
+    Some(datos)
+}
+
+/// El estado del mundo, del fichero que empuja el mod (sin RCON).
+fn leer_estado_de_fichero(ruta: &std::path::Path, marca: &mut Option<(u64, u64)>) -> Option<String> {
+    leer_si_cambio(ruta, marca)
+}
+
+/// El inventario, del fichero que empuja el mod (sin RCON).
+fn leer_inventario_de_fichero(
+    ruta: &std::path::Path,
+    marca: &mut Option<(u64, u64)>,
+) -> Option<String> {
+    leer_si_cambio(ruta, marca)
+}
+
+/// Sondeo por el remoto RCON (el camino antiguo, se mantiene de reserva).
+fn sondeo_por_rcon(
+    cx: f32,
+    cy: f32,
+    ultimo_inventario: &mut f32,
+) -> (Option<String>, Option<String>, bool) {
+    let (host, port, password, verbose) = {
+        let cfg = match get_rcon_config().lock() {
+            Ok(c) => c,
+            Err(_) => return (None, None, false),
+        };
+        (
+            cfg.host.clone(),
+            cfg.port,
+            cfg.password.clone(),
+            cfg.verbose_fallback,
+        )
+    };
+    let addr = format!(
+        "{}:{}",
+        read_host_override().unwrap_or_else(|| host.clone()),
+        port
+    );
+
+    let mut rcon = match RCON_SONDEO_CLIENT.get_or_init(|| Mutex::new(RconClient::new())).lock()
+    {
+        Ok(r) => r,
+        Err(_) => return (None, None, false),
+    };
+
+    if !rcon.is_connected() {
+        if !rcon.connect(&addr, &password) {
+            rcon.disconnect();
+            return (None, None, false);
+        }
+        log::info!("RCON (sondeo) conectado al motor de Factorio en {addr}");
+    }
+
+    let prefix = if verbose { "" } else { "/silent-command " };
+    let snap_cmd = comando_snapshot(prefix, cx, cy);
+    let snapshot = if verbose {
+        ejecutar_con_reconexion(&mut rcon, &addr, &password, &snap_cmd, 3, |_| true)
+    } else {
+        ejecutar_con_reconexion(&mut rcon, &addr, &password, &snap_cmd, 3, trae_json)
+    };
+
+    // El inventario se pide con mucha menos frecuencia.
+    *ultimo_inventario += RCON_POLL_INTERVAL;
+    let inventory = if *ultimo_inventario >= RCON_INVENTORY_INTERVAL {
+        *ultimo_inventario = 0.0;
+        let inv_cmd = format!("{}remote.call('xfactorvr', 'get_inventory')", prefix);
+        if verbose {
+            ejecutar_con_reconexion(&mut rcon, &addr, &password, &inv_cmd, 2, |_| true)
+        } else {
+            ejecutar_con_reconexion(&mut rcon, &addr, &password, &inv_cmd, 2, |c| {
+                !c.trim().is_empty()
+            })
+        }
+    } else {
+        None
+    };
+
+    let conectado = rcon.is_connected();
+    (snapshot, inventory, conectado)
+}
+
 fn hilo_sondeo() {
     let mut ultimo_inventario = 0.0f32;
+    let mut marca_estado: Option<(u64, u64)> = None;
+    let mut marca_inventario: Option<(u64, u64)> = None;
     loop {
         std::thread::sleep(Duration::from_millis((RCON_POLL_INTERVAL * 1000.0) as u64));
 
@@ -1303,66 +1436,32 @@ fn hilo_sondeo() {
             )
         };
 
-        let (host, port, password, verbose) = {
-            let cfg = match get_rcon_config().lock() {
-                Ok(c) => c,
-                Err(_) => continue,
-            };
-            (
-                cfg.host.clone(),
-                cfg.port,
-                cfg.password.clone(),
-                cfg.verbose_fallback,
-            )
-        };
-        let addr = format!(
-            "{}:{}",
-            read_host_override().unwrap_or_else(|| host.clone()),
-            port
-        );
-
-        let mut rcon = match RCON_SONDEO_CLIENT.get_or_init(|| Mutex::new(RconClient::new())).lock()
+        // El estado puede venir de dos sitios: del FICHERO que empuja el mod
+        // (canal sin RCON, ADR-020) o del remoto RCON (el camino antiguo).
+        // Con el fichero se prefiere el fichero: si el mod lo esta escribiendo
+        // no hace falta ni RCON ni su conexion.
+        let ruta_estado = ruta_estado();
+        let ruta_inv = ruta_inventario();
+        let (snapshot, inventory, conectado) = match ruta_estado
+            .as_deref()
+            .and_then(|r| leer_estado_de_fichero(r, &mut marca_estado))
         {
-            Ok(r) => r,
-            Err(_) => continue,
-        };
-
-        if !rcon.is_connected() {
-            if !rcon.connect(&addr, &password) {
-                rcon.disconnect();
-                if let Ok(mut b) = get_buzon().lock() {
-                    b.conectado = false;
-                }
-                continue;
+            Some(s) => {
+                // El inventario va en su propio fichero y se pide menos seguido.
+                ultimo_inventario += RCON_POLL_INTERVAL;
+                let inv = if ultimo_inventario >= RCON_INVENTORY_INTERVAL {
+                    ultimo_inventario = 0.0;
+                    ruta_inv
+                        .as_deref()
+                        .and_then(|r| leer_inventario_de_fichero(r, &mut marca_inventario))
+                } else {
+                    None
+                };
+                (Some(s), inv, true)
             }
-            log::info!("RCON (sondeo) conectado al motor de Factorio en {addr}");
-        }
-
-        let prefix = if verbose { "" } else { "/silent-command " };
-        let snap_cmd = comando_snapshot(prefix, cx, cy);
-        let snapshot = if verbose {
-            ejecutar_con_reconexion(&mut rcon, &addr, &password, &snap_cmd, 3, |_| true)
-        } else {
-            ejecutar_con_reconexion(&mut rcon, &addr, &password, &snap_cmd, 3, trae_json)
+            None => sondeo_por_rcon(cx, cy, &mut ultimo_inventario),
         };
 
-        // El inventario se pide con mucha menos frecuencia.
-        ultimo_inventario += RCON_POLL_INTERVAL;
-        let inventory = if ultimo_inventario >= RCON_INVENTORY_INTERVAL {
-            ultimo_inventario = 0.0;
-            let inv_cmd = format!("{}remote.call('xfactorvr', 'get_inventory')", prefix);
-            if verbose {
-                ejecutar_con_reconexion(&mut rcon, &addr, &password, &inv_cmd, 2, |_| true)
-            } else {
-                ejecutar_con_reconexion(&mut rcon, &addr, &password, &inv_cmd, 2, |c| {
-                    !c.trim().is_empty()
-                })
-            }
-        } else {
-            None
-        };
-
-        let conectado = rcon.is_connected();
         if let Ok(mut b) = get_buzon().lock() {
             if snapshot.is_some() {
                 b.snapshot = snapshot;
@@ -1804,6 +1903,39 @@ mod tests {
     }
 
     #[test]
+    /// El canal de estado SIN RCON (ADR-020): el visor lee el fichero que
+    /// empuja el mod.  El formato es el mismo que devolvia el remoto, asi que
+    /// el parser de abajo no cambia.
+    #[test]
+    fn test_el_estado_se_lee_del_fichero() {
+        let dir = std::env::temp_dir().join(format!("xfv_estado_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("no se pudo crear el directorio");
+        let ruta = dir.join("estado.json");
+        // El formato REAL que escribe el mod (medido en el servidor).
+        let json = r#"{"entities":[],"patches":[],"loose":[],
+            "terrain":{"base":0,"names":["dry-dirt","dirt-4"],"x0":-32,"y0":-32,"w":65,"h":65,
+                       "tiles":[[42,0,1],[43,0,1]]}}"#;
+        std::fs::write(&ruta, json).expect("no se pudo escribir");
+
+        let mut marca: Option<(u64, u64)> = None;
+        let leido = leer_estado_de_fichero(&ruta, &mut marca);
+        assert_eq!(leido.as_deref(), Some(json), "tiene que leer el fichero");
+
+        // Si no ha cambiado, no se vuelve a leer: el buzon conserva lo anterior.
+        assert!(
+            leer_estado_de_fichero(&ruta, &mut marca).is_none(),
+            "un fichero sin cambios no se relee"
+        );
+
+        // Y el contenido es el que entiende el parser del mundo.
+        let snap: Snapshot = serde_json::from_str(json).expect("el JSON del fichero se parsea");
+        assert_eq!(snap.terrain.w, 65);
+        assert_eq!(snap.terrain.names, vec!["dry-dirt", "dirt-4"]);
+        assert_eq!(snap.terrain.tile_at(43, 0), Some("dirt-4"));
+        // Y el dominante (base 0) es el primer nombre.
+        assert_eq!(snap.terrain.tile_at(0, 0), Some("dry-dirt"));
+    }
+
     fn test_terreno_de_la_instantanea() {
         // Formato que manda el mod: tile dominante + excepciones.
         let json = r#"{"entities":[],"patches":[],

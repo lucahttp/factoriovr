@@ -26,6 +26,13 @@
 set -u
 
 FACTORIO_DIR="${FACTORIO_DIR:-/data/local/tmp/factorio_arm64}"
+
+# Donde escribe el motor.  El estado que el mod empuja (ADR-020) cae en
+# write-data/script-output/, y la app del visor SOLO puede leer /sdcard
+# (tiene MANAGE_EXTERNAL_STORAGE; con el almacenamiento con ambito no puede
+# leer /data/local/tmp).  Por eso el write-data va a /sdcard: es lo que hace
+# que el canal de estado sin RCON funcione.
+WRITE_DIR="${WRITE_DIR:-/sdcard/XFactorVR/srv}"
 FACTORIO_BIN="$FACTORIO_DIR/bin/arm64/factorio"
 MOD_DIR="$FACTORIO_DIR/mods"
 MOD_NAME="xfactorvr_bridge"
@@ -109,6 +116,12 @@ mkdir -p "$FACTORIO_DIR/logs" 2>/dev/null || true
 CONFIG_DIR="$FACTORIO_DIR/config"
 SETTINGS_FILE="$CONFIG_DIR/server-settings.json"
 mkdir -p "$CONFIG_DIR" 2>/dev/null || true
+# El write-data tiene que existir y ser escribible: si no, el motor no
+# arranca y no hay estado que leer.
+mkdir -p "$WRITE_DIR" 2>/dev/null || true
+if [ ! -w "$WRITE_DIR" ]; then
+    log "AVISO: no se puede escribir en $WRITE_DIR (el estado no llegara al visor)"
+fi
 
 # El motor deduce sus rutas (read-data / write-data) de /proc/self/exe.  En
 # Android se arranca a traves del linker de glibc (/data/local/tmp/glibc/lib),
@@ -121,7 +134,7 @@ if [ ! -f "$SERVER_CONFIG" ]; then
     cat > "$SERVER_CONFIG" <<CFG
 [path]
 read-data=$FACTORIO_DIR/data
-write-data=$FACTORIO_DIR
+write-data=$WRITE_DIR
 
 [other]
 check-updates=false

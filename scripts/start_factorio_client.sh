@@ -343,13 +343,17 @@ mkdir -p "$(dirname "$CONSOLA_FIFO")" "$CONSOLA_DIR" 2>/dev/null || true
 if [ ! -p "$CONSOLA_FIFO" ]; then
     mkfifo "$CONSOLA_FIFO" 2>/dev/null || true
 fi
-if [ -p "$CONSOLA_FIFO" ]; then
+STDIN_MOTOR=""
+if [ -p "$CONSOLA_FIFO" ] && exec 3<>"$CONSOLA_FIFO" 2>/dev/null; then
     # Se abre en lectura-escritura: el motor lee del fd 0 y no hay EOF.
-    exec 3<>"$CONSOLA_FIFO" 2>/dev/null || true
+    STDIN_MOTOR="<&3"
     export XFACTORVR_CONSOLA_DIR="$CONSOLA_DIR"
     log "Consola del motor: FIFO $CONSOLA_FIFO, ordenes en $CONSOLA_DIR"
 else
-    log "AVISO: no se pudo crear la FIFO de la consola ($CONSOLA_FIFO):"
+    # Sin FIFO el motor leeria de /dev/null: cerraria la consola al instante
+    # y no aceptaria ni una orden.  Se le pasa /dev/null igualmente, pero sin
+    # romper el arranque (solo se pierde el canal de ordenes).
+    log "AVISO: no se pudo abrir la FIFO de la consola ($CONSOLA_FIFO):"
     log "       el motor no aceptara ordenes por consola (solo RCON)."
 fi
 
@@ -365,7 +369,7 @@ if [ -n "${SERVER_ADDR:-}" ]; then
     exec env LD_LIBRARY_PATH="$LIB_PATH" LD_PRELOAD="$PRELOAD" "$LOADER" --library-path "$LIB_PATH" "$GAME_BIN" \
         --config "$CLIENT_CONFIG" \
         --window-size "${WIDTH}x${HEIGHT}" \
-        --mp-connect "$SERVER_ADDR:$SERVER_PORT" <&3
+        --mp-connect "$SERVER_ADDR:$SERVER_PORT" $STDIN_MOTOR
 fi
 
 # Modo simple: el cliente juega en single-player (sin RCON, que en single
@@ -385,4 +389,4 @@ exec env LD_LIBRARY_PATH="$LIB_PATH" LD_PRELOAD="$PRELOAD" "$LOADER" --library-p
     --config "$CLIENT_CONFIG" \
     --window-size "${WIDTH}x${HEIGHT}" \
     --fullscreen \
-    "$SAVE" <&3
+    "$SAVE" $STDIN_MOTOR

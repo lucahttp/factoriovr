@@ -3462,7 +3462,10 @@ static void draw_game_panel(const float* vp_mat, const float* model_mesa, bool o
     glUniformMatrix4fv(s_mvp_loc, 1, GL_FALSE, mvp);
     glUniform1f(s_use_tex_loc, 1.0f);
     glUniform1f(s_lit_loc, 0.0f);
-    glUniform3f(s_emissive_loc, 1.0f, 1.0f, 1.0f);
+    // OJO: el emisivo tiene que ser NEGRO.  Con (1,1,1) el shader hacia
+    // "textura + blanco" y el panel salia BLANCO: se veia la maqueta de la
+    // mesa pero NO la imagen del motor.  La imagen se ve tal cual.
+    glUniform3f(s_emissive_loc, 0.0f, 0.0f, 0.0f);
     glUniform1f(s_enable_clipping_loc, 0.0f);
     // Con el motor mandando DOS vistas (estereo real) no hay que desplazar
     // nada: el paralaje ya viene en la imagen.  Si solo llega una vista

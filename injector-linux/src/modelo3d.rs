@@ -1017,6 +1017,55 @@ static TRAMPOLIN_DQ: AtomicUsize = AtomicUsize::new(0);
 // blit, ese framebuffer es el que esta activo.
 static TRAMPOLIN_BLIT: AtomicUsize = AtomicUsize::new(0);
 
+// --- hook de la captura de pantalla del motor (donde SI esta el GUI) ------
+//
+// `RenderUtil::takeScreenshots()` es la funcion que hace el motor cuando
+// hay que guardar una captura: en ese momento renderiza el frame FINAL (con
+// el GUI del juego) y lo lee.  Enganchandola se ve que framebuffer usa:
+// ese es el del GUI.
+static TRAMPOLIN_SCREEN: AtomicUsize = AtomicUsize::new(0);
+
+/// `RenderUtil::takeScreenshots(const std::vector<ScreenshotRequest>&, Map&,
+/// bool)`: es una funcion ESTATICA (sin `this`).
+type HookTakeScreenshots = unsafe extern "C" fn(*const c_void, *mut c_void, u8);
+
+#[no_mangle]
+pub extern "C" fn xfv_hook_take_screenshots(
+    peticiones: *const c_void,
+    mapa: *mut c_void,
+    mostrar: u8,
+) {
+    // El framebuffer que usa el motor para la captura: si ahi esta el GUI,
+    // este es el framebuffer que hay que leer para Mandarlo al visor.
+    if let Some(gl) = GL.get() {
+        let mut vp = [0i32; 4];
+        unsafe { (gl.get_integerv)(GL_VIEWPORT, vp.as_mut_ptr()) };
+        let fb = gl_int(gl, GL_READ_FRAMEBUFFER_BINDING);
+        log::info(&format!(
+            "captura del motor: viewport {}x{} framebuffer {}",
+            vp[2], vp[3], fb
+        ));
+        if std::env::var("XFACTORVR_CAPTURA_GUI").ok().as_deref() == Some("1") {
+            if let Ok(ruta) = std::env::var("XFACTORVR_CAPTURA_GUI_RUTA") {
+                if !ruta.is_empty() {
+                    let ruta = format!("{ruta}.motor");
+                    if capturar_png(gl, &vp, &ruta) {
+                        log::info(&format!("captura del motor escrita en {ruta}"));
+                    }
+                }
+            }
+        }
+    }
+    let tramp = TRAMPOLIN_SCREEN.load(Ordering::SeqCst);
+    if tramp != 0 {
+        // SAFETY: el trampolin repone los argumentos intactos.
+        unsafe {
+            let f: HookTakeScreenshots = std::mem::transmute(tramp);
+            f(peticiones, mapa, mostrar);
+        }
+    }
+}
+
 /// La firma de `FramebufferOpenGL::blitTo(VideoBitmap&, int, int, int, int,
 /// int, int)`.
 type HookBlitTo =
@@ -2660,6 +2709,23 @@ pub fn instalar(simbolos: &resolver::Simbolos) {
         }
     } else {
         log::aviso("no se encontro FramebufferOpenGL::blitTo()");
+    }
+
+    // --- hook de la captura de pantalla del motor (el frame con el GUI) ---
+    const MANGLE_SCREEN: &str =
+        "_ZN10RenderUtil15takeScreenshotsERKSt6vectorI17ScreenshotRequestSaIS1_EER3Mapb";
+    if let Some(sc) = simbolos.resolver_exacto(MANGLE_SCREEN) {
+        if let Some(a) = direccion_de_ejecucion_de("xfv_hook_take_screenshots") {
+            match detour::instalar(sc.direccion, a, None, sc.tamano) {
+                Ok(d) => {
+                    TRAMPOLIN_SCREEN.store(d.trampolin as usize, Ordering::SeqCst);
+                    log::info("detour instalado sobre RenderUtil::takeScreenshots()");
+                }
+                Err(e) => log::error(&format!("no se pudo instalar el detour de takeScreenshots: {e}")),
+            }
+        }
+    } else {
+        log::aviso("no se encontro RenderUtil::takeScreenshots()");
     }
 
     // --- hook del enlace de uniform buffers (la camara del motor) ---

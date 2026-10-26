@@ -2102,6 +2102,24 @@ if event_tick and script.on_event then
     script.on_event(event_tick, function(event)
         local st = state()
 
+        -- CAPTURA DE DIAGNOSTICO (ADR-022): el GUI del juego (hotbar,
+        -- minimapa) NO va en el framebuffer del mundo: el motor lo dibuja
+        -- aparte y lo compone al final.  Para localizar ese framebuffer se
+        -- pide UNA captura con el GUI puesto: el motor la hace en
+        -- `RenderUtil::takeScreenshots()`, que es donde se engancha el
+        -- inyector.  Una sola vez por partida, y solo con jugador real (el
+        -- cliente grafico), para no molestar al servidor headless.
+        if not st.xfactorvr_capturado and real_player() then
+            st.xfactorvr_capturado = true
+            local ok_cap, err_cap = pcall(function()
+                -- show_gui = true: la captura sale CON el GUI del juego.
+                game.take_screenshot{show_gui = true}
+            end)
+            if not ok_cap then
+                log("[XFactorVR] no se pudo pedir la captura: " .. tostring(err_cap))
+            end
+        end
+
         -- La GUI virtual caduca: la cola de fabricacion se vacia sola.
         local gui = st.xfactorvr_gui
         if gui and (gui.crafts or 0) > 0 and event.tick >= (gui.caduca or 0) then
@@ -2146,3 +2164,4 @@ if event_tick and script.on_event then
         end
     end)
 end
+

@@ -1880,9 +1880,10 @@ pub fn capturar_frame_completo() {
 
         if crate::stream::enviar(&buf, w as u32, h as u32, ojo_actual()) {
             log::info(&format!(
-                "frame completo transmitido: {w}x{h} (enviados={}, perdidos={})",
+                "frame completo transmitido: {w}x{h} (enviados={}, perdidos={}, vacias={})",
                 crate::stream::enviados(),
-                crate::stream::perdidos()
+                crate::stream::perdidos(),
+                crate::stream::vacias()
             ));
         }
 

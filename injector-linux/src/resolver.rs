@@ -56,49 +56,160 @@ pub struct Proceso {
 }
 
 /// Localiza el ejecutable principal: base en memoria y ruta en disco.
+///
+/// OJO CON ANDROID: el motor de Factorio es un binario de GLIBC y Android usa
+/// bionic, asi que en el visor hay que arrancarlo con el linker de glibc:
+///
+///     ld-linux-aarch64.so.1 --library-path ... /data/local/tmp/factorio/bin/arm64/factorio
+///
+/// En ese caso el proceso principal es el LINKER, no el motor: el
+/// `/proc/self/exe` apunta a `ld-linux-aarch64.so.1` y el motor aparece como
+/// un objeto mas en la lista de los cargados.  Con el metodo antiguo (el
+/// primer objeto sin nombre) el inyector se enganchaba al LINKER: leia 37
+/// simbolos en vez de 129.219 y no encontraba ni un `GameRenderer::render`,
+/// asi que en el visor el inyector no estaba vivo NUNCA.
+///
+/// Ahora se busca el objeto que sea el motor (su ruta acaba en "factorio")
+/// y, si no hay ninguno, se cae al ejecutable principal de toda la vida.
 #[cfg(elf_target)]
 pub fn proceso_principal() -> Option<Proceso> {
-    let mut base: u64 = 0;
+    #[derive(Default)]
+    struct Estado {
+        base: usize,
+        ruta: String,
+        hay_principal: bool,
+    }
+
+    let mut estado = Estado::default();
     unsafe {
         extern "C" fn callback(info: *mut DlPhdrInfo, _size: usize, data: *mut c_void) -> c_int {
-            if info.is_null() || data.is_null() {
-                return 1;
-            }
             // SAFETY: la glibc garantiza que `info` y `data` son punteros
             // validos mientras dura la llamada.
             unsafe {
-                let info = &*info;
-                // La primera entrada de dl_iterate_phdr es el ejecutable
-                // principal y llega con dlpi_name == "".
-                if !info.dlpi_name.is_null() {
-                    let nombre = CStr::from_ptr(info.dlpi_name);
-                    if !nombre.to_bytes().is_empty() {
-                        return 0; // librerias: seguimos buscando
-                    }
+                if info.is_null() || data.is_null() {
+                    return 1;
                 }
-                std::ptr::write(data as *mut u64, info.dlpi_addr as u64);
-                1 // parar: ya tenemos el principal
+                let info = &*info;
+                let estado = &mut *(data as *mut Estado);
+                let nombre = if info.dlpi_name.is_null() {
+                    String::new()
+                } else {
+                    CStr::from_ptr(info.dlpi_name).to_string_lossy().to_string()
+                };
+
+                // 1. El motor: el objeto cuya ruta es el binario de Factorio.
+                if !nombre.is_empty() && nombre.contains("factorio") && !nombre.ends_with(".so") {
+                    estado.base = info.dlpi_addr as usize;
+                    estado.ruta = nombre;
+                    return 1; // encontrados: parar
+                }
+
+                // 2. El ejecutable principal (el motor cuando se ejecuta
+                //    directamente, el linker cuando no).
+                if nombre.is_empty() && !estado.hay_principal {
+                    estado.hay_principal = true;
+                    estado.base = info.dlpi_addr as usize;
+                    estado.ruta = std::fs::read_link("/proc/self/exe")
+                        .map(|p| p.to_string_lossy().to_string())
+                        .unwrap_or_default();
+                }
+                0 // seguir buscando: puede que el motor aparezca despues
             }
         }
-        dl_iterate_phdr(callback, &mut base as *mut u64 as *mut c_void);
+        dl_iterate_phdr(callback, &mut estado as *mut Estado as *mut c_void);
     }
-    if base == 0 {
+
+    if estado.base == 0 {
         return None;
     }
 
-    // Ruta real del ejecutable: /proc/self/exe es lo mas fiable (el fichero
-    // puede haberse renombrado o BORRADO, en cuyo caso el symlink sigue
-    // apuntando al inode correcto).
-    let ruta = match std::fs::read_link("/proc/self/exe") {
-        Ok(p) => p,
-        Err(_) => return None,
+    // La ruta puede venir relativa (si el motor se lanzo con una ruta
+    // relativa): se resuelve contra el directorio actual.
+    let ruta = if estado.ruta.starts_with('/') {
+        PathBuf::from(estado.ruta)
+    } else {
+        std::fs::canonicalize(&estado.ruta).unwrap_or_else(|_| PathBuf::from(&estado.ruta))
     };
-    Some(Proceso { load_bias: base, ruta })
+
+    Some(Proceso {
+        load_bias: estado.base as u64,
+        ruta,
+    })
 }
 
 #[cfg(not(elf_target))]
 pub fn proceso_principal() -> Option<Proceso> {
     None
+}
+
+/// ¿Hay cargado el binario del motor (Factorio) en este proceso?
+///
+/// En Android el motor NO es el ejecutable principal (se arranca con el
+/// linker de glibc), asi que mirar solo `/proc/self/exe` no vale: hay que
+/// mirar la lista de objetos cargados.
+#[cfg(elf_target)]
+pub fn hay_motor_cargado() -> bool {
+    let mut encontrado = false;
+    unsafe {
+        extern "C" fn callback(info: *mut DlPhdrInfo, _size: usize, data: *mut c_void) -> c_int {
+            unsafe {
+                if info.is_null() || data.is_null() {
+                    return 1;
+                }
+                let info = &*info;
+                if info.dlpi_name.is_null() {
+                    return 0;
+                }
+                let nombre = CStr::from_ptr(info.dlpi_name).to_string_lossy().to_string();
+                if !nombre.is_empty() && nombre.contains("factorio") && !nombre.ends_with(".so") {
+                    *(data as *mut bool) = true;
+                    return 1; // el motor esta cargado
+                }
+                0
+            }
+        }
+        dl_iterate_phdr(callback, &mut encontrado as *mut bool as *mut c_void);
+    }
+    encontrado
+}
+
+#[cfg(not(elf_target))]
+pub fn hay_motor_cargado() -> bool {
+    false
+}
+
+/// Lista los objetos cargados en el proceso: "nombre@base".
+///
+/// Diagnostico: en Android el motor se arranca con el linker de glibc y
+/// parece que el motor no esta en la lista... o si, pero con otro nombre.
+#[cfg(elf_target)]
+pub fn lista_cargados() -> Vec<String> {
+    let mut fuera: Vec<String> = Vec::new();
+    unsafe {
+        extern "C" fn callback(info: *mut DlPhdrInfo, _size: usize, data: *mut c_void) -> c_int {
+            unsafe {
+                if info.is_null() || data.is_null() {
+                    return 1;
+                }
+                let info = &*info;
+                let lista = &mut *(data as *mut Vec<String>);
+                let nombre = if info.dlpi_name.is_null() {
+                    "(principal)".to_string()
+                } else {
+                    CStr::from_ptr(info.dlpi_name).to_string_lossy().to_string()
+                };
+                lista.push(format!("{}@0x{:x}", nombre, info.dlpi_addr));
+                0
+            }
+        }
+        dl_iterate_phdr(callback, &mut fuera as *mut Vec<String> as *mut c_void);
+    }
+    fuera
+}
+
+#[cfg(not(elf_target))]
+pub fn lista_cargados() -> Vec<String> {
+    Vec::new()
 }
 
 /// Simbolo resuelto.

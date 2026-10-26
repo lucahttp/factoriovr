@@ -220,6 +220,15 @@ pub fn instalar() {
         if debug { "si" } else { "no" }
     ));
 
+    // Diagnostico: que objetos hay cargados y cual es el motor.  En Android
+    // el motor se arranca con el linker de glibc, asi que el ejecutable
+    // principal es el LINKER y el motor aparece en otro sitio.
+    if debug {
+        for obj in crate::resolver::lista_cargados() {
+            log::info(&format!("objeto cargado: {obj}"));
+        }
+    }
+
     // --- localizar el ejecutable ---
     let proceso = match resolver::proceso_principal() {
         Some(p) => p,

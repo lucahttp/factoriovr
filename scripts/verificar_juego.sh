@@ -58,8 +58,17 @@ ok "scripts y lista de mods subidos"
 paso "2. Reiniciando el motor"
 # El proceso del motor en el visor se llama "ld-linux-aarch64.so.1", asi que
 # se mata por la linea de ordenes, no por el nombre.
-"$ADB" shell 'P="bin/arm64"; P="${P}factorio"; for p in /proc/[0-9]*; do [ "$p" = "/proc/$$" ] && continue; if grep -qa "$P" $p/cmdline 2>/dev/null; then kill ${p#/proc/} 2>/dev/null; fi; done; sleep 2; true' >/dev/null 2>&1
-ok "motores parados"
+#
+# OJO: el patron se arma con un "/" DELANTE de "factorio".  Si se concatena
+# sin separador queda "bin/arm64factorio", que no casa con nada y el motor
+# sigue vivo (y el script cree que ya habia un servidor).
+"$ADB" shell 'pat="bin/arm64"; pat="${pat}/factorio"; for p in /proc/[0-9]*; do [ "$p" = "/proc/$$" ] && continue; if grep -qa "$pat" $p/cmdline 2>/dev/null; then kill ${p#/proc/} 2>/dev/null; fi; done; sleep 3; true' >/dev/null 2>&1
+VIVOS="$("$ADB" shell 'pat="bin/arm64"; pat="${pat}/factorio"; for p in /proc/[0-9]*; do [ "$p" = "/proc/$$" ] && continue; if grep -qa "$pat" $p/cmdline 2>/dev/null; then echo "${p#/proc/}"; fi; done' 2>/dev/null | tr -d '\r' | tr '\n' ' ')"
+if [ -n "${VIVOS// /}" ]; then
+    fallo "quedan motores vivos (PIDs: ${VIVOS})"
+else
+    ok "motores parados"
+fi
 
 paso "3. Levantando el servidor"
 "$ADB" shell "cd $REMOTE && XFACTORVR_RESOLVER_LOG=$REMOTE/res_srv.log nohup sh $REMOTE/start_factorio_standalone.sh > $REMOTE/srv.log 2>&1 &" >/dev/null

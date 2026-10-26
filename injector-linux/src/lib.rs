@@ -66,15 +66,69 @@ pub extern "C" fn xfactorvr_injector_init() {
     // (grep, tail, python, shells...). Si el inyector hiciera su trabajo en
     // cualquiera, ensuciaria la salida de todas las herramientas y podria
     // tocar memoria de procesos ajenos. Solo se activa en el juego.
-    if !es_el_juego() {
+    //
+    // OJO CON ANDROID: el motor de Factorio es un binario de glibc y Android
+    // usa bionic, asi que en el visor hay que arrancarlo con el linker de
+    // glibc ("ld-linux-aarch64.so.1 --library-path ... factorio").  En ese
+    // caso, cuando corre este constructor, el motor AUN NO ESTA CARGADO: lo
+    // carga el linker DESPUES de inicializar los preloads.  Por eso no basta
+    // con mirar /proc/self/exe (apunta al LINKER) ni con buscar el motor en
+    // la lista de objetos: hay que ESPERAR a que aparezca.
+    if crate::resolver::hay_motor_cargado() {
+        hooks::instalar();
         return;
     }
-    hooks::instalar();
+    if std::env::var("XFACTORVR_FORZAR").is_ok() {
+        hooks::instalar();
+        return;
+    }
+    let nombre = std::fs::read_link("/proc/self/exe")
+        .ok()
+        .and_then(|p| p.file_name().map(|s| s.to_string_lossy().to_string()))
+        .unwrap_or_default();
+    if nombre == "factorio" || nombre.starts_with("factorio-") {
+        hooks::instalar();
+        return;
+    }
+    // Proceso ajeno: no se toca nada.  Salvo que sea el LINKER de glibc, en
+    // cuyo caso el motor esta a punto de aparecer.
+    if nombre.starts_with("ld-linux") || nombre.starts_with("ld-") {
+        esperar_al_motor();
+    }
+}
+
+/// Espera a que el motor aparezca en la lista de objetos cargados.
+///
+/// El motor tarda una fraccion de segundo en cargarse (el linker lo mapea
+/// justo despues de inicializar los preloads) y en llegar al menu pasan un
+/// par de segundos, asi que da tiempo de sobra a enganchar los hooks antes
+/// de que el motor los pueda estar ejecutando.
+fn esperar_al_motor() {
+    std::thread::spawn(|| {
+        for _ in 0..1200 {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            if crate::resolver::hay_motor_cargado() {
+                crate::log::info("el motor ha aparecido: instalo los hooks");
+                hooks::instalar();
+                return;
+            }
+        }
+        crate::log::error("el motor no aparecio en 6 s: no instalo los hooks");
+    });
 }
 
 /// ¿El proceso actual es el ejecutable de Factorio?
+///
+/// OJO: en Android el motor NO es el ejecutable principal.  El motor es un
+/// binario de glibc y Android usa bionic, asi que hay que arrancarlo con el
+/// linker de glibc ("ld-linux-aarch64.so.1 --library-path ... factorio").  En
+/// ese caso `/proc/self/exe` es el LINKER y el motor aparece como un objeto
+/// mas de los cargados: hay que mirar la lista, no solo el ejecutable.
 fn es_el_juego() -> bool {
     if std::env::var("XFACTORVR_FORZAR").is_ok() {
+        return true;
+    }
+    if crate::resolver::hay_motor_cargado() {
         return true;
     }
     let exe = match std::fs::read_link("/proc/self/exe") {

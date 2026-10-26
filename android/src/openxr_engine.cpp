@@ -798,9 +798,13 @@ static bool s_hud_forzado = [] {
     return v != nullptr && v[0] == '1';
 }();
 
-/// El HUD propio se dibuja si el motor no manda imagen, o si se ha forzado.
+/// El HUD propio (el menu de crafteo y el inventario) se dibuja siempre.
+///
+/// Antes se ocultaba cuando el motor mandaba imagen, pero ese HUD es la
+/// UNICA forma de fabricar y de ver el inventario: el usuario lo echa de
+/// menos.  El problema no era que existiera, sino que era enorme.
 static inline bool hud_propio_visible() {
-    return s_hud_forzado || s_game_panel_w == 0;
+    return true;
 }
 
 static void update_table_matrix();
@@ -4355,6 +4359,8 @@ static void* openxr_thread_main(void* arg) {
     std::vector<XrEnvironmentBlendMode> blendModes(blendModeCount);
     xrEnumerateEnvironmentBlendModes(instance, systemId, XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO, blendModeCount, &blendModeCount, blendModes.data());
     XrEnvironmentBlendMode chosenBlendMode = XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
+    LOGI("Blend mode elegido: %d (0=OPAQUE, 1=ALPHA_BLEND, 2=ADDITIVE)",
+         (int)chosenBlendMode);
     for (auto mode : blendModes) {
         if (mode == XR_ENVIRONMENT_BLEND_MODE_ALPHA_BLEND) {
             chosenBlendMode = XR_ENVIRONMENT_BLEND_MODE_ALPHA_BLEND;
@@ -4586,6 +4592,8 @@ static void* openxr_thread_main(void* arg) {
             .layerHandle = passthroughLayer,
         };
         std::vector<XrCompositionLayerBaseHeader*> layers;
+        LOGI("Capa de passthrough: %s",
+               passthroughLayer != XR_NULL_HANDLE ? "creada" : "NO DISPONIBLE");
         if (passthroughLayer != XR_NULL_HANDLE) {
             layers.push_back((XrCompositionLayerBaseHeader*)&ptLayer);
         }

@@ -437,14 +437,14 @@ fn redirigir(path: *const c_char) -> Option<std::ffi::CString> {
 unsafe fn dlsym_next_open(
     _handle: *mut c_void,
     sym: &[u8],
-) -> Option<unsafe extern "C" fn(*const c_char, c_int) -> c_int> {
+) -> Option<unsafe extern "C" fn(*const c_char, c_int, c_int) -> c_int> {
     let ptr = dlsym(RTLD_NEXT, sym.as_ptr() as *const c_char);
     if ptr.is_null() {
         None
     } else {
         Some(std::mem::transmute::<
             *mut c_void,
-            unsafe extern "C" fn(*const c_char, c_int) -> c_int,
+            unsafe extern "C" fn(*const c_char, c_int, c_int) -> c_int,
         >(ptr))
     }
 }
@@ -455,9 +455,13 @@ pub unsafe extern "C" fn open(path: *const c_char, flags: c_int, mode: c_int) ->
         Some(f) => f,
         None => return -1,
     };
+    // OJO: el modo SOLO cuenta si el fichero se crea (O_CREAT), pero hay
+    // que pasarlo SIEMPRE: si no, el motor crea ficheros con un modo
+    // basura (y con el bit de ejecucion puesto, el motor se queda
+    // esperando).
     match redirigir(path) {
-        Some(d) => f(d.as_ptr(), flags),
-        None => f(path, flags),
+        Some(d) => f(d.as_ptr(), flags, mode),
+        None => f(path, flags, mode),
     }
 }
 
@@ -476,7 +480,7 @@ pub unsafe extern "C" fn openat(
     match redirigir(path) {
         Some(d) => {
             let f: Option<
-                unsafe extern "C" fn(c_int, *const c_char, c_int) -> c_int,
+                unsafe extern "C" fn(c_int, *const c_char, c_int, c_int) -> c_int,
             > = {
                 let ptr = dlsym(RTLD_NEXT, b"openat\0".as_ptr() as *const c_char);
                 if ptr.is_null() {
@@ -484,18 +488,18 @@ pub unsafe extern "C" fn openat(
                 } else {
                     Some(std::mem::transmute::<
                         *mut c_void,
-                        unsafe extern "C" fn(c_int, *const c_char, c_int) -> c_int,
+                        unsafe extern "C" fn(c_int, *const c_char, c_int, c_int) -> c_int,
                     >(ptr))
                 }
             };
             match f {
-                Some(f) => f(dirfd, d.as_ptr(), flags),
+                Some(f) => f(dirfd, d.as_ptr(), flags, mode),
                 None => -1,
             }
         }
         None => {
             let f: Option<
-                unsafe extern "C" fn(c_int, *const c_char, c_int) -> c_int,
+                unsafe extern "C" fn(c_int, *const c_char, c_int, c_int) -> c_int,
             > = {
                 let ptr = dlsym(RTLD_NEXT, b"openat\0".as_ptr() as *const c_char);
                 if ptr.is_null() {
@@ -503,12 +507,12 @@ pub unsafe extern "C" fn openat(
                 } else {
                     Some(std::mem::transmute::<
                         *mut c_void,
-                        unsafe extern "C" fn(c_int, *const c_char, c_int) -> c_int,
+                        unsafe extern "C" fn(c_int, *const c_char, c_int, c_int) -> c_int,
                     >(ptr))
                 }
             };
             match f {
-                Some(f) => f(dirfd, path, flags),
+                Some(f) => f(dirfd, path, flags, mode),
                 None => -1,
             }
         }

@@ -28,8 +28,15 @@ LOG_DIR="${LOG_DIR:-$FACTORIO_DIR/logs}"
 CLIENT_DIR="${CLIENT_DIR:-/data/local/tmp/factorio_cliente}"
 RCON_PORT="${RCON_PORT:-27015}"
 RCON_PASSWORD="${RCON_PASSWORD:-xfactorvr}"
-WIDTH="${WIDTH:-1280}"
-HEIGHT="${HEIGHT:-720}"
+# OJO: el tamano de la ventana importa.  Medido en el visor Pico 4 Ultra:
+# con 1280x720 el motor se queda ESPERADO despues de "Factorio initialised"
+# (nunca llega a "Joining game"); con 640x360 entra en juego del tiron
+# ("to(InGame)" + "PlayerJoinGame mode(connect)").
+#
+# 640x360 es ademas lo que manda el inyector al visor (XFV1), asi que el
+# panel del motor tiene el tamano justo de la imagen que se ve.
+WIDTH="${WIDTH:-640}"
+HEIGHT="${HEIGHT:-360}"
 
 log() { echo "[factorio-client] $*"; }
 
@@ -237,7 +244,19 @@ mkdir -p "$XDG_RUNTIME_DIR" 2>/dev/null || true
 # shim trae un proxy CONNECT y un resolutor DNS propios: con el proxy, el
 # padlock del auth server sale de verdad y el cliente se puede emparejar.
 PRELOAD=""
-RESOLVER="${XFACTORVR_RESOLVER:-/data/local/tmp/libxfactorvr_resolver.so}"
+# OJO: el CLIENTE **no** necesita el resolutor de nombres.
+#
+# Medido en el visor Pico: con el shim preloaded el motor se queda ESPERADO
+# despues de "Factorio initialised" y nunca llega a "Joining game" (el hilo
+# principal acaba en hrtimer_nanosleep).  Sin el shim, el motor entra en
+# juego del tiron ("InGame" + "PlayerJoinGame") contra el servidor LAN.
+#
+# El shim solo lo necesita el SERVIDOR, que sin el no puede pedir el
+# "server padlock" a auth.factorio.com y se queda sin partida.
+#
+# Por defecto el cliente NO lo carga.  Se puede forzar con
+# XFACTORVR_RESOLVER=/ruta/libxfactorvr_resolver.so
+RESOLVER="${XFACTORVR_RESOLVER:-}"
 PROXY_PUERTO="${XFACTORVR_PROXY_PUERTO:-8899}"
 if [ -f "$RESOLVER" ]; then
     export https_proxy="http://127.0.0.1:$PROXY_PUERTO"
@@ -448,6 +467,7 @@ if [ -n "${SERVER_ADDR:-}" ]; then
     exec env LD_LIBRARY_PATH="$LIB_PATH" LD_PRELOAD="$PRELOAD" "$LOADER" --library-path "$LIB_PATH" "$GAME_BIN" \
         --config "$CLIENT_CONFIG" \
         --window-size "${WIDTH}x${HEIGHT}" \
+        --disable-audio \
         --mp-connect "$SERVER_ADDR:$SERVER_PORT" $STDIN_MOTOR
 fi
 

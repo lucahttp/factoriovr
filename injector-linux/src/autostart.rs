@@ -924,6 +924,15 @@ pub fn abrir_rcon(app_manager: *mut c_void) -> bool {
 /// llama manyas veces (la `InLoadingGameBox::process()` la llama en cada
 /// frame mientras la carga esta terminada).
 pub fn tick_rcon() {
+    // OJO: se comprueba ANTES de nada.  `startRconIfEnabled()` crea una
+    // interfaz NUEVA del RCON en el `RemoteCommandProcessor` cada vez que se
+    // llama, asi que llamarla dos veces intenta abrir dos sockets en el
+    // mismo puerto: el motor se queda con el estado a medias y acaba
+    // petando con un SIGSEGV (medido en el banco de autostart: dos
+    // "abriendo el RCON" seguidos y, justo despues, el crash).
+    if RCON_ABIERTO.load(Ordering::SeqCst) {
+        return;
+    }
     let app = APP_MANAGER.load(Ordering::Relaxed) as *mut c_void;
     if app.is_null() {
         return;

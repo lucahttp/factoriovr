@@ -282,6 +282,22 @@ fi
 cp "$MOD_LIST_CANON" "$MOD_DIR/mod-list.json" 2>/dev/null && \
     log "Lista de mods (canonica, sin expansiones): $MOD_DIR/mod-list.json"
 
+# Las expansiones tampoco pueden estar en el READ-DATA del servidor.
+#
+# Medido en el visor: con space-age/quality/recycler/elevated-rails en el
+# read-data, el servidor y el cliente acaban con listas de prototipos
+# DISTINTAS y el servidor rechaza la conexion:
+#   "Refusing connection for address (...), username (). ModsMismatch"
+# El cliente grafico no puede cargarlas (licencia) y el headless si, asi que
+# hay que quitarlas de los DOS lados para que las listas coincidan.
+for _exp in space-age quality recycler elevated-rails; do
+    if [ -d "$FACTORIO_DIR/data/$_exp" ]; then
+        mkdir -p "$FACTORIO_DIR/data/_sin_licencia" 2>/dev/null || true
+        mv "$FACTORIO_DIR/data/$_exp" "$FACTORIO_DIR/data/_sin_licencia/" 2>/dev/null && \
+            log "Expansion apartada del read-data del servidor: $_exp"
+    fi
+done
+
 # ---------------------------------------------------------------------------
 # 4 ter. Resolutor de nombres
 # ---------------------------------------------------------------------------

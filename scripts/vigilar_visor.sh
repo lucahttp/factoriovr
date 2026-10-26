@@ -59,6 +59,11 @@ for intento in $(seq 1 "$INTENTOS"); do
     $ADB shell "chmod 755 $REMOTE/libxfactorvr_injector.so $REMOTE/libxfactorvr_resolver.so $REMOTE/start_factorio_client.sh $REMOTE/start_factorio_standalone.sh" >> "$LOG" 2>&1
     say "desplegado"
 
+    # 1 bis. Apartar las expansiones del read-data del SERVIDOR (si no, el
+    # servidor y el cliente tienen listas distintas y el servidor rechaza la
+    # conexion con ModsMismatch).
+    $ADB shell 'for e in space-age quality recycler elevated-rails; do if [ -d /data/local/tmp/factorio_arm64/data/$e ]; then mkdir -p /data/local/tmp/factorio_arm64/data/_sin_licencia; mv /data/local/tmp/factorio_arm64/data/$e /data/local/tmp/factorio_arm64/data/_sin_licencia/ && echo "apartada $e"; fi; done' >> "$LOG" 2>&1
+
     # 2. Reiniciar los motores (el cliente y el servidor).
     $ADB shell 'pat="bin/arm64"; pat="${pat}/factorio"; for p in /proc/[0-9]*; do [ "$p" = "/proc/$$" ] && continue; if grep -qa "$pat" $p/cmdline 2>/dev/null; then kill ${p#/proc/} 2>/dev/null; fi; done; sleep 3; true' >> "$LOG" 2>&1
     $ADB shell "cd $REMOTE && XFACTORVR_RESOLVER_LOG=$REMOTE/res_srv.log nohup sh $REMOTE/start_factorio_standalone.sh > $REMOTE/srv.log 2>&1 &" >> "$LOG" 2>&1

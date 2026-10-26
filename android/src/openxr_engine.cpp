@@ -3432,6 +3432,11 @@ static void draw_game_panel(const float* vp_mat, const float* model_mesa, bool o
     // La matriz y el tamano de la imagen se guardan para el rayo de la mano:
     // con ellos se calcula el pixel del motor donde ha caido el puntero.
     memcpy(s_game_panel_mat, m_panel, sizeof(s_game_panel_mat));
+    if (s_game_panel_w != cfg.img_w || s_game_panel_h != cfg.img_h) {
+        LOGI("Panel del motor: textura %dx%d (imagen %dx%d, %.2fx%.2f m)",
+             cfg.img_w, cfg.img_h, cfg.img_w, cfg.img_h,
+             (float)cfg.img_w * 0.04f * (float)(cfg.img_w > 0 ? 1 : 1), 0.0f);
+    }
     s_game_panel_w = cfg.img_w;
     s_game_panel_h = cfg.img_h;
 
@@ -4358,13 +4363,39 @@ static void* openxr_thread_main(void* arg) {
     xrEnumerateEnvironmentBlendModes(instance, systemId, XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO, 0, &blendModeCount, nullptr);
     std::vector<XrEnvironmentBlendMode> blendModes(blendModeCount);
     xrEnumerateEnvironmentBlendModes(instance, systemId, XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO, blendModeCount, &blendModeCount, blendModes.data());
+    // EL MODO DE MEZCLA: en Pico OS (Pico OS 5.x, runtime 2.2.0) los modos
+    // disponibles son 1 (OPAQUE) y 3 (ADDITIVE): NO hay ALPHA_BLEND.
+    //
+    // El passthrough se compone en modo ADDITIVE: el runtime pone la camara
+    // detras y la app SUMA su imagen encima.  Con OPAQUE, el fondo del
+    // compositor (un gris plano) tapa la camara: eso es lo que se veia.
+    //
+    // OJO: en ADDITIVE el alfa se ignora y lo que se pinta se suma, asi que
+    // el fondo debe ser NEGRO (nada que sumar), no un gris.
     XrEnvironmentBlendMode chosenBlendMode = XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
-    LOGI("Blend mode elegido: %d (0=OPAQUE, 1=ALPHA_BLEND, 2=ADDITIVE)",
-         (int)chosenBlendMode);
+    bool hay_aditivo = false;
     for (auto mode : blendModes) {
-        if (mode == XR_ENVIRONMENT_BLEND_MODE_ALPHA_BLEND) {
-            chosenBlendMode = XR_ENVIRONMENT_BLEND_MODE_ALPHA_BLEND;
+        if (mode == XR_ENVIRONMENT_BLEND_MODE_ADDITIVE) {
+            hay_aditivo = true;
         }
+    }
+    if (hay_aditivo) {
+        chosenBlendMode = XR_ENVIRONMENT_BLEND_MODE_ADDITIVE;
+    } else {
+        for (auto mode : blendModes) {
+            if (mode == XR_ENVIRONMENT_BLEND_MODE_ALPHA_BLEND) {
+                chosenBlendMode = XR_ENVIRONMENT_BLEND_MODE_ALPHA_BLEND;
+            }
+        }
+    }
+    {
+        std::string modos;
+        for (auto mode : blendModes) {
+            modos += std::to_string((int)mode) + " ";
+        }
+        // 0=OPAQUE, 1=ALPHA_BLEND, 2=ADDITIVE.
+        LOGI("Blend mode: elegido=%d disponibles=[%s]",
+             (int)chosenBlendMode, modos.c_str());
     }
 
     init_tabletop_scene();
@@ -4539,7 +4570,10 @@ static void* openxr_thread_main(void* arg) {
                 glViewport(0, 0, swapchains[i].width, swapchains[i].height);
             }
 
-            glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
+            // Negro opaco: en modo ADDITIVE (el del passthrough de Pico OS)
+            // lo que se pinta se SUMA sobre la camara, asi que el fondo tiene
+            // que ser negro (nada que sumar).
+            glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
             glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
 
             float proj[16], viewMat[16], vp_mat[16];
@@ -4592,8 +4626,12 @@ static void* openxr_thread_main(void* arg) {
             .layerHandle = passthroughLayer,
         };
         std::vector<XrCompositionLayerBaseHeader*> layers;
-        LOGI("Capa de passthrough: %s",
-               passthroughLayer != XR_NULL_HANDLE ? "creada" : "NO DISPONIBLE");
+        static bool log_passthrough = false;
+        if (!log_passthrough) {
+            log_passthrough = true;
+            LOGI("Capa de passthrough: %s",
+                 passthroughLayer != XR_NULL_HANDLE ? "creada" : "NO DISPONIBLE");
+        }
         if (passthroughLayer != XR_NULL_HANDLE) {
             layers.push_back((XrCompositionLayerBaseHeader*)&ptLayer);
         }

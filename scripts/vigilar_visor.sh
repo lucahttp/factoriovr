@@ -59,7 +59,19 @@ for intento in $(seq 1 "$INTENTOS"); do
     $ADB shell "chmod 755 $REMOTE/libxfactorvr_injector.so $REMOTE/libxfactorvr_resolver.so $REMOTE/start_factorio_client.sh $REMOTE/start_factorio_standalone.sh" >> "$LOG" 2>&1
     say "desplegado"
 
-    # 1 bis. Apartar las expansiones del read-data del SERVIDOR (si no, el
+    # 1 bis. APK del visor (el HUD propio ya no tapa el juego).
+    if [ -f "$PROJECT_ROOT/build/XFactorVR_Pico4Ultra.apk" ]; then
+        if $ADB install -r "$PROJECT_ROOT/build/XFactorVR_Pico4Ultra.apk" >> "$LOG" 2>&1; then
+            say "APK del visor instalado"
+            $ADB shell "am force-stop com.xfactorvr.tabletop" >> "$LOG" 2>&1
+            $ADB shell "am start -n com.xfactorvr.tabletop/android.app.NativeActivity" >> "$LOG" 2>&1
+            sleep 6
+        else
+            say "AVISO: no se pudo instalar el APK (sigue el anterior)"
+        fi
+    fi
+
+    # 1 ter. Apartar las expansiones del read-data del SERVIDOR (si no, el
     # servidor y el cliente tienen listas distintas y el servidor rechaza la
     # conexion con ModsMismatch).
     $ADB shell 'for e in space-age quality recycler elevated-rails; do if [ -d /data/local/tmp/factorio_arm64/data/$e ]; then mkdir -p /data/local/tmp/factorio_arm64/data/_sin_licencia; mv /data/local/tmp/factorio_arm64/data/$e /data/local/tmp/factorio_arm64/data/_sin_licencia/ && echo "apartada $e"; fi; done' >> "$LOG" 2>&1

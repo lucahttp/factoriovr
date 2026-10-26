@@ -778,6 +778,31 @@ static const char* LAYOUT_FILE_PATH = "/sdcard/XFactorVR/layout.json";
 // consola vieja en un segundo si en el dispositivo se ve mejor.
 static const bool PREFERIR_HUD_NUEVO = true;
 
+// ---------------------------------------------------------------------------
+// ¿Se dibuja el HUD PROPIO (las ventanas holograficas)?
+// ---------------------------------------------------------------------------
+//
+// El HUD propio (la tabla de controles, el inventario, las recetas) se creo
+// cuando el motor todavia no mandaba imagen.  Con el juego en marcha, lo que
+// se ve es el GUI DEL JUEGO, que va dentro de la textura del panel (el
+// motor lo dibuja en su framebuffer, con su hotbar y su minimapa).
+//
+// Poner los dos a la vez tapaba la vista: el minimapa propio ocupaba media
+// pantalla y la escena se veia "distinta" del juego de PC.
+//
+// Por defecto el HUD propio se dibuja SOLO cuando el motor no esta mandando
+// imagen (entonces hace de consola).  Si esta forzado (XFACTORVR_HUD=1 o el
+// gesto), se dibuja siempre.
+static bool s_hud_forzado = [] {
+    const char* v = getenv("XFACTORVR_HUD");
+    return v != nullptr && v[0] == '1';
+}();
+
+/// El HUD propio se dibuja si el motor no manda imagen, o si se ha forzado.
+static inline bool hud_propio_visible() {
+    return s_hud_forzado || s_game_panel_w == 0;
+}
+
 static void update_table_matrix();
 
 static void save_tabletop_layout() {
@@ -2128,7 +2153,7 @@ static void draw_tabletop_scene(const float* vp_mat,
     float ui_z = -hd - 0.08f;
     float ui_y = 0.18f;
     if (!PREFERIR_HUD_NUEVO) {
-        if (!s_observer_mode) {
+        if (!s_observer_mode && hud_propio_visible()) {
             float ui_mvp[16];
             mat4_multiply(vp_mat, active_model, ui_mvp);
             glUniformMatrix4fv(s_model_loc, 1, GL_FALSE, active_model);
@@ -3038,7 +3063,7 @@ static void draw_tabletop_scene(const float* vp_mat,
     // y con que texto; aqui solo se pinta su geometria, que viene en el mismo
     // formato que el diorama.  El texto son quads por pixel de la fuente 5x7,
     // asi que no hace falta ninguna fuente del sistema.
-    if (s_ui_vertices) {
+    if (s_ui_vertices && hud_propio_visible()) {
         static std::vector<DioramaVertex> ui_verts(24000);
         int n = s_ui_vertices(ui_verts.data(), (int)ui_verts.size());
         if (n >= (int)ui_verts.size()) {

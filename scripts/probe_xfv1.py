@@ -71,6 +71,32 @@ def parsear_geometria(carga):
     return nombres, entidades
 
 
+
+def escribir_png(ruta, ancho, alto, rgba):
+    """Escribe un PNG RGBA minimo (sin dependencias)."""
+    import zlib
+
+    crudo = bytearray()
+    for y in range(alto):
+        crudo.append(0)  # filtro "none"
+        crudo += rgba[y * ancho * 4 : (y + 1) * ancho * 4]
+
+    def trozo(tipo, datos):
+        return (
+            struct.pack(">I", len(datos))
+            + tipo
+            + datos
+            + struct.pack(">I", zlib.crc32(tipo + datos) & 0xFFFFFFFF)
+        )
+
+    png = b"\x89PNG\r\n\x1a\n"
+    png += trozo(b"IHDR", struct.pack(">IIBBBBB", ancho, alto, 8, 6, 0, 0, 0))
+    png += trozo(b"IDAT", zlib.compress(bytes(crudo), 6))
+    png += trozo(b"IEND", b"")
+    with open(ruta, "wb") as f:
+        f.write(png)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--puerto", type=int, default=27020)
@@ -78,6 +104,11 @@ def main():
     ap.add_argument("--segundos", type=float, default=30.0)
     ap.add_argument("--consola", default=None, help="directorio de ordenes")
     ap.add_argument("--orden", default=None, help="orden a mandar por la consola")
+    ap.add_argument(
+        "--guardar",
+        default=None,
+        help="guarda el ultimo frame de pixeles recibido como PNG (para VERLO)",
+    )
     args = ap.parse_args()
 
     limite = time.time() + args.segundos
@@ -191,6 +222,13 @@ def main():
             ojos.add(flags & 1)
             if frames == 1:
                 log(f"PIXELES: primer frame {w}x{h} (ojo {flags & 1})")
+            # El ultimo frame se guarda como PNG para poder VERLO (asi se
+            # comprueba si lo que llega al visor trae el GUI del juego).
+            if args.guardar:
+                try:
+                    escribir_png(args.guardar, w, h, pix)
+                except OSError as exc:
+                    log(f"no se pudo guardar el PNG: {exc}")
 
     log("")
     log("=== RESUMEN ===")

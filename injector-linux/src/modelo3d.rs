@@ -102,7 +102,7 @@
 //!   * la **matriz de proyeccion** es la del juego (ver "Camara" arriba).
 
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use crate::detour::{self};
@@ -1006,6 +1006,81 @@ const MAX_TIPOS_3D: usize = 24;
 /// Trampolin de `DrawQueue::draw`.
 static TRAMPOLIN_DQ: AtomicUsize = AtomicUsize::new(0);
 
+// --- hook del blit del framebuffer (el GUI del juego) ------------------------
+//
+// El motor dibuja el MUNDO en su framebuffer y compone el GUI (hotbar,
+// minimapa, alertas) en OTRO, que despues se blitea a la pantalla.  Medido:
+// el frame que llega al visor (el del mundo) NO trae el GUI, y el
+// framebuffer 0 (la pantalla) con el driver offscreen esta vacio.
+//
+// Asi que el GUI hay que leerlo de su propio framebuffer: justo antes del
+// blit, ese framebuffer es el que esta activo.
+static TRAMPOLIN_BLIT: AtomicUsize = AtomicUsize::new(0);
+
+/// La firma de `FramebufferOpenGL::blitTo(VideoBitmap&, int, int, int, int,
+/// int, int)`.
+type HookBlitTo =
+    unsafe extern "C" fn(*mut c_void, *mut c_void, i32, i32, i32, i32, i32, i32);
+
+#[no_mangle]
+pub extern "C" fn xfv_hook_blit_to(
+    this: *mut c_void,
+    destino: *mut c_void,
+    a: i32,
+    b: i32,
+    c: i32,
+    d: i32,
+    e: i32,
+    f: i32,
+) {
+    // El framebuffer ACTIVO en este momento es el que se va a blitear.
+    capturar_gui_si_pide();
+    let tramp = TRAMPOLIN_BLIT.load(Ordering::SeqCst);
+    if tramp == 0 {
+        return;
+    }
+    // SAFETY: el trampolin contiene el bloque original reubicado y salta al
+    // resto de la funcion; los argumentos se pasan intactos.
+    unsafe {
+        let g: HookBlitTo = std::mem::transmute(tramp);
+        g(this, destino, a, b, c, d, e, f);
+    }
+}
+
+/// Lee el framebuffer activo (el del GUI) y lo deja en un PNG.
+///
+/// Sirve para MIRAR el GUI del juego: con XFACTORVR_CAPTURA_GUI=1 y
+/// XFACTORVR_CAPTURA_GUI_RUTA=/ruta.png.
+fn capturar_gui_si_pide() {
+    if std::env::var("XFACTORVR_CAPTURA_GUI").ok().as_deref() != Some("1") {
+        return;
+    }
+    let Some(gl) = GL.get() else { return };
+    let mut vp = [0i32; 4];
+    unsafe { (gl.get_integerv)(GL_VIEWPORT, vp.as_mut_ptr()) };
+    let (w, h) = (vp[2], vp[3]);
+    if w <= 0 || h <= 0 || w > 4096 || h > 4096 {
+        return;
+    }
+    let mut pix = vec![0u8; (w as usize) * (h as usize) * 4];
+    leer_pixeles(gl, w, h, &mut pix);
+    let con_color = pix
+        .chunks_exact(4)
+        .filter(|p| p[0] != 0 || p[1] != 0 || p[2] != 0)
+        .count();
+    log::info(&format!(
+        "GUI: framebuffer activo {w}x{h} con {} pixeles con color",
+        con_color
+    ));
+    if let Ok(ruta) = std::env::var("XFACTORVR_CAPTURA_GUI_RUTA") {
+        if !ruta.is_empty() {
+            if capturar_png(gl, &vp, &ruta) {
+                log::info(&format!("captura del GUI escrita en {ruta}"));
+            }
+        }
+    }
+}
+
 /// Trampolines de los hooks de entidad (uno por tipo): cada tipo enganchado
 /// necesita el suyo, porque el original es distinto en cada caso.
 static TRAMPOLIN_ENT: [AtomicUsize; MAX_TIPOS_3D] = [const { AtomicUsize::new(0) }; MAX_TIPOS_3D];
@@ -1240,6 +1315,100 @@ fn aplicar_desplazamiento_camara(this: *mut c_void) {
     unsafe { std::ptr::write_unaligned((p + 0x1b8) as *mut f64, desplazada) };
 }
 
+// ---------------------------------------------------------------------------
+// Diagnostico: que CAPAS dibuja el motor (para el GUI como textura)
+// ---------------------------------------------------------------------------
+//
+// El motor dibuja el mundo en una capa y el GUI (hotbar, minimapa, alertas)
+// en otra.  El inyector necesita saber cual es la del GUI para poder leer el
+// framebuffer ANTES de que se dibuja (el mundo sin GUI) y despues (con el
+// GUI), y restar: GUI = F - W (ADR-022).
+//
+// Con XFACTORVR_DIAG_CAPAS=1 se vuelca la secuencia de capas de cada frame.
+
+/// La ultima capa que se ha visto (para detectar los cambios).
+static CAPA_ACTUAL: AtomicU32 = AtomicU32::new(u32::MAX);
+/// Las capas de este frame: (capa, draws, x_min, y_min, x_max, y_max).
+///
+/// El rectangulo es el de las POSICIONES de los draws.  En el mundo son
+/// coordenadas de tile (grandes); en el GUI son pixeles de pantalla
+/// (0..ancho, 0..alto).  Eso es lo que dice que capa es el GUI.
+#[derive(Clone, Copy)]
+struct InfoCapa {
+    draws: u32,
+    x_min: i32,
+    y_min: i32,
+    x_max: i32,
+    y_max: i32,
+}
+
+/// Las capas de este frame.
+static CAPAS_FRAME: Mutex<Vec<(u32, InfoCapa)>> = Mutex::new(Vec::new());
+
+/// Suma un draw a la capa actual y registra el cambio.
+fn anotar_capa(layer: u32, x: i32, y: i32) {
+    if std::env::var("XFACTORVR_DIAG_CAPAS").ok().as_deref() != Some("1") {
+        return;
+    }
+    let anterior = CAPA_ACTUAL.swap(layer, Ordering::Relaxed);
+    let mut guard = match CAPAS_FRAME.lock() {
+        Ok(g) => g,
+        Err(_) => return,
+    };
+    // Busca la entrada de esta capa (puede no ser la ultima: las capas
+    // alternan).
+    let pos = match guard.iter().position(|(c, _)| *c == layer) {
+        Some(i) => i,
+        None => {
+            guard.push((
+                layer,
+                InfoCapa { draws: 0, x_min: i32::MAX, y_min: i32::MAX, x_max: i32::MIN, y_max: i32::MIN },
+            ));
+            guard.len() - 1
+        }
+    };
+    let info = &mut guard[pos].1;
+    info.draws += 1;
+    if x < info.x_min {
+        info.x_min = x;
+    }
+    if y < info.y_min {
+        info.y_min = y;
+    }
+    if x > info.x_max {
+        info.x_max = x;
+    }
+    if y > info.y_max {
+        info.y_max = y;
+    }
+    let _ = anterior;
+}
+
+/// Vuelca las capas del frame y limpia el contador.
+fn volcar_capas() {
+    if std::env::var("XFACTORVR_DIAG_CAPAS").ok().as_deref() != Some("1") {
+        return;
+    }
+    let mut guard = match CAPAS_FRAME.lock() {
+        Ok(g) => g,
+        Err(_) => return,
+    };
+    if !guard.is_empty() {
+        let texto: Vec<String> = guard
+            .iter()
+            .map(|(c, i)| {
+                format!(
+                    "{c}:{} draws=[{},{}..{},{}]",
+                    i.draws, i.x_min, i.y_min, i.x_max, i.y_max
+                )
+            })
+            .collect();
+        log::info(&format!("capas del frame: {}", texto.join(" | ")));
+        guard.clear();
+    }
+    CAPA_ACTUAL.store(u32::MAX, Ordering::Relaxed);
+}
+
 #[no_mangle]
 pub extern "C" fn xfv_hook_draw_queue(
     this: *mut c_void,
@@ -1267,6 +1436,13 @@ extern "C" fn hook_draw_queue(
     // El desplazamiento de camara va ANTES del original: el motor tiene que
     // calcular las posiciones de los sprites con la camara ya desplazada.
     aplicar_desplazamiento_camara(this);
+
+    // La capa de este draw (para el GUI como textura).  La posicion se lee
+    // como un MapPosition (2 x i32); en el GUI son pixeles de pantalla.
+    if !position.is_null() {
+        let mp = unsafe { std::ptr::read_unaligned(position as *const [i32; 2]) };
+        anotar_capa(layer, mp[0], mp[1]);
+    }
 
     if ACTIVO.load(Ordering::Relaxed) == 0 || position.is_null() || this.is_null() {
         return;
@@ -1396,7 +1572,37 @@ extern "C" fn hook_flush_sprites(this: *mut c_void, flag: u8) {
             f(this, flag);
         }
     }
+    capturar_framebuffer_activo("sprites");
     pintar_si_toca("sprites");
+}
+
+/// Lee el framebuffer ACTIVO (el que esta bindeado ahora mismo) y lo guarda
+/// como PNG.
+///
+/// El motor dibuja el GUI del juego en su PROPIO framebuffer, que solo esta
+/// bindeado mientras lo dibuja (durante los flush).  Asi se puede leer el
+/// GUI en el momento en que existe.
+fn capturar_framebuffer_activo(sufijo: &str) {
+    if std::env::var("XFACTORVR_CAPTURA_GUI").ok().as_deref() != Some("1") {
+        return;
+    }
+    let Some(gl) = GL.get() else { return };
+    let mut vp = [0i32; 4];
+    unsafe { (gl.get_integerv)(GL_VIEWPORT, vp.as_mut_ptr()) };
+    let (w, h) = (vp[2], vp[3]);
+    if w <= 0 || h <= 0 || w > 4096 || h > 4096 {
+        return;
+    }
+    let Ok(ruta) = std::env::var("XFACTORVR_CAPTURA_GUI_RUTA") else {
+        return;
+    };
+    if ruta.is_empty() {
+        return;
+    }
+    let ruta = format!("{ruta}.{sufijo}");
+    if capturar_png(gl, &vp, &ruta) {
+        log::info(&format!("captura del framebuffer activo escrita en {ruta}"));
+    }
 }
 
 /// Hook de `DrawCommandBatch::flushSpritesInstancedBatch(bool)`.
@@ -1414,6 +1620,7 @@ extern "C" fn hook_flush_sprites_instanced(this: *mut c_void, flag: u8) {
             f(this, flag);
         }
     }
+    capturar_framebuffer_activo("instanced");
     pintar_si_toca("instanced");
 }
 
@@ -1432,6 +1639,7 @@ extern "C" fn hook_flush_primitives(this: *mut c_void) {
             f(this);
         }
     }
+    capturar_framebuffer_activo("primitives");
     pintar_si_toca("primitives");
 }
 
@@ -1550,6 +1758,9 @@ fn leer_pixeles(gl: &Gl, w: i32, h: i32, buf: &mut [u8]) {
 /// El ojo es el del frame que se esta capturando (el contador de frames se
 /// incrementa DESPUES de esta llamada).
 pub fn capturar_frame_completo() {
+    // El diagnostico de capas se volca SIEMPRE (aunque no se este
+    // transmitiendo nada): es lo que dice que capa usa el GUI.
+    volcar_capas();
     if !crate::stream::toca_enviar() {
         return;
     }
@@ -1609,6 +1820,15 @@ pub fn capturar_frame_completo() {
             // error sea de otra cosa (y perder el frame es peor).
             log::aviso("hubo un error de GL al leer el frame (se manda igualmente)");
         }
+        // DIAGNOSTICO: el framebuffer del MUNDO frente a la PANTALLA (FBO 0).
+        //
+        // El motor dibuja el mundo en su framebuffer y compone el GUI
+        // (hotbar, minimapa) en la pantalla.  Comparando los dos se ve si
+        // el GUI esta en la pantalla (pixels que difieren) y donde.
+        if std::env::var("XFACTORVR_DIAG_PANTALLA").ok().as_deref() == Some("1") {
+            comparar_con_la_pantalla(gl, &buf, w, h);
+        }
+
         if crate::stream::enviar(&buf, w as u32, h as u32, ojo_actual()) {
             log::info(&format!(
                 "frame completo transmitido: {w}x{h} (enviados={}, perdidos={})",
@@ -2079,6 +2299,55 @@ extern "C" fn hook_bind_uniform_buffer(
 // Captura
 // --------------------------------------------------------------------------
 
+/// Compara el framebuffer del mundo con el de la pantalla (FBO 0).
+///
+/// El motor compone el GUI del juego en la pantalla: si la pantalla y el
+/// mundo se diferencian, lo que se ve ahi es el GUI (hotbar, minimapa...).
+/// Deja constancia de cuantos pixeles difieren y guarda la pantalla como
+/// PNG si se pide (XFACTORVR_CAPTURA_PANTALLA).
+fn comparar_con_la_pantalla(gl: &Gl, mundo: &[u8], w: i32, h: i32) {
+    let fb_dibujo = gl_int(gl, GL_DRAW_FRAMEBUFFER_BINDING);
+    let fb_lectura = gl_int(gl, GL_READ_FRAMEBUFFER_BINDING);
+    // El framebuffer 0 (la pantalla por defecto).
+    unsafe {
+        (gl.bind_framebuffer)(GL_DRAW_FRAMEBUFFER, 0);
+        (gl.bind_framebuffer)(GL_READ_FRAMEBUFFER, 0);
+    }
+    let mut pantalla = vec![0u8; (w as usize) * (h as usize) * 4];
+    leer_pixeles(gl, w, h, &mut pantalla);
+    drenar_errores(gl, "leer la pantalla");
+    unsafe {
+        (gl.bind_framebuffer)(GL_DRAW_FRAMEBUFFER, fb_dibujo as u32);
+        (gl.bind_framebuffer)(GL_READ_FRAMEBUFFER, fb_lectura as u32);
+    }
+
+    let mut difieren = 0u64;
+    let mut con_color = 0u64;
+    for (a, b) in mundo.chunks_exact(4).zip(pantalla.chunks_exact(4)) {
+        if a != b {
+            difieren += 1;
+        }
+        if b[0] != 0 || b[1] != 0 || b[2] != 0 {
+            con_color += 1;
+        }
+    }
+    log::info(&format!(
+        "pantalla vs mundo: {} de {} pixeles difieren (pantalla con color: {})",
+        difieren,
+        (w as u64) * (h as u64),
+        con_color
+    ));
+
+    if let Ok(ruta) = std::env::var("XFACTORVR_CAPTURA_PANTALLA") {
+        if !ruta.is_empty() {
+            let vp = [0i32, 0, w, h];
+            if capturar_png(gl, &vp, &ruta) {
+                log::info(&format!("captura de la PANTALLA escrita en {ruta}"));
+            }
+        }
+    }
+}
+
 /// Captura el framebuffer actual si la variable de entorno lo pide.
 ///
 /// Se escribe en `XFACTORVR_3D_CAPTURA` (una ruta). Se capturan como mucho
@@ -2375,6 +2644,22 @@ pub fn instalar(simbolos: &resolver::Simbolos) {
         }
     } else {
         log::aviso("no se encontro DrawQueue::draw()");
+    }
+
+    // --- hook del blit del framebuffer (para capturar el GUI del juego) ---
+    const MANGLE_BLIT: &str = "_ZN17FramebufferOpenGL6blitToER11VideoBitmapiiiiii";
+    if let Some(blit) = simbolos.resolver_exacto(MANGLE_BLIT) {
+        if let Some(a) = direccion_de_ejecucion_de("xfv_hook_blit_to") {
+            match detour::instalar(blit.direccion, a, None, blit.tamano) {
+                Ok(d) => {
+                    TRAMPOLIN_BLIT.store(d.trampolin as usize, Ordering::SeqCst);
+                    log::info("detour instalado sobre FramebufferOpenGL::blitTo()");
+                }
+                Err(e) => log::error(&format!("no se pudo instalar el detour de blitTo: {e}")),
+            }
+        }
+    } else {
+        log::aviso("no se encontro FramebufferOpenGL::blitTo()");
     }
 
     // --- hook del enlace de uniform buffers (la camara del motor) ---

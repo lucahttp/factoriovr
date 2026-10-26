@@ -1,6 +1,8 @@
 # ADR-022 — El GUI del juego como textura capturada, y un puntero para interactuar
 
-> **Estado**: diseño cerrado (decidido el 2026-10-25). Implementación pendiente.
+> **Estado**: diseño cerrado (decidido el 2026-10-25). **Implementación a
+> medias, con la parte 3 (capturar el GUI) bloqueada por un dato medido** (ver
+> la sección 9).
 > Revisa: `ADR-021` (el canal de geometría), `ADR-020` (sin RCON).
 
 ---
@@ -110,3 +112,76 @@ Se puede poner en un atril o en un botón del HUD.
 - Las **acciones** siguen yendo por la consola del motor (ADR-020).
 - El **render 3D** del visor no se toca: solo se le añade una textura.
 - El motor **no se parchea**: todo esto vive en el inyector y en el visor.
+
+
+---
+
+## 9. Lo que dice la medicion (2026-10-26)
+
+Antes de escribir codigo se midio en el motor real (el binario `factorio` ARM64
+y el cliente de verdad, en el contenedor), porque el diseno de la seccion 3
+suponia cosas que hay que comprobar:
+
+### 9.1 El GUI NO va en el framebuffer del mundo
+
+El inyector manda al visor el framebuffer del MUNDO (`FB_MUNDO`).  Ese frame
+**no trae el GUI**: capturado a PNG se ve el terreno, las vias y el jugador, y
+**ni hotbar, ni minimapa, ni alertas**.  El GUI del motor se dibuja en otro
+framebuffer y se compone despues.
+
+Esto significa que la tecnica "GUI = F - W" de la seccion 3 **no se puede
+aplicar tal cual**: no hay un "F con el GUI" disponible en el framebuffer del
+mundo, y el FBO 0 (la pantalla) con el driver `offscreen` **esta vacio**
+(medido: 0 pixeles con color, y 0 de 230400 pixeles distintos del mundo).
+
+### 9.2 El GUI tampoco pasa por `DrawQueue::draw`
+
+El hook de `DrawQueue::draw` recibe la capa (`RenderLayer::Enum`) y por ahi se
+ve el mundo.  Las capas medidas en un frame:
+
+```
+92:166 draws=[-2525,-2541..3057,2523]   <- el mundo
+66:40  draws=[-2945,-1918..113,915]     <- el mundo (otra capa)
+124:1  draws=[1152,-1920..1152,-1920]   <- una sola vez
+118:1  draws=[1152,-1920..1152,-1920]   <- una sola vez
+10:1   draws=[2433,-2030..2433,-2030]   <- una sola vez
+```
+
+Ninguna de las tres ultimas es el GUI (el GUI dibujaria hotbar, minimapa y
+alertas, o sea **muchos** draws en coordenadas de pantalla, no uno).
+
+### 9.3 `FramebufferOpenGL::blitTo()` no se llama
+
+El detour se instala bien (`detour instalado sobre
+FramebufferOpenGL::blitTo()`) pero **el hook no se ejecuta nunca**: esa via
+no es la que compone el GUI en 2.1.22.
+
+### 9.4 Lo que ya esta hecho
+
+- El **HUD propio del visor** (las ventanas holograficas con la tabla de
+  controles) **solo se dibuja cuando el motor no manda imagen**.  Con el juego
+  en marcha, lo que se ve es el GUI del JUEGO (el del motor), que es lo que
+  se ve "como en el PC".  Antes los dos a la vez: el minimapa propio se
+  comia media vista y la escena se veia distinta del juego de PC.
+- Los hooks de diagnostico en el inyector (`XFACTORVR_DIAG_CAPAS`,
+  `XFACTORVR_DIAG_PANTALLA`, `XFACTORVR_CAPTURA_GUI`), que son los que han
+  destapado los puntos 9.1 a 9.3.
+
+### 9.5 El paso que falta
+
+Localizar el framebuffer del GUI.  Los candidatos que quedan:
+
+1. `RenderUtil::takeScreenshots()`: es donde el motor lee el frame final
+   (con el GUI) para escribir la captura.  Enganchandolo se ve el
+   framebuffer que usa.
+2. `GraphicsInterfaceOpenGL::draw()`: el dibujado final a la pantalla; el
+   FBO activo ahi dira si el GUI se compone ahi o en otro.
+3. Los nombres del GUI en 2.1.22 no son los de 2.0: no existe
+   `GuiRenderTarget` ni `ActiveRenderTarget` (el motor tiene `FrameBuffer`,
+   `EngineFramebuffers`, `SpriteRenderTarget`...).  Hay que buscar el
+   equivalente actual.
+
+Con ese framebuffer localizado, la idea del ADR-022 se aplica tal cual: el
+inyector lo lee, lo manda por XFV1 con un tipo nuevo y el visor lo pinta con
+alfa encima del mundo 3D (con las mismas coordenadas que la textura del
+panel, de modo que el hit-test del puntero ya sirve).

@@ -76,7 +76,24 @@ for intento in $(seq 1 "$INTENTOS"); do
     # conexion con ModsMismatch).
     $ADB shell 'for e in space-age quality recycler elevated-rails; do if [ -d /data/local/tmp/factorio_arm64/data/$e ]; then mkdir -p /data/local/tmp/factorio_arm64/data/_sin_licencia; mv /data/local/tmp/factorio_arm64/data/$e /data/local/tmp/factorio_arm64/data/_sin_licencia/ && echo "apartada $e"; fi; done' >> "$LOG" 2>&1
 
-    # 2. Reiniciar los motores (el cliente y el servidor).
+    # 2. Reiniciar los motores SOLO si no estan bien.
+    #
+    # OJO: reiniciar el motor con la partida en marcha la corta (el cliente
+    # se queda en "WaitingForUserToSaveOrQuitAfterServerLeft").  Asi que
+    # solo se toca lo que este roto:
+    #   - el servidor, si no esta InGame;
+    #   - el cliente, si no ha entrado en juego.
+    SRV_LOG="$REMOTE/factorio_arm64/logs/standalone.log"
+    CLI_LOG="$REMOTE/cli.log"
+    SRV_OK="$($ADB shell "grep -aq 'to(InGame)' '$SRV_LOG' && echo si || echo no" 2>/dev/null | tr -d '\r\n ')"
+    CLI_OK="$($ADB shell "grep -aq 'to(InGame)' '$CLI_LOG' && echo si || echo no" 2>/dev/null | tr -d '\r\n ')"
+    say "servidor InGame=$SRV_OK  cliente InGame=$CLI_OK"
+    if [ "$SRV_OK" = "si" ] && [ "$CLI_OK" = "si" ]; then
+        say "todo en marcha: no se toca nada (la partida sigue)"
+        # Aun asi se comprueba que el juego entra y se guarda evidencia.
+        $ADB exec-out screencap -p > "/tmp/vigila_visor_$(date +%H%M%S).png" 2>/dev/null
+        exit 0
+    fi
     $ADB shell 'pat="bin/arm64"; pat="${pat}/factorio"; for p in /proc/[0-9]*; do [ "$p" = "/proc/$$" ] && continue; if grep -qa "$pat" $p/cmdline 2>/dev/null; then kill ${p#/proc/} 2>/dev/null; fi; done; sleep 3; true' >> "$LOG" 2>&1
     $ADB shell "cd $REMOTE && XFACTORVR_RESOLVER_LOG=$REMOTE/res_srv.log nohup sh $REMOTE/start_factorio_standalone.sh > $REMOTE/srv.log 2>&1 &" >> "$LOG" 2>&1
     sleep 18

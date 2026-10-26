@@ -98,6 +98,11 @@ for intento in $(seq 1 "$INTENTOS"); do
     if [ "$CONECTADO" = "1" ]; then
         say "*** EL CLIENTE ENTRA COMO JUGADOR ***"
         echo "OK: el cliente entra como jugador" > "$RES"
+        # Una captura del visor y los datos del panel (la textura del motor).
+        sleep 5
+        $ADB exec-out screencap -p > "/tmp/vigila_visor_$(date +%H%M%S).png" 2>/dev/null
+        $ADB shell "logcat -d | grep -aE 'Blend mode|Capa de passthrough|Panel del motor' | tail -4" >> "$LOG" 2>&1
+        $ADB shell "cat /sdcard/XFactorVR/srv/script-output/xfactorvr_bridge/estado.json 2>/dev/null | head -c 200" >> "$LOG" 2>&1
         # Estado del mundo (la camara) y el inyector.
         sleep 5
         $ADB shell "cat $REMOTE/factorio_arm64/logs/standalone.log | grep -a 'PlayerJoinGame' | tail -1" >> "$LOG" 2>&1

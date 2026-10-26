@@ -463,6 +463,22 @@ struct DioramaVertex {
 static const float TABLE_HALF_W = 0.90f;  // Ancho total 1.80m
 static const float TABLE_HALF_D = 0.60f;  // Profundidad total 1.20m
 
+// ---------------------------------------------------------------------------
+// El puntero visible
+// ---------------------------------------------------------------------------
+//
+// El rayo de la mano ya sabia que pixel del motor hay debajo (eso es lo que
+// manda el clic XFCE), pero no se dibujaba nada: el jugador pulsaba a ciegas.
+//
+// Aqui se guarda el punto del rayo en el espacio LOCAL del panel (-1..1) y
+// se dibuja un anillo tumbado encima, del tamaño de una moneda.
+static GLuint s_vao_puntero = 0;
+static GLuint s_vbo_puntero = 0;
+static int s_puntero_vertices = 0;
+static float s_puntero_local_x = 0.0f;
+static float s_puntero_local_y = 0.0f;
+static std::atomic<bool> s_puntero_visible{false};
+
 // ============================================================================
 // ESTADO DE MESA Y OBSERVADOR HUMANO (GENERALS XR PATTERN)
 // ============================================================================
@@ -2423,6 +2439,10 @@ static void draw_tabletop_scene(const float* vp_mat,
         // mandaba un clic al motor Y una orden por RCON al diorama.
         bool has_panel_hit = false;
         int panel_px = 0, panel_py = 0;
+        // El puntero se recalcula en cada frame del ojo principal: si el rayo
+        // no da en el panel, se esconde (si no se queda congelado en el
+        // ultimo sitio donde acertó).
+        if (is_primary_eye) s_puntero_visible.store(false);
         if (is_primary_eye && !s_observer_mode && s_game_panel_w > 0 && s_game_panel_h > 0) {
             const float origen_rayo[3] = { rx, ry, rz };
             const float dir_rayo[3] = { dx, dy, dz };
@@ -2446,6 +2466,11 @@ static void draw_tabletop_scene(const float* vp_mat,
                     has_panel_hit = true;
                     panel_px = px;
                     panel_py = py;
+                    // El puntero visible: la posicion del rayo en el espacio
+                    // LOCAL del panel (-1..1, con +1 = ARRIBA de la imagen).
+                    s_puntero_local_x = ((float)px + 0.5f) / (float)s_game_panel_w * 2.0f - 1.0f;
+                    s_puntero_local_y = 1.0f - ((float)py + 0.5f) / (float)s_game_panel_h * 2.0f;
+                    s_puntero_visible.store(true);
                 }
             }
         }
@@ -3345,6 +3370,9 @@ static void subir_frame_juego(int ojo) {
 /// El desplazamiento por ojo (`u_uv_offset`) es lo que da el paralaje: la
 /// imagen se ve como si fuera una ventana al mundo y el cubo 3D del inyector
 /// gana volumen.
+static void dibujar_puntero(const float* vp_mat, const float* m_panel,
+                            const PanelMesaConfig* cfg);
+
 static void draw_game_panel(const float* vp_mat, const float* model_mesa, bool ojo_primario) {
     // En modo observador el mundo esta a escala 1:1 (x25) y el panel de la
     // mesa no tiene sentido ahi.
@@ -3408,6 +3436,88 @@ static void draw_game_panel(const float* vp_mat, const float* model_mesa, bool o
 
     glBindVertexArray(0);
     glBindBuffer(GL_ARRAY_BUFFER, 0);
+
+    // El puntero, encima del panel (se dibuja despues para que el blend
+    // del panel no se lo coma).
+    dibujar_puntero(vp_mat, m_panel, &cfg);
+}
+
+/// Dibuja el puntero: un anillo tumbado en el punto donde ha caido el rayo
+/// de la mano, ENCIMA del panel del juego.
+///
+/// Se dibuja con la MISMA matriz del panel (los vertices van en su espacio
+/// local), asi que el anillo sale tumbado y del tamaño pedido sin tener que
+/// recalcular nada.  El recorte de mesa se desactiva: el puntero ya esta
+/// dentro del panel, que esta dentro de la mesa.
+static void dibujar_puntero(const float* vp_mat, const float* m_panel,
+                            const PanelMesaConfig* cfg) {
+    if (!s_puntero_visible.load()) return;
+    if (s_game_panel_w <= 0 || s_game_panel_h <= 0) return;
+
+    float ancho_m = 0.0f, fondo_m = 0.0f;
+    panel_mesa_tamano(cfg, &ancho_m, &fondo_m);
+    if (ancho_m < 0.01f || fondo_m < 0.01f) return;
+
+    // 2,5 cm de radio: se ve bien a un brazo de distancia y no tapa el juego.
+    const float radio_m = 0.025f;
+    const float rx = radio_m / (ancho_m * 0.5f);
+    const float ry = radio_m / (fondo_m * 0.5f);
+
+    PanelMesaVertice pv[PANEL_MESA_PUNTERO_VERTICES];
+    const int n = panel_mesa_vertices_puntero(s_puntero_local_x, s_puntero_local_y,
+                                               rx, ry, 0.002f, pv,
+                                               PANEL_MESA_PUNTERO_VERTICES);
+    if (n <= 0) return;
+
+    // Los vertices solo se suben cuando el puntero se mueve.
+    static float cache_x = 1e9f, cache_y = 1e9f;
+    static int cache_n = 0;
+    if (n != cache_n || s_puntero_local_x != cache_x || s_puntero_local_y != cache_y) {
+        std::vector<DioramaVertex> verts;
+        verts.reserve(n);
+        for (int i = 0; i < n; ++i) {
+            DioramaVertex d{};
+            d.x = pv[i].x; d.y = pv[i].y; d.z = pv[i].z;
+            d.nx = pv[i].nx; d.ny = pv[i].ny; d.nz = pv[i].nz;
+            d.u = pv[i].u; d.v = pv[i].v;
+            d.r = 1.0f; d.g = 0.80f; d.b = 0.15f; d.a = 0.95f;
+            verts.push_back(d);
+        }
+        if (s_vao_puntero == 0) {
+            s_vao_puntero = create_mesh_vao(verts, s_vbo_puntero);
+        } else {
+            glBindBuffer(GL_ARRAY_BUFFER, s_vbo_puntero);
+            glBufferData(GL_ARRAY_BUFFER, verts.size() * sizeof(DioramaVertex),
+                         verts.data(), GL_DYNAMIC_DRAW);
+            glBindBuffer(GL_ARRAY_BUFFER, 0);
+        }
+        s_puntero_vertices = n;
+        cache_x = s_puntero_local_x;
+        cache_y = s_puntero_local_y;
+        cache_n = n;
+    }
+    if (s_vao_puntero == 0 || s_puntero_vertices <= 0) return;
+
+    float mvp[16];
+    mat4_multiply(vp_mat, m_panel, mvp);
+
+    glUseProgram(s_program);
+    glUniformMatrix4fv(s_model_loc, 1, GL_FALSE, m_panel);
+    glUniformMatrix4fv(s_mvp_loc, 1, GL_FALSE, mvp);
+    glUniform1f(s_use_tex_loc, 0.0f);
+    glUniform1f(s_lit_loc, 0.0f);
+    glUniform3f(s_emissive_loc, 0.30f, 0.25f, 0.05f);
+    glUniform1f(s_enable_clipping_loc, 0.0f);
+    glUniform2f(s_uv_offset_loc, 0.0f, 0.0f);
+
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    glDepthMask(GL_FALSE);
+    glBindVertexArray(s_vao_puntero);
+    glDrawArrays(GL_TRIANGLES, 0, s_puntero_vertices);
+    glDepthMask(GL_TRUE);
+    glDisable(GL_BLEND);
+    glBindVertexArray(0);
 }
 
 // ============================================================================

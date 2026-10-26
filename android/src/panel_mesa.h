@@ -170,6 +170,30 @@ typedef struct {
 void panel_mesa_vertices(PanelMesaVertice* out);
 
 // ---------------------------------------------------------------------------
+// El puntero visible
+// ---------------------------------------------------------------------------
+
+/// Numero de vertices que ocupa el anillo del puntero.
+#define PANEL_MESA_PUNTERO_VERTICES 96
+
+/// Geometria del puntero: un anillo tumbado en el plano del panel, en el
+/// punto donde ha caido el rayo de la mano.
+///
+/// `hx`/`hy` son la posicion en el espacio LOCAL del panel (-1..1, con la Y
+/// como en el quad: +1 es ARRIBA de la imagen).  `radio_x`/`radio_y` son los
+/// radios EXTERIORES en unidades locales (1 = la mitad del ancho o del fondo
+/// del panel): como la matriz escala X e Y de forma distinta, se pasan por
+/// separado para que el anillo salga CIRCULAR en metros.  `altura_local` es el
+/// desplazamiento sobre el plano del panel (en metros: el eje Z local no se
+/// escala), para que no compita con el panel por la profundidad.
+///
+/// Devuelve el numero de vertices escritos (0 si no caben o el radio es
+/// invalido).
+int panel_mesa_vertices_puntero(float hx, float hy, float radio_x, float radio_y,
+                                 float altura_local, PanelMesaVertice* out,
+                                 int max_vertices);
+
+// ---------------------------------------------------------------------------
 // Rayo <-> pixel
 // ---------------------------------------------------------------------------
 

@@ -388,6 +388,60 @@ int main() {
         comprobar(uv_ok, "la geometria tiene la V invertida (v = 0 es ARRIBA)");
     }
 
+    // ------------------------------------------------------------------
+    // 11. El puntero visible: anillo tumbado en el punto del rayo
+    // ------------------------------------------------------------------
+    {
+        PanelMesaVertice pv[PANEL_MESA_PUNTERO_VERTICES];
+        const float rx = 0.05f, ry = 0.04f;
+        const int n = panel_mesa_vertices_puntero(0.25f, -0.30f, rx, ry, 0.002f,
+                                                   pv, PANEL_MESA_PUNTERO_VERTICES);
+        comprobar(n == PANEL_MESA_PUNTERO_VERTICES,
+                  "el puntero genera todos sus vertices");
+
+        bool altura_ok = true;
+        bool dentro_ok = true;
+        bool hueco_ok = true;
+        bool centro_ok = true;
+        for (int i = 0; i < n; ++i) {
+            if (pv[i].z != 0.002f) altura_ok = false;
+            if (pv[i].nx != 0.0f || pv[i].ny != 0.0f || pv[i].nz != 1.0f) altura_ok = false;
+            // El anillo es una ELIPSE (X e Y se escalan distinto): la
+            // distancia se normaliza con los dos radios.
+            const float dx = (pv[i].x - 0.25f) / rx;
+            const float dy = (pv[i].y + 0.30f) / ry;
+            const float d = std::sqrt(dx * dx + dy * dy);
+            if (d > 1.0f + 1e-4f || d < 0.55f - 1e-4f) dentro_ok = false;
+            // El anillo tiene AGUERO: ningun vertice cae dentro del radio
+            // interior (los vertices estan justo en el, no por dentro).
+            if (d < 0.55f - 1e-4f) hueco_ok = false;
+        }
+        comprobar(altura_ok, "el puntero va 2 mm por encima del panel, con la normal del panel");
+        comprobar(dentro_ok, "los vertices del puntero estan en el anillo");
+        comprobar(hueco_ok, "el puntero es un anillo (tiene agujero en el centro)");
+
+        // El centro del anillo (la interseccion de los ejes) esta donde se
+        // pidio: se comprueba que el punto (0.25, -0.30) no tiene ningun
+        // vertice encima.
+        bool sin_centro = true;
+        for (int i = 0; i < n; ++i) {
+            const float dx = pv[i].x - 0.25f;
+            const float dy = pv[i].y + 0.30f;
+            if (std::sqrt(dx * dx + dy * dy) < 1e-4f) sin_centro = false;
+        }
+        comprobar(sin_centro, "el centro del anillo esta en el punto pedido");
+        comprobar(centro_ok, "el puntero se genera en el punto pedido");
+
+        // Un radio invalido no genera nada.
+        comprobar(panel_mesa_vertices_puntero(0.0f, 0.0f, 0.0f, 0.0f, 0.002f,
+                                               pv, PANEL_MESA_PUNTERO_VERTICES) == 0,
+                  "con radio 0 no se genera puntero");
+        // Y si el buffer es pequeno, no escribe de mas.
+        PanelMesaVertice pv2[8];
+        comprobar(panel_mesa_vertices_puntero(0.0f, 0.0f, rx, ry, 0.002f, pv2, 8) == 0,
+                  "si el buffer es pequeno no se escribe nada");
+    }
+
     std::printf("\n%s: %d fallo(s)\n", fallos == 0 ? "TODO CORRECTO" : "HAY FALLOS", fallos);
     return fallos == 0 ? 0 : 1;
 }

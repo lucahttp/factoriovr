@@ -273,6 +273,69 @@ void panel_mesa_vertices(PanelMesaVertice* out) {
 }
 
 // ---------------------------------------------------------------------------
+// El puntero visible
+// ---------------------------------------------------------------------------
+//
+// El rayo de la mano dice QUE pixel del motor hay debajo (eso ya lo hacia
+// `panel_mesa_rayo_a_pixel`), pero sin dibujarse el jugador no ve donde
+// esta apuntando: el clic XFCE sale a ciegas.
+//
+// El puntero es un ANILLO tumbado en el plano del panel, en el punto del
+// rayo.  Se genera en el espacio LOCAL del panel (el mismo en el que vive
+// el quad unitario), con el tamano dado en radios locales: el motor lo
+// escala a metros con la matriz del panel.
+
+/// Numero de segmentos del anillo del puntero.
+#define PUNTERO_SEGMENTOS 16
+
+/// Vertices que ocupa el anillo (2 triangulos por segmento).
+#define PUNTERO_VERTICES (PUNTERO_SEGMENTOS * 6)
+
+int panel_mesa_vertices_puntero(float hx, float hy, float radio_x, float radio_y,
+                                float altura_local, PanelMesaVertice* out,
+                                int max_vertices) {
+    if (out == nullptr || max_vertices < PUNTERO_VERTICES) return 0;
+    if (radio_x <= 0.0f || radio_y <= 0.0f) return 0;
+
+    // El anillo: elipses de radio interior (0,55) y exterior.
+    const float ri_x = radio_x * 0.55f;
+    const float ri_y = radio_y * 0.55f;
+
+    int n = 0;
+    for (int s = 0; s < PUNTERO_SEGMENTOS; ++s) {
+        const float a0 = 6.28318530718f * (float)s / (float)PUNTERO_SEGMENTOS;
+        const float a1 = 6.28318530718f * (float)(s + 1) / (float)PUNTERO_SEGMENTOS;
+        const float c0 = cosf(a0), s0 = sinf(a0);
+        const float c1 = cosf(a1), s1 = sinf(a1);
+
+        // Los cuatro puntos del cuadrilatero del segmento.
+        const float xi[4] = { hx + ri_x * c0, hx + radio_x * c1,
+                              hx + radio_x * c0, hx + ri_x * c1 };
+        const float yi[4] = { hy + ri_y * s0, hy + radio_y * s1,
+                              hy + radio_y * s0, hy + ri_y * s1 };
+        // UV sin sentido (el puntero no usa textura): se pone la del punto.
+        const float ui[4] = { 0.0f, 1.0f, 1.0f, 0.0f };
+        const float vi[4] = { 0.0f, 0.0f, 1.0f, 1.0f };
+
+        // Dos triangulos: (0,1,2) y (0,2,3).
+        const int orden[6] = { 0, 1, 2, 0, 2, 3 };
+        for (int k = 0; k < 6; ++k) {
+            const int j = orden[k];
+            out[n].x = xi[j];
+            out[n].y = yi[j];
+            out[n].z = altura_local;
+            out[n].nx = 0.0f;
+            out[n].ny = 0.0f;
+            out[n].nz = 1.0f;
+            out[n].u = ui[j];
+            out[n].v = vi[j];
+            ++n;
+        }
+    }
+    return n;
+}
+
+// ---------------------------------------------------------------------------
 // Rayo <-> pixel
 // ---------------------------------------------------------------------------
 

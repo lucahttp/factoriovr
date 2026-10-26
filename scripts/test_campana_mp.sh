@@ -123,19 +123,26 @@ in_container "test -f '$ESC_DIR/blueprint.zip'" \
 
 in_container "command -v python3 >/dev/null" || sin_entorno "el contenedor no tiene python3"
 
-# X: se reutiliza el que haya o se levanta un Xvfb.
-DISPLAY_USADO=""
-for d in ":$DISPLAY_NUM" :99 :0 :1; do
-    if in_container "test -e /tmp/.X11-unix/X${d#:}"; then DISPLAY_USADO="$d"; break; fi
-done
-if [ -z "$DISPLAY_USADO" ]; then
-    in_container "command -v Xvfb >/dev/null" \
-        || sin_entorno "no hay servidor X y Xvfb no esta instalado"
-    in_container "Xvfb :$DISPLAY_NUM -screen 0 1280x720x24 -nolisten tcp >/dev/null 2>&1 & sleep 3" \
-        || sin_entorno "no se pudo arrancar Xvfb"
-    DISPLAY_USADO=":$DISPLAY_NUM"
-fi
-ok "contenedor '$CONTAINER' con datos del juego y display $DISPLAY_USADO"
+# Driver de video del cliente.
+#
+# OJO: el SDL que lleva el motor ENLAZADO ESTATICAMENTE NO tiene X11.
+# Medido en el binario real (factorio/bin/arm64/factorio), los drivers que
+# trae son: dummy, kmsdrm, offscreen y wayland.  No hay cadena "x11" en el
+# binario, asi que forzar SDL_VIDEODRIVER=x11 hace que SDL_Init falle con
+#   "SDL couldn't be initialized. SDL_Error: x11 not available"
+# y el cliente muera antes de conectar.  Por defecto se usa "offscreen",
+# que es el mismo driver que usa el cliente en el visor Pico (allí tampoco
+# hay X11).
+SDL_VIDEO="${SDL_VIDEO:-offscreen}"
+case "$SDL_VIDEO" in
+    x11)
+        in_container "command -v Xvfb >/dev/null" \
+            || sin_entorno "se pidio x11 pero el contenedor no tiene Xvfb"
+        in_container "Xvfb :$DISPLAY_NUM -screen 0 1280x720x24 -nolisten tcp >/dev/null 2>&1 & sleep 3" \
+            || sin_entorno "no se pudo arrancar Xvfb"
+        ;;
+esac
+ok "contenedor '$CONTAINER' con datos del juego y driver de video $SDL_VIDEO"
 
 # --------------------------------------------------------------------------
 # 1. Preparacion: nivel parcheado para MP, mod puente, config y ajustes
@@ -247,7 +254,7 @@ else
     aviso "el cliente arranca SIN inyector (no hay /injector.so o esta desactivado)"
 fi
 
-in_container "cd '$CLIENT_DIR' && env DISPLAY=$DISPLAY_USADO SDL_VIDEODRIVER=x11 \
+in_container "cd '$CLIENT_DIR' && env SDL_VIDEODRIVER=$SDL_VIDEO \
     XDG_RUNTIME_DIR=/tmp/xdg \
     LIBGL_DRIVERS_PATH=/usr/lib/aarch64-linux-gnu/dri \
     MESA_LOADER_DRIVER_OVERRIDE=zink ZINK_DESCRIPTORS=auto \

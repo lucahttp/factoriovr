@@ -608,10 +608,81 @@ fn registrar(mensaje: &str) {
 
 /// Servidores de nombres que se consultan si la glibc no puede resolver.
 ///
-/// El primero es el del router (responde rapido y sin salir de la red); los
-/// publicos son el plan B.  El orden importa: cada consulta que no responde
-/// cuesta un timeout entero.
-const SERVIDORES: [&str; 3] = ["172.20.0.1", "8.8.8.8", "1.1.1.1"];
+/// ANTES era una lista fija ("172.20.0.1", "8.8.8.8", "1.1.1.1") y eso
+/// MURIO el dia que el visor cambio de red: el router paso a otra subred y
+/// 172.20.0.1 dejo de responder, el mini-resolver no resolvia
+/// auth.factorio.com y el servidor multijugador caia con
+///   "Failed to reach auth server. Code: 520"  (el proxy devolvia 502).
+///
+/// Ahora la lista se descubre del propio sistema: las propiedades de Android
+/// (net.dns1, dhcp.wlan0.dns1, ...) y la puerta de enlace de la ruta por
+/// defecto.  Los publicos siguen como plan B.
+const SERVIDORES_PUBLICOS: [&str; 3] = ["8.8.8.8", "1.1.1.1", "9.9.9.9"];
+
+/// La lista se resuelve una sola vez y se cachea.
+fn servidores() -> &'static Vec<String> {
+    static SERVIDORES: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    SERVIDORES.get_or_init(|| {
+        let mut lista: Vec<String> = Vec::new();
+        let mut anadir = |s: String| {
+            if !s.is_empty() && !lista.contains(&s) {
+                lista.push(s);
+            }
+        };
+
+        // 1. Las propiedades de Android: "net.dns1", "vendor.net.dns2",
+        //    "dhcp.wlan0.dns1", ... Son el contrato real de la red.
+        if let Ok(salida) = std::process::Command::new("getprop").output() {
+            let texto = String::from_utf8_lossy(&salida.stdout);
+            for linea in texto.lines() {
+                // Formato: "[net.dns1]: [8.8.8.8]"
+                let Some((clave, valor)) = linea.split_once(": [") else {
+                    continue;
+                };
+                if !clave.ends_with(".dns1") && !clave.ends_with(".dns2") {
+                    continue;
+                }
+                let valor = valor.trim_end_matches(']').trim();
+                if valor.parse::<std::net::Ipv4Addr>().is_ok() {
+                    anadir(valor.to_string());
+                }
+            }
+        }
+
+        // 2. La puerta de enlace de la ruta por defecto: en una red domestica
+        //    el router suele ser tambien el servidor de nombres.
+        if let Ok(tabla) = std::fs::read_to_string("/proc/net/route") {
+            for linea in tabla.lines().skip(1) {
+                let campos: Vec<&str> = linea.split_whitespace().collect();
+                if campos.len() < 3 {
+                    continue;
+                }
+                if campos[1] != "00000000" {
+                    continue; // solo la ruta por defecto
+                }
+                if let Some(ip) = hex_a_ipv4(campos[2]) {
+                    anadir(ip);
+                }
+            }
+        }
+
+        // 3. Plan B: los publicos.
+        for s in SERVIDORES_PUBLICOS.iter() {
+            anadir((*s).to_string());
+        }
+
+        registrar(&format!("dns: servidores de nombres: {}", lista.join(", ")));
+        lista
+    })
+}
+
+/// Convierte un gateway de /proc/net/route (hexadecimal en orden de red) a
+/// su forma IPv4.
+fn hex_a_ipv4(hex: &str) -> Option<String> {
+    let valor = u32::from_str_radix(hex, 16).ok()?;
+    let b = valor.to_le_bytes();
+    Some(format!("{}.{}.{}.{}", b[0], b[1], b[2], b[3]))
+}
 
 static CACHE: Mutex<Option<HashMap<String, (u32, u64)>>> = Mutex::new(None);
 
@@ -650,7 +721,7 @@ fn resolver_udp(nombre: &str) -> Option<u32> {
     let socket = UdpSocket::bind("0.0.0.0:0").ok()?;
     socket.set_read_timeout(Some(Duration::from_millis(1500))).ok()?;
 
-    for servidor in SERVIDORES.iter() {
+    for servidor in servidores().iter() {
         let destino = format!("{}:53", servidor);
         if socket.send_to(&consulta, &destino).is_err() {
             registrar(&format!("dns: no se pudo enviar a {}", destino));

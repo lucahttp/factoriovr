@@ -50,18 +50,20 @@ fail() { echo "[factorio][ERROR] $*" >&2; exit 1; }
 # ---------------------------------------------------------------------------
 # 1. ¿Hay ya un servidor en marcha?
 # ---------------------------------------------------------------------------
-# pidof no esta en todas las imagenes de Android, asi que se busca tambien
-# en /proc. Un servidor vivo significa que no hay que levantar otro: dos
-#_factorio en el mismo puerto RCON se pelean por el estado del mundo.
+# OJO: el nombre del proceso en el visor NO es "factorio".  El motor se
+# arranca con el linker de glibc, asi que /proc/<pid>/comm vale
+# "ld-linux-aarch64.so.1" (medido en el visor).  Por eso hay que mirar la
+# linea de ordenes (cmdline), donde si aparece "bin/arm64/factorio".
+# Con el metodo antiguo (comm == "factorio") el servidor NUNCA se detectaba:
+# el script lanzaba un segundo motor, este se comia el puerto 34197 y
+# moria con "Host address is already in use".
 existing_pid() {
-    _pid=$(pidof factorio 2>/dev/null)
-    if [ -n "$_pid" ]; then
-        printf '%s' "$_pid"
-        return 0
-    fi
     for _p in /proc/[0-9]*; do
-        [ -r "$_p/comm" ] || continue
-        if [ "$(cat "$_p/comm" 2>/dev/null)" = "factorio" ]; then
+        [ -r "$_p/cmdline" ] || continue
+        # El propio shell de este script tambien tiene "factorio" en su
+        # linea de ordenes: hay que excluirse a si mismo.
+        [ "$_p" = "/proc/$$" ] && continue
+        if tr '\0' ' ' < "$_p/cmdline" 2>/dev/null | grep -q "bin/arm64/factorio"; then
             printf '%s' "${_p#/proc/}"
             return 0
         fi
@@ -245,6 +247,35 @@ else
     log "        El servidor arrancara, pero sin puente RCON el juego"
     log "        seguira usando la simulacion local de Rust."
 fi
+
+# ---------------------------------------------------------------------------
+# 4 bis. Lista de mods: la MISMA en el servidor y en el cliente grafico
+# ---------------------------------------------------------------------------
+# El servidor y el cliente tienen que llevar EXACTAMENTE la misma lista de
+# mods, o la conexion se rechaza ("Mod information mismatch").
+#
+# La lista es la canonica del repo (scripts/mod-list.json): base + el mod
+# puente.  SIN las expansiones (space-age, quality, recycler, elevated-rails)
+# por un motivo medido: el cliente GRAFICO comprueba la licencia de
+# expansion y sin cuenta de Factorio se niega a cargarlas --
+#   "Failed to load mods: Mod elevated-rails requires Space Age expansion."
+# El servidor headless no hace ese chequeo, asi que una lista con expansiones
+# hace que el servidor cargue 6 mods y el cliente rechace 2: nunca conectan.
+MOD_LIST_CANON="${MOD_LIST_CANON:-/data/local/tmp/mod-list.json}"
+if [ ! -f "$MOD_LIST_CANON" ]; then
+    # Si no esta en el visor se escribe aqui mismo (mismo formato).
+    cat > "$MOD_LIST_CANON" <<'JSON'
+{
+  "mods":
+  [
+    { "name": "base", "enabled": true },
+    { "name": "xfactorvr_bridge", "enabled": true }
+  ]
+}
+JSON
+fi
+cp "$MOD_LIST_CANON" "$MOD_DIR/mod-list.json" 2>/dev/null && \
+    log "Lista de mods (canonica, sin expansiones): $MOD_DIR/mod-list.json"
 
 # ---------------------------------------------------------------------------
 # 4 ter. Resolutor de nombres

@@ -330,6 +330,60 @@ if ! grep -q "^sound-enabled" "$CLIENT_CONFIG" 2>/dev/null; then
     printf '\n[sound]\nsound-enabled=false\n' >> "$CLIENT_CONFIG"
 fi
 
+# --- 5a. Mods: la MISMA lista que el servidor ------------------------------
+#
+# El servidor y el cliente deben llevar exactamente la misma lista de mods o
+# la conexion se rechaza.  Ademas el cliente GRAFICO comprueba la licencia de
+# las expansiones y, sin cuenta de Factorio, se niega a cargarlas:
+#   "Failed to load mods: Mod elevated-rails requires Space Age expansion."
+# Por eso:
+#   1. se copia al cliente la lista canonica (base + mod puente),
+#   2. se copia el mod puente desde el arbol del servidor (para que ambos
+#      lados ejecuten EXACTAMENTE el mismo control.lua),
+#   3. se apartan las expansiones del read-data del cliente (el motor las
+#      auto-activa si las encuentra y luego no las deja cargar).
+MOD_LIST_CANON="${MOD_LIST_CANON:-/data/local/tmp/mod-list.json}"
+SERVER_MOD_DIR="${SERVER_MOD_DIR:-/data/local/tmp/factorio_arm64/mods}"
+CLIENT_MODS="$CLIENT_DIR/mods"
+mkdir -p "$CLIENT_MODS" 2>/dev/null || true
+
+if [ ! -f "$MOD_LIST_CANON" ]; then
+    cat > "$MOD_LIST_CANON" <<'JSON'
+{
+  "mods":
+  [
+    { "name": "base", "enabled": true },
+    { "name": "xfactorvr_bridge", "enabled": true }
+  ]
+}
+JSON
+fi
+cp "$MOD_LIST_CANON" "$CLIENT_MODS/mod-list.json" 2>/dev/null && \
+    log "Lista de mods del cliente: $CLIENT_MODS/mod-list.json"
+
+# El mod puente, copiado del servidor para que no haya ni un byte de
+# diferencia entre los dos lados.
+for _d in "$SERVER_MOD_DIR"/xfactorvr_bridge_*/; do
+    [ -f "${_d}control.lua" ] || continue
+    _nombre=$(basename "$_d")
+    if [ ! -f "$CLIENT_MODS/$_nombre/control.lua" ] || \
+       ! cmp -s "$_d/control.lua" "$CLIENT_MODS/$_nombre/control.lua"; then
+        mkdir -p "$CLIENT_MODS/$_nombre" 2>/dev/null || true
+        cp "$_d"control.lua "$_d"info.json "$CLIENT_MODS/$_nombre/" 2>/dev/null
+        log "Mod puente copiado del servidor: $_nombre"
+    fi
+done
+
+# Las expansiones NO pueden estar en el read-data del cliente grafico.
+READ_DATA_DIR="$GAME_DIR/data"
+for _exp in space-age quality recycler elevated-rails; do
+    if [ -d "$READ_DATA_DIR/$_exp" ]; then
+        mkdir -p "$READ_DATA_DIR/_sin_licencia" 2>/dev/null || true
+        mv "$READ_DATA_DIR/$_exp" "$READ_DATA_DIR/_sin_licencia/" 2>/dev/null && \
+            log "Expansion apartada (el cliente grafico no tiene licencia): $_exp"
+    fi
+done
+
 # --- 5b. La consola del motor (canal de ordenes sin RCON, ADR-020) ---------
 #
 # El motor lee ordenes por su stdin (la consola de Factorio).  Si el stdin
@@ -337,7 +391,7 @@ fi
 # ("Got EOF on stdin; closing").  Con una FIFO abierta en lectura-escritura
 # nunca hay EOF, y el inyector (que vive dentro del motor) puede escribir en
 # el fd 0 del propio motor.
-CONSOLA_FIFO="${CONSOLA_FIFO:-/data/local/tmp/factorio/consola.fifo}"
+CONSOLA_FIFO="${CONSOLA_FIFO:-$CLIENT_DIR/consola.fifo}"
 CONSOLA_DIR="${XFACTORVR_CONSOLA_DIR:-/sdcard/XFactorVR/consola}"
 mkdir -p "$(dirname "$CONSOLA_FIFO")" "$CONSOLA_DIR" 2>/dev/null || true
 if [ ! -p "$CONSOLA_FIFO" ]; then
@@ -360,6 +414,24 @@ fi
 # --- 6. Arranque ------------------------------------------------------------
 GAME_BIN="$GAME_DIR/bin/arm64/factorio"
 
+# Si quedo un cliente anterior vivo, el motor nuevo muere al instante:
+#   "Couldn't acquire exclusive lock for /data/local/tmp/factorio_cliente/.lock"
+# y, sin ventana, solo se ve el dialogo de error.  Se mata SOLO el cliente
+# anterior (el del servidor se reconoce por su --config, no por el nombre:
+# en el visor el proceso se llama "ld-linux-aarch64.so.1").
+for _p in /proc/[0-9]*; do
+    [ -r "$_p/cmdline" ] || continue
+    [ "$_p" = "/proc/$$" ] && continue
+    _cmd=$(tr '\0' ' ' < "$_p/cmdline" 2>/dev/null)
+    case "$_cmd" in
+        *bin/arm64/factorio*"--config $CLIENT_CONFIG"*)
+            log "Matando el cliente anterior (pid ${_p#/proc/})..."
+            kill "${_p#/proc/}" 2>/dev/null
+            ;;
+    esac
+done
+sleep 1
+
 if [ -n "${SERVER_ADDR:-}" ]; then
     # Modo campana: el juego corre en dos procesos del mismo arbol. El
     # SERVIDOR simula y tiene el RCON (el RCON es funcion del servidor) y el
@@ -373,8 +445,9 @@ if [ -n "${SERVER_ADDR:-}" ]; then
 fi
 
 # Modo simple: el cliente juega en single-player (sin RCON, que en single
-# player no existe) sobre una partida guardada.
-SAVE="${SAVE:-$FACTORIO_DIR/saves/xfactorvr.zip}"
+# player no existe) sobre una partida guardada.  La partida va en el
+# write-data DEL CLIENTE (el del servidor es de root y no se puede escribir).
+SAVE="${SAVE:-$CLIENT_DIR/saves/xfactorvr.zip}"
 if [ ! -f "$SAVE" ]; then
     log "Creando la partida inicial..."
     env LD_LIBRARY_PATH="$LIB_PATH" LD_PRELOAD="$PRELOAD" "$LOADER" --library-path "$LIB_PATH" "$GAME_BIN" --create "$SAVE" --config "$CLIENT_CONFIG" \

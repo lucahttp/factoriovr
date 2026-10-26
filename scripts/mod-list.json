@@ -1,0 +1,13 @@
+{
+  "mods":
+  [
+    {
+      "name": "base",
+      "enabled": true
+    },
+    {
+      "name": "xfactorvr_bridge",
+      "enabled": true
+    }
+  ]
+}

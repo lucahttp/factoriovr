@@ -795,6 +795,12 @@ static const bool PREFERIR_HUD_NUEVO = true;
 // Por defecto el HUD propio se dibuja SOLO cuando el motor no esta mandando
 // imagen (entonces hace de consola).  Si esta forzado (XFACTORVR_HUD=1 o el
 // gesto), se dibuja siempre.
+/// El modo de mezcla de la sesion (lo elige el runtime de Pico).
+/// Con ADDITIVE, el fondo es la camara y lo que pintamos se SUMA: el
+/// blending de toda la escena tiene que ser aditivo, o la imagen se
+/// mezclaria con el fondo del compositor en vez de con la habitacion.
+static bool s_blend_aditivo = false;
+
 static bool s_hud_forzado = [] {
     const char* v = getenv("XFACTORVR_HUD");
     return v != nullptr && v[0] == '1';
@@ -3439,10 +3445,11 @@ static void draw_game_panel(const float* vp_mat, const float* model_mesa, bool o
     // La matriz y el tamano de la imagen se guardan para el rayo de la mano:
     // con ellos se calcula el pixel del motor donde ha caido el puntero.
     memcpy(s_game_panel_mat, m_panel, sizeof(s_game_panel_mat));
-    if (s_game_panel_w != cfg.img_w || s_game_panel_h != cfg.img_h) {
-        LOGI("Panel del motor: textura %dx%d (imagen %dx%d, %.2fx%.2f m)",
-             cfg.img_w, cfg.img_h, cfg.img_w, cfg.img_h,
-             (float)cfg.img_w * 0.04f * (float)(cfg.img_w > 0 ? 1 : 1), 0.0f);
+    static bool log_panel = false;
+    if (!log_panel) {
+        log_panel = true;
+        LOGI("Panel del motor: textura %dx%d (imagen %dx%d)",
+             cfg.img_w, cfg.img_h, s_game_panel_w, s_game_panel_h);
     }
     s_game_panel_w = cfg.img_w;
     s_game_panel_h = cfg.img_h;
@@ -3468,7 +3475,12 @@ static void draw_game_panel(const float* vp_mat, const float* model_mesa, bool o
     glUniform1i(s_tex_loc, 0);
 
     glEnable(GL_BLEND);
-    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    if (s_blend_aditivo) {
+        // La camara esta detras: lo que pintamos se SUMA.
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE);
+    } else {
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    }
     glDepthMask(GL_FALSE);
     glBindVertexArray(s_vao_juego);
     glDrawArrays(GL_TRIANGLES, 0, s_juego_vertices);
@@ -4418,9 +4430,14 @@ static void* openxr_thread_main(void* arg) {
         for (auto mode : blendModes) {
             modos += std::to_string((int)mode) + " ";
         }
-        // 0=OPAQUE, 1=ALPHA_BLEND, 2=ADDITIVE.
-        LOGI("Blend mode: elegido=%d disponibles=[%s]",
-             (int)chosenBlendMode, modos.c_str());
+        // 1=OPAQUE, 2=ALPHA_BLEND, 3=ADDITIVE (los valores de OpenXR).
+        // OJO: el enum de este SDK no coincide con el de OpenXR (el modo de
+        // passthrough de Pico es el 3 y la constante vale otra cosa), asi
+        // que se decide por lo que importa: si NO es OPAQUE, la camara esta
+        // detras y lo que pintamos se suma.
+        s_blend_aditivo = (chosenBlendMode != XR_ENVIRONMENT_BLEND_MODE_OPAQUE);
+        LOGI("Blend mode: elegido=%d (aditivo=%d) disponibles=[%s]",
+             (int)chosenBlendMode, (int)s_blend_aditivo, modos.c_str());
     }
 
     init_tabletop_scene();

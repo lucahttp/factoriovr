@@ -37,6 +37,8 @@
 //   * ancla_espacial: anclaje a la mesa real con las extensiones XR_BD_*
 #include "puente_entrada.h"
 #include "panel_mesa.h"
+
+extern "C" int __system_property_get(const char* name, char* value);
 #include "ancla_espacial.h"
 
 #define TAG "XFactorVR_OpenXR"
@@ -3075,6 +3077,11 @@ static void draw_tabletop_scene(const float* vp_mat,
             ui_verts.resize(ui_verts.size() * 2);
             n = s_ui_vertices(ui_verts.data(), (int)ui_verts.size());
         }
+        static int log_hud = 0;
+        if (log_hud < 3) {
+            log_hud++;
+            LOGI("HUD propio: %d vertices (hay %s)", n, n > 0 ? "ventanas" : "NADA");
+        }
         if (n > 0) {
             // Las ventanas del HUD viven en el espacio LOCAL (el de la
             // cabeza), no en el de la mesa: se pintan con la matriz de la
@@ -4379,7 +4386,25 @@ static void* openxr_thread_main(void* arg) {
             hay_aditivo = true;
         }
     }
-    if (hay_aditivo) {
+    // Se puede forzar el modo con XFACTORVR_BLEND=opaque|additive|alpha
+    // (util para medir cual de los tres compone el passthrough en Pico OS).
+    // Se lee de una property de Android (las "debug." las puede leer
+    // cualquier app) porque el entorno de la app no se puede fijar desde
+    // adb:   adb shell setprop debug.XFACTORVR_BLEND opaque
+    char prop[64] = {0};
+    const char* forzado = nullptr;
+    if (__system_property_get("debug.XFACTORVR_BLEND", prop) > 0) {
+        forzado = prop;
+    }
+    if (forzado != nullptr && forzado[0] != '\0') {
+        if (strcmp(forzado, "opaque") == 0) {
+            chosenBlendMode = XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
+        } else if (strcmp(forzado, "alpha") == 0) {
+            chosenBlendMode = XR_ENVIRONMENT_BLEND_MODE_ALPHA_BLEND;
+        } else {
+            chosenBlendMode = XR_ENVIRONMENT_BLEND_MODE_ADDITIVE;
+        }
+    } else if (hay_aditivo) {
         chosenBlendMode = XR_ENVIRONMENT_BLEND_MODE_ADDITIVE;
     } else {
         for (auto mode : blendModes) {

@@ -21,6 +21,11 @@ set -u
 FACTORIO_DIR="${FACTORIO_DIR:-/data/local/tmp/factorio}"
 MESA_DIR="${MESA_DIR:-/data/local/tmp/mesa}"
 LOG_DIR="${LOG_DIR:-$FACTORIO_DIR/logs}"
+# El write-data DEL CLIENTE.  Se declara aqui (y no mas abajo) porque el
+# script corre con "set -u" y se usa antes: el log del resolutor de nombres
+# y la FIFO de la consola cuelgan de aqui, y este directorio es el unico
+# que puede escribir el usuario shell (el del servidor es de root).
+CLIENT_DIR="${CLIENT_DIR:-/data/local/tmp/factorio_cliente}"
 RCON_PORT="${RCON_PORT:-27015}"
 RCON_PASSWORD="${RCON_PASSWORD:-xfactorvr}"
 WIDTH="${WIDTH:-1280}"
@@ -237,7 +242,7 @@ PROXY_PUERTO="${XFACTORVR_PROXY_PUERTO:-8899}"
 if [ -f "$RESOLVER" ]; then
     export https_proxy="http://127.0.0.1:$PROXY_PUERTO"
     export http_proxy="http://127.0.0.1:$PROXY_PUERTO"
-    export XFACTORVR_RESOLVER_LOG="${XFACTORVR_RESOLVER_LOG:-$FACTORIO_DIR/logs/resolver.log}"
+    export XFACTORVR_RESOLVER_LOG="${XFACTORVR_RESOLVER_LOG:-$CLIENT_DIR/logs/resolver.log}"
     mkdir -p "$(dirname "$XFACTORVR_RESOLVER_LOG")" 2>/dev/null || true
     PRELOAD="$RESOLVER${PRELOAD:+:$PRELOAD}"
     log "resolutor: $RESOLVER (proxy en 127.0.0.1:$PROXY_PUERTO)"
@@ -301,9 +306,7 @@ fi
 #   write-data=<directorio del cliente>
 # Es la unica forma de que el motor lo acepte: si el ejecutable esta en otro
 # sitio, deduce el write-data por si mismo y choca con el del servidor.
-GAME_DIR="${GAME_DIR:-$(cd "$(dirname "$0")" && pwd)}"
-GAME_DIR="${GAME_DIR_OVERRIDE:-/data/local/tmp/factorio}"
-CLIENT_DIR="${CLIENT_DIR:-/data/local/tmp/factorio_cliente}"
+GAME_DIR="${GAME_DIR_OVERRIDE:-${GAME_DIR:-/data/local/tmp/factorio}}"
 SERVER_PORT="${SERVER_PORT:-34197}"
 
 mkdir -p "$CLIENT_DIR/config" "$CLIENT_DIR/saves" "$CLIENT_DIR/logs" 2>/dev/null || true
@@ -375,7 +378,11 @@ for _d in "$SERVER_MOD_DIR"/xfactorvr_bridge_*/; do
 done
 
 # Las expansiones NO pueden estar en el read-data del cliente grafico.
-READ_DATA_DIR="$GAME_DIR/data"
+# El read-data se lee del config.ini (que es el que manda de verdad: el
+# motor deduce sus rutas de ahi), y solo si no se encuentra se usa el
+# arbol del cliente.
+READ_DATA_DIR="$(sed -n 's/^read-data=//p' "$CLIENT_CONFIG" 2>/dev/null | head -1)"
+[ -n "$READ_DATA_DIR" ] || READ_DATA_DIR="$GAME_DIR/data"
 for _exp in space-age quality recycler elevated-rails; do
     if [ -d "$READ_DATA_DIR/$_exp" ]; then
         mkdir -p "$READ_DATA_DIR/_sin_licencia" 2>/dev/null || true

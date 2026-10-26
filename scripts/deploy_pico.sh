@@ -65,9 +65,12 @@ done
 REMOTE_CLIENT="/data/local/tmp/factorio_client"
 REMOTE_MESA="/data/local/tmp/mesa"
 REMOTE_INJECTOR="/data/local/tmp/libxfactorvr_injector.so"
+REMOTE_RESOLVER="/data/local/tmp/libxfactorvr_resolver.so"
+REMOTE_MOD_LIST="/data/local/tmp/mod-list.json"
 LOCAL_CLIENT="$PROJECT_ROOT/factorio_client_arm64/factorio"
 LOCAL_MESA="$PROJECT_ROOT/build/mesa"
 LOCAL_INJECTOR="$PROJECT_ROOT/injector-linux/target/aarch64-unknown-linux-gnu/release/libxfactorvr_injector.so"
+LOCAL_RESOLVER="$PROJECT_ROOT/resolver-linux/target/aarch64-unknown-linux-gnu/release/libxfactorvr_resolver.so"
 
 echo "=== Desplegando XFactorVR en Pico 4 Ultra (modo standalone) ==="
 
@@ -289,6 +292,26 @@ if [ "$MODO_CLIENT" -eq 1 ]; then
     "$ADB" push "$PROJECT_ROOT/scripts/start_factorio_client.sh" "$REMOTE_SCRIPT"
     "$ADB" shell "chmod 755 $REMOTE_SCRIPT"
 fi
+
+# 4 bis. El resolutor de nombres y la lista canonica de mods.
+#
+# El resolutor es el shim que hace de proxy CONNECT y de mini-resolver DNS
+# para el motor (que no tiene /etc/resolv.conf).  Sin el, el servidor
+# multijugador cae al pedir el padlock a auth.factorio.com.
+#
+# La lista de mods tiene que ser LA MISMA en el servidor y en el cliente
+# grafico (y sin expansiones: el cliente grafico exige licencia).  Los dos
+# scripts la leen de /data/local/tmp/mod-list.json.
+echo "[4 bis] Resolutor de nombres y lista canonica de mods..."
+if [ -f "$LOCAL_RESOLVER" ]; then
+    "$ADB" push "$LOCAL_RESOLVER" "$REMOTE_RESOLVER" >/dev/null
+    "$ADB" shell "chmod 755 $REMOTE_RESOLVER" >/dev/null
+    echo "    resolutor: $REMOTE_RESOLVER"
+else
+    echo "    AVISO: sin resolutor compilado ($LOCAL_RESOLVER)."
+fi
+"$ADB" push "$PROJECT_ROOT/scripts/mod-list.json" "$REMOTE_MOD_LIST" >/dev/null
+echo "    lista de mods: $REMOTE_MOD_LIST"
 
 # 5. Mod puente
 # El nombre de la carpeta DEBE coincidir con <nombre>_<version> de info.json

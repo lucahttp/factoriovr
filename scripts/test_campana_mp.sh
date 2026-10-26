@@ -342,6 +342,8 @@ in_container "cat > '$CMDS_A' <<'CMDS'
 /silent-command rcon.print('jugadores='..#game.players)
 /silent-command rcon.print('nombre='..tostring(game.players[1] and game.players[1].name))
 /silent-command rcon.print('nombre='..tostring(game.players[1] and game.players[1].name))
+/silent-command rcon.print('pos='..tostring(game.players[1] and game.players[1].position and game.players[1].position.x)..','..tostring(game.players[1] and game.players[1].position and game.players[1].position.y))
+/silent-command rcon.print('pos='..tostring(game.players[1] and game.players[1].position and game.players[1].position.x)..','..tostring(game.players[1] and game.players[1].position and game.players[1].position.y))
 /silent-command remote.call('xfactorvr', 'get_world_snapshot', 16, 0, 0)
 /silent-command remote.call('xfactorvr', 'get_world_snapshot', 16, 0, 0)
 /silent-command remote.call('xfactorvr', 'teleport_player', 0, 0)
@@ -410,6 +412,45 @@ case "$SNAPSHOT" in
         ;;
     *) fail "el mod puente no devolvio la instantanea del mundo" ;;
 esac
+
+# 4e. el canal de estado POR FICHERO lleva la posicion del jugador.
+# Esto es lo que coloca la mesa del visor: sin esto el visor se queda en
+# (0,0) y pinta un trozo de mapa que no es donde esta la fabrica.
+ESTADO_IN="$FACTORIO_DIR/script-output/xfactorvr_bridge/estado.json"
+if in_container "test -f '$ESTADO_IN'"; then
+    ESTADO="$(in_container "cat '$ESTADO_IN'" | tr -d '\r' | tail -c 200000)"
+    POS_MOD="$(printf '%s' "$ESTADO" | python3 -c "
+import json, sys
+try:
+    d = json.loads(sys.stdin.read())
+except Exception:
+    print(''); raise SystemExit
+j = d.get('jugador') or {}
+print('%s,%s' % (j.get('x'), j.get('y')))
+" 2>/dev/null)"
+    POS_REAL="$(valor_de "/silent-command rcon.print('pos" "$SALIDA_A")"
+    printf '  posicion: RCON=%s  estado.json=%s\n' "${POS_REAL:-?}" "${POS_MOD:-?}"
+    if [ -n "$POS_MOD" ] && [ -n "$POS_REAL" ]; then
+        if printf '%s\n%s\n' "$POS_REAL" "$POS_MOD" | python3 -c "
+import sys
+a = sys.stdin.read().split()
+try:
+    rx, ry = [float(v) for v in a[0].split(',')]
+    mx, my = [float(v) for v in a[1].split(',')]
+except Exception:
+    sys.exit(1)
+sys.exit(0 if abs(rx - mx) <= 2.0 and abs(ry - my) <= 2.0 else 1)
+"; then
+            ok "el estado por fichero lleva la posicion del jugador (la camara del visor)"
+        else
+            fail "el estado por fichero NO lleva la posicion real del jugador"
+        fi
+    else
+        fail "no se pudo leer la posicion del jugador ($POS_REAL / $POS_MOD)"
+    fi
+else
+    fail "el mod no escribio el estado por fichero ($ESTADO_IN)"
+fi
 
 # 4d. el jugador se puede mover e interactuar (lo que pide el final del nivel)
 TELEPORT="$(valor_de "/silent-command remote.call('xfactorvr', 'teleport_player'" "$SALIDA_A")"

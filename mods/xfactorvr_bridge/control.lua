@@ -178,6 +178,13 @@ local START_INVENTORY = {
 }
 
 local function real_player()
+    -- El JUGADOR REAL es el que esta conectado desde el visor (el cliente
+    -- grafico).  Antes solo se miraba game.players[1], que en un servidor
+    -- multijugador puede no ser el del cliente (y si no hay ninguno, se
+    -- quedaba sin camera: el visor pintaba un trozo de mapa equivocado).
+    for _, p in ipairs(game.connected_players) do
+        if p.valid then return p end
+    end
     local p = game.players[1]
     if p and p.valid then return p end
     return nil

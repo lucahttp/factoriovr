@@ -63,7 +63,12 @@ existing_pid() {
         # El propio shell de este script tambien tiene "factorio" en su
         # linea de ordenes: hay que excluirse a si mismo.
         [ "$_p" = "/proc/$$" ] && continue
-        if tr '\0' ' ' < "$_p/cmdline" 2>/dev/null | grep -q "bin/arm64/factorio"; then
+        # OJO: hay que pedir TAMBIEN "--start-server".  El shell que lanza
+        # el cliente tambien tiene "bin/arm64/factorio" en su linea de
+        # ordenes, asi que sin este filtro el script creia que el servidor
+        # estaba vivo cuando solo era el cliente.
+        if tr '\0' ' ' < "$_p/cmdline" 2>/dev/null | grep -q "bin/arm64/factorio" \
+           && tr '\0' ' ' < "$_p/cmdline" 2>/dev/null | grep -q -- "--start-server"; then
             printf '%s' "${_p#/proc/}"
             return 0
         fi

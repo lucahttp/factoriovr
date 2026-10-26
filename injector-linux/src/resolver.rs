@@ -119,6 +119,16 @@ pub fn proceso_principal() -> Option<Proceso> {
         dl_iterate_phdr(callback, &mut estado as *mut Estado as *mut c_void);
     }
 
+    // El mapa de memoria manda: con el linker de glibc (Android) el motor
+    // aparece en la lista de objetos con el nombre vacio, igual que el
+    // linker, y solo el mapa lo distingue.
+    if let Some((base, ruta)) = motor_en_mapa() {
+        return Some(Proceso {
+            load_bias: base,
+            ruta: PathBuf::from(ruta),
+        });
+    }
+
     if estado.base == 0 {
         return None;
     }
@@ -149,6 +159,11 @@ pub fn proceso_principal() -> Option<Proceso> {
 /// mirar la lista de objetos cargados.
 #[cfg(elf_target)]
 pub fn hay_motor_cargado() -> bool {
+    // El mapa de memoria es lo fiable (el motor aparece con su ruta).
+    if motor_en_mapa().is_some() {
+        return true;
+    }
+    // Y la lista de objetos, por si acaso.
     let mut encontrado = false;
     unsafe {
         extern "C" fn callback(info: *mut DlPhdrInfo, _size: usize, data: *mut c_void) -> c_int {
@@ -210,6 +225,54 @@ pub fn lista_cargados() -> Vec<String> {
 #[cfg(not(elf_target))]
 pub fn lista_cargados() -> Vec<String> {
     Vec::new()
+}
+
+/// Busca el motor (el binario de Factorio) en el mapa de memoria del
+/// proceso: devuelve (base, ruta).
+///
+/// Es la forma FIABLE de encontrarlo en Android: alli el motor lo carga el
+/// linker de glibc como programa principal, y un programa principal siempre
+/// aparece en `dl_iterate_phdr` con el nombre VACIO (igual que el linker),
+/// asi que por la lista de objetos no se puede distinguir.  En el mapa de
+/// memoria, en cambio, cada fichero aparece con su ruta.
+#[cfg(elf_target)]
+pub fn motor_en_mapa() -> Option<(u64, String)> {
+    let maps = std::fs::read_to_string("/proc/self/maps").ok()?;
+    let mut base: Option<u64> = None;
+    let mut ruta = String::new();
+    for linea in maps.lines() {
+        let Some((rango, resto)) = linea.split_once(' ') else {
+            continue;
+        };
+        let Some((ini, _fin)) = rango.split_once('-') else {
+            continue;
+        };
+        let Ok(ini) = u64::from_str_radix(ini, 16) else {
+            continue;
+        };
+        // perms offset dev inode [ruta...]
+        let campos: Vec<&str> = resto.split_whitespace().collect();
+        if campos.len() < 5 {
+            continue;
+        }
+        let ruta_fichero = campos[4..].join(" ");
+        if !ruta_fichero.contains("factorio") || ruta_fichero.ends_with(".so") {
+            continue;
+        }
+        let offset = u64::from_str_radix(campos[1], 16).unwrap_or(0);
+        let inicio = ini.saturating_sub(offset);
+        base = Some(match base {
+            Some(b) => b.min(inicio),
+            None => inicio,
+        });
+        ruta = ruta_fichero;
+    }
+    base.map(|b| (b, ruta))
+}
+
+#[cfg(not(elf_target))]
+pub fn motor_en_mapa() -> Option<(u64, String)> {
+    None
 }
 
 /// Simbolo resuelto.

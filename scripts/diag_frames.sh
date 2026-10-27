@@ -13,9 +13,18 @@ set -uo pipefail
 #
 # Uso: bash scripts/diag_frames.sh
 
-ADB="${ADB:-$HOME/Library/Android/platform-tools/adb}"
+ADB="${ADB:-$HOME/Library/Android/sdk/platform-tools/adb}"
 REMOTE="/data/local/tmp"
 MESA="$REMOTE/mesa/usr/lib/aarch64-linux-gnu"
+
+# OJO: la ruta del adb era "$HOME/Library/Android/platform-tools/adb", que NO
+# existe: el SDK esta en "$HOME/Library/Android/sdk".  Con la ruta mala el
+# script SIEMPRE decia "NO VALIDABLE: no hay visor conectado" aunque la Pico
+# estuviese enchufada, y el diagnostico no se podia hacer nunca.
+if [ ! -x "$ADB" ]; then
+    echo "NO VALIDABLE: no hay adb en $ADB"
+    exit 2
+fi
 
 if ! $ADB devices 2>/dev/null | grep -q "device$"; then
     echo "NO VALIDABLE: no hay visor conectado por adb"
@@ -36,19 +45,22 @@ traer_png() {
 
 echo "=== 1. Cliente con TURNIP (el de siempre) ==="
 matar_cliente
-$ADB shell "cd $REMOTE && nohup env XFACTORVR_USE_TURNIP=1 SERVER_ADDR=127.0.0.1 GAME_DIR=$REMOTE/factorio XFACTORVR_3D_CAPTURA=/tmp/frame_turnip.png sh $REMOTE/start_factorio_client.sh > $REMOTE/cli_turnip.log 2>&1 &" >/dev/null 2>&1
+$ADB shell "cd $REMOTE && nohup env XFACTORVR_USE_TURNIP=1 SERVER_ADDR=127.0.0.1 GAME_DIR=$REMOTE/factorio XFACTORVR_3D_CAPTURA=/tmp/frame_turnip.png XFACTORVR_CAPTURA_PANTALLA=/tmp/pantalla_turnip.png XFACTORVR_DIAG_PANTALLA=1 sh $REMOTE/start_factorio_client.sh > $REMOTE/cli_turnip.log 2>&1 &" >/dev/null 2>&1
 sleep 70
-$ADB shell "grep -a 'captura\|frame completo' $REMOTE/cli_turnip.log | tail -2" 2>&1 | sed 's/^/  /'
+$ADB shell "grep -a 'captura\|frame completo\|pantalla vs mundo' $REMOTE/cli_turnip.log | tail -4" 2>&1 | sed 's/^/  /'
 traer_png /tmp/frame_turnip.png /tmp/frame_turnip.png
+traer_png /tmp/pantalla_turnip.png /tmp/pantalla_turnip.png
 
 echo ""
 echo "=== 2. Cliente con LAVAPIPE (Vulkan por software) ==="
 matar_cliente
-$ADB shell "cd $REMOTE && nohup env SERVER_ADDR=127.0.0.1 GAME_DIR=$REMOTE/factorio XFACTORVR_PROXY_PUERTO=8899 XFACTORVR_3D_CAPTURA=/tmp/frame_lvp.png sh $REMOTE/start_factorio_client.sh > $REMOTE/cli_lvp.log 2>&1 &" >/dev/null 2>&1
+$ADB shell "cd $REMOTE && nohup env SERVER_ADDR=127.0.0.1 GAME_DIR=$REMOTE/factorio XFACTORVR_PROXY_PUERTO=8899 XFACTORVR_3D_CAPTURA=/tmp/frame_lvp.png XFACTORVR_CAPTURA_PANTALLA=/tmp/pantalla_lvp.png XFACTORVR_DIAG_PANTALLA=1 sh $REMOTE/start_factorio_client.sh > $REMOTE/cli_lvp.log 2>&1 &" >/dev/null 2>&1
 sleep 70
-$ADB shell "grep -a 'captura\|frame completo' $REMOTE/cli_lvp.log | tail -2" 2>&1 | sed 's/^/  /'
+$ADB shell "grep -a 'captura\|frame completo\|pantalla vs mundo' $REMOTE/cli_lvp.log | tail -4" 2>&1 | sed 's/^/  /'
 traer_png /tmp/frame_lvp.png /tmp/frame_lvp.png
+traer_png /tmp/pantalla_lvp.png /tmp/pantalla_lvp.png
 
 echo ""
-echo "Mira los dos PNG: si el de lavapipe tiene el juego y el de turnip esta"
-echo "negro, el problema es el driver (y la pista es el FBO del mundo)."
+echo "Mira los PNG: frame_* es el FBO del MUNDO y pantalla_* es el FBO 0"
+echo "(la ventana final).  Si el de lavapipe tiene el juego y el de turnip"
+echo "esta negro, el problema es el driver (y la pista es el FBO del mundo)."

@@ -84,6 +84,15 @@ fi
 # El render de verdad lo pone la app OpenXR, que si es nativa de Android.
 VENDOR_VULKAN_DIR="${VENDOR_VULKAN_DIR:-/vendor/lib64/hw}"
 ICD_JSON="$MESA_DIR/adreno_icd.json"
+# Este ICD del fabricante es BIONIC y el cliente es un proceso GLIBC: si se
+# carga, el motor revienta (dos libc en el mismo proceso).  Solo se usa si lo
+# pide el llamante CONCRETAMENTE en ESTA ejecucion.
+#
+# OJO: antes se decidia por la mera EXISTENCIA del fichero JSON.  Ese JSON
+# se queda en el disco (/data/local/tmp/mesa/adreno_icd.json), asi que una
+# ejecucion anterior con XFACTORVR_USE_ADRENO_ICD=1 dejaba el fichero y la
+# siguiente, sin la variable, se colgaba el ICD bionic sin querer.
+USE_FABRICANTE=0
 
 if [ "${XFACTORVR_USE_ADRENO_ICD:-0}" = "1" ]; then
     ICD_SO=""
@@ -107,6 +116,7 @@ if [ "${XFACTORVR_USE_ADRENO_ICD:-0}" = "1" ]; then
     }
 }
 JSON
+        USE_FABRICANTE=1
     else
         log "AVISO: no se encontro un ICD de Vulkan en $VENDOR_VULKAN_DIR"
     fi
@@ -186,7 +196,7 @@ JSON
     export VK_ICD_FILENAMES="$TURNIP_JSON"
     export VK_DRIVER_FILES="$TURNIP_JSON"
     log "turnip (Adreno por KGSL): $TURNIP_SO"
-elif [ -f "$ICD_JSON" ]; then
+elif [ "$USE_FABRICANTE" = "1" ]; then
     export VK_ICD_FILENAMES="$ICD_JSON"
     export VK_DRIVER_FILES="$ICD_JSON"
     log "ICD del fabricante: $ICD_SO"

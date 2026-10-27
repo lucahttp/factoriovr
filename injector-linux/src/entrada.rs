@@ -70,8 +70,14 @@ pub const MAGIC: u32 = 0x4543_4658;
 pub const CABECERA: usize = 7;
 /// Tipo de mensaje: clic del raton.
 pub const TIPO_CLIC: u8 = 1;
+/// Tipo de mensaje: tecla pulsada o soltada.
+pub const TIPO_TECLA: u8 = 2;
+/// Tipo de mensaje: rueda del raton (zoom).
+pub const TIPO_RUEDA: u8 = 3;
+/// Tipo de mensaje: movimiento del raton.
+pub const TIPO_MOVIMIENTO: u8 = 4;
 
-/// Accion del raton.
+/// Accion del raton o tecla.
 pub const ACCION_BAJO: u8 = 1;
 pub const ACCION_ARRIBA: u8 = 2;
 pub const ACCION_CLIC: u8 = 3;
@@ -85,10 +91,15 @@ pub const BOTON_DERECHO: u8 = 3;
 pub const SDL_MOUSEBUTTONDOWN: u32 = 0x0403;
 /// Tipo de evento SDL2 de boton de raton (soltar).
 pub const SDL_MOUSEBUTTONUP: u32 = 0x0404;
+/// Tipo de evento SDL2 de teclado.
+pub const SDL_KEYDOWN: u32 = 0x0300;
+pub const SDL_KEYUP: u32 = 0x0301;
+/// Tipo de evento SDL2 de rueda del raton.
+pub const SDL_MOUSEWHEEL: u32 = 0x0405;
 
-/// Boton pulsado.
+/// Boton o tecla pulsada.
 pub const SDL_PRESSED: u8 = 1;
-/// Boton soltado.
+/// Boton o tecla soltada.
 pub const SDL_RELEASED: u8 = 0;
 
 /// `SDL_Event` es una union; se reserva de mas por si cambia el miembro mayor.
@@ -107,10 +118,33 @@ pub struct Clic {
     pub accion: u8,
 }
 
+/// Un evento de teclado que llega del visor.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Tecla {
+    /// Scancode de SDL2 (p.ej. 26 = W, 4 = A, 22 = S, 7 = D, 8 = E, 20 = Q, 21 = R, 41 = ESC).
+    pub scancode: u16,
+    /// Accion (1 = abajo, 2 = arriba).
+    pub accion: u8,
+}
+
+/// Movimiento de la rueda del raton (zoom).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Rueda {
+    pub x: i16,
+    pub y: i16,
+}
+
+/// Movimiento del raton (sin clic).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Movimiento {
+    pub x: u16,
+    pub y: u16,
+}
+
 /// Funciones de SDL que usa el motor, resueltas por nombre.
 struct Sdl {
-    /// `SDL_SendMouseMotion(SDL_Window*, uint32_t which, int x, int y)`.
-    send_mouse_motion: unsafe extern "C" fn(*mut std::ffi::c_void, u32, i32, i32) -> i32,
+    /// `SDL_SendMouseMotion(SDL_Window*, uint32_t which, int relative, int x, int y)`.
+    send_mouse_motion: unsafe extern "C" fn(*mut std::ffi::c_void, u32, i32, i32, i32) -> i32,
     /// `SDL_GetMouseFocus() -> SDL_Window*`.
     get_mouse_focus: unsafe extern "C" fn() -> *mut std::ffi::c_void,
     /// `SDL_GetWindowID(SDL_Window*) -> Uint32`.
@@ -202,10 +236,85 @@ pub fn analizar_clic(mensaje: &[u8]) -> Option<Clic> {
     })
 }
 
+/// Analiza un mensaje de teclado.
+pub fn analizar_tecla(mensaje: &[u8]) -> Option<Tecla> {
+    if mensaje.len() < CABECERA {
+        return None;
+    }
+    let magic = u32::from_le_bytes([mensaje[0], mensaje[1], mensaje[2], mensaje[3]]);
+    if magic != MAGIC || mensaje[4] != TIPO_TECLA {
+        return None;
+    }
+    let tam = u16::from_le_bytes([mensaje[5], mensaje[6]]) as usize;
+    if mensaje.len() < CABECERA + tam || tam < 3 {
+        return None;
+    }
+    let carga = &mensaje[CABECERA..CABECERA + tam];
+    Some(Tecla {
+        scancode: u16::from_le_bytes([carga[0], carga[1]]),
+        accion: carga[2],
+    })
+}
+
+/// Analiza un mensaje de rueda del raton.
+pub fn analizar_rueda(mensaje: &[u8]) -> Option<Rueda> {
+    if mensaje.len() < CABECERA {
+        return None;
+    }
+    let magic = u32::from_le_bytes([mensaje[0], mensaje[1], mensaje[2], mensaje[3]]);
+    if magic != MAGIC || mensaje[4] != TIPO_RUEDA {
+        return None;
+    }
+    let tam = u16::from_le_bytes([mensaje[5], mensaje[6]]) as usize;
+    if mensaje.len() < CABECERA + tam || tam < 4 {
+        return None;
+    }
+    let carga = &mensaje[CABECERA..CABECERA + tam];
+    Some(Rueda {
+        x: i16::from_le_bytes([carga[0], carga[1]]),
+        y: i16::from_le_bytes([carga[2], carga[3]]),
+    })
+}
+
+/// Analiza un mensaje de movimiento del raton.
+pub fn analizar_movimiento(mensaje: &[u8]) -> Option<Movimiento> {
+    if mensaje.len() < CABECERA {
+        return None;
+    }
+    let magic = u32::from_le_bytes([mensaje[0], mensaje[1], mensaje[2], mensaje[3]]);
+    if magic != MAGIC || mensaje[4] != TIPO_MOVIMIENTO {
+        return None;
+    }
+    let tam = u16::from_le_bytes([mensaje[5], mensaje[6]]) as usize;
+    if mensaje.len() < CABECERA + tam || tam < 4 {
+        return None;
+    }
+    let carga = &mensaje[CABECERA..CABECERA + tam];
+    Some(Movimiento {
+        x: u16::from_le_bytes([carga[0], carga[1]]),
+        y: u16::from_le_bytes([carga[2], carga[3]]),
+    })
+}
+
+pub fn scancode_a_sym(scancode: u16) -> i32 {
+    match scancode {
+        4 => b'a' as i32,
+        7 => b'd' as i32,
+        8 => b'e' as i32,
+        20 => b'q' as i32,
+        21 => b'r' as i32,
+        22 => b's' as i32,
+        26 => b'w' as i32,
+        41 => 27, // SDLK_ESCAPE
+        _ => scancode as i32,
+    }
+}
+
 /// Construye el evento SDL2 de boton de raton.
 ///
 /// El reparto de bytes es el de `SDL_MouseButtonEvent` en SDL2 (64 bits):
-/// tipo, timestamp, windowID, boton, estado, clics, relleno, x, y.
+/// 0..4: type, 4..8: timestamp, 8..12: windowID, 12..16: which,
+/// 16: button, 17: state, 18: clicks, 19: padding, 20..24: x, 24..28: y.
 pub fn evento_boton(
     tipo: u32,
     window_id: u32,
@@ -216,11 +325,59 @@ pub fn evento_boton(
 ) -> [u8; TAM_EVENTO] {
     let mut evento = [0u8; TAM_EVENTO];
     evento[0..4].copy_from_slice(&tipo.to_le_bytes());
-    // 4..8: timestamp (0: el motor no lo usa para el raton)
+    // 4..8: timestamp (0: el motor usa SDL_GetTicks si es necesario)
     evento[8..12].copy_from_slice(&window_id.to_le_bytes());
-    evento[12] = boton;
-    evento[13] = estado;
-    evento[14] = 1; // numero de clics
+    // 12..16: which (0 = mouseID por defecto)
+    evento[16] = boton;
+    evento[17] = estado;
+    evento[18] = 1; // numero de clics
+    evento[20..24].copy_from_slice(&x.to_le_bytes());
+    evento[24..28].copy_from_slice(&y.to_le_bytes());
+    evento
+}
+
+/// Construye el evento SDL2 de movimiento de raton.
+///
+/// 0..4: type (0x0400 = SDL_MOUSEMOTION), 4..8: timestamp, 8..12: windowID,
+/// 12..16: which, 16..20: state (botones pulsados), 20..24: x, 24..28: y,
+/// 28..32: xrel, 32..36: yrel.
+pub fn evento_movimiento(
+    window_id: u32,
+    estado_botones: u32,
+    x: i32,
+    y: i32,
+) -> [u8; TAM_EVENTO] {
+    let mut evento = [0u8; TAM_EVENTO];
+    let tipo = 0x0400u32; // SDL_MOUSEMOTION
+    evento[0..4].copy_from_slice(&tipo.to_le_bytes());
+    evento[8..12].copy_from_slice(&window_id.to_le_bytes());
+    evento[16..20].copy_from_slice(&estado_botones.to_le_bytes());
+    evento[20..24].copy_from_slice(&x.to_le_bytes());
+    evento[24..28].copy_from_slice(&y.to_le_bytes());
+    evento
+}
+
+pub fn evento_tecla(
+    tipo: u32,
+    window_id: u32,
+    scancode: u32,
+    sym: i32,
+    estado: u8,
+) -> [u8; TAM_EVENTO] {
+    let mut evento = [0u8; TAM_EVENTO];
+    evento[0..4].copy_from_slice(&tipo.to_le_bytes());
+    evento[8..12].copy_from_slice(&window_id.to_le_bytes());
+    evento[12] = estado;
+    evento[16..20].copy_from_slice(&scancode.to_le_bytes());
+    evento[20..24].copy_from_slice(&sym.to_le_bytes());
+    evento
+}
+
+pub fn evento_rueda(window_id: u32, x: i32, y: i32) -> [u8; TAM_EVENTO] {
+    let mut evento = [0u8; TAM_EVENTO];
+    let tipo = SDL_MOUSEWHEEL;
+    evento[0..4].copy_from_slice(&tipo.to_le_bytes());
+    evento[8..12].copy_from_slice(&window_id.to_le_bytes());
     evento[16..20].copy_from_slice(&x.to_le_bytes());
     evento[20..24].copy_from_slice(&y.to_le_bytes());
     evento
@@ -228,12 +385,10 @@ pub fn evento_boton(
 
 /// Instala el puente de entrada (resuelve SDL y abre el puerto).
 ///
-/// No hace nada si `XFACTORVR_ENTRADA_PUERTO` no esta definido.
+/// Si `XFACTORVR_ENTRADA_PUERTO` no esta definido, escucha en 27021 por defecto.
 pub fn instalar(simbolos: &Simbolos) {
-    let puerto = match std::env::var("XFACTORVR_ENTRADA_PUERTO") {
-        Ok(v) if !v.is_empty() => v,
-        _ => return,
-    };
+    let puerto = std::env::var("XFACTORVR_ENTRADA_PUERTO")
+        .unwrap_or_else(|_| "27021".to_string());
 
     let send_mouse_motion = match resolver_sdl(simbolos, &["SDL_SendMouseMotion"]) {
         Some(d) => d,
@@ -268,7 +423,7 @@ pub fn instalar(simbolos: &Simbolos) {
     };
 
     let sdl = Sdl {
-        send_mouse_motion: unsafe { std::mem::transmute::<u64, unsafe extern "C" fn(*mut std::ffi::c_void, u32, i32, i32) -> i32>(send_mouse_motion) },
+        send_mouse_motion: unsafe { std::mem::transmute::<u64, unsafe extern "C" fn(*mut std::ffi::c_void, u32, i32, i32, i32) -> i32>(send_mouse_motion) },
         get_mouse_focus: unsafe { std::mem::transmute::<u64, unsafe extern "C" fn() -> *mut std::ffi::c_void>(get_mouse_focus) },
         get_window_id: unsafe { std::mem::transmute::<u64, unsafe extern "C" fn(*mut std::ffi::c_void) -> u32>(get_window_id) },
         get_window_from_id: match get_window_from_id {
@@ -383,7 +538,13 @@ fn atender(mut conexion: TcpStream) {
             }
             let mensaje: Vec<u8> = acumulado.drain(..total).collect();
             if let Some(clic) = analizar_clic(&mensaje) {
-                inyectar(&clic);
+                inyectar_clic(&clic);
+            } else if let Some(tecla) = analizar_tecla(&mensaje) {
+                inyectar_tecla(&tecla);
+            } else if let Some(rueda) = analizar_rueda(&mensaje) {
+                inyectar_rueda(&rueda);
+            } else if let Some(mov) = analizar_movimiento(&mensaje) {
+                inyectar_movimiento(&mov);
             }
         }
         // Si se acumularon demasiados bytes sin un mensaje valido, se limpian.
@@ -393,42 +554,26 @@ fn atender(mut conexion: TcpStream) {
     }
 }
 
-/// Mete el clic en el motor como si fuera el raton.
-fn inyectar(clic: &Clic) {
-    let sdl = match SDL.get() {
-        Some(s) => s,
-        None => return,
-    };
-
-    // De coordenadas de la imagen transmitida a pixeles de la VENTANA del
-    // juego (el raton de SDL vive en coordenadas de ventana, no del framebuffer
-    // del mundo).
-    let origen = match crate::stream::Config::desde_entorno() {
-        Some(c) => (c.ancho, c.alto),
-        None => (0, 0),
-    };
-
-    // --- 1. La ventana del juego ---
-    // (para el windowID del evento y su tamano). Sin foco (tipico en un
-    // servidor X sin gestor de ventanas) se intenta la ventana 1, que suele
-    // ser la del juego.
-    let (ventana, window_id) = unsafe {
+fn obtener_ventana(sdl: &Sdl) -> (*mut std::ffi::c_void, u32) {
+    unsafe {
         let mut ventana = (sdl.get_mouse_focus)();
         if ventana.is_null() {
             ventana = (sdl.get_window_from_id)(1);
         }
-        let id = if ventana.is_null() {
+        let mut id = if ventana.is_null() {
             0
         } else {
             (sdl.get_window_id)(ventana)
         };
+        if id == 0 {
+            id = 1;
+        }
         (ventana, id)
-    };
+    }
+}
 
-    // --- 2. Tamano de destino ---
-    // El del raton de SDL es el de la VENTANA; si no se pudo saber, el del
-    // framebuffer del mundo (que publica la captura del frame).
-    let destino = unsafe {
+fn obtener_destino(sdl: &Sdl, ventana: *mut std::ffi::c_void) -> (u32, u32) {
+    unsafe {
         let mut ww = 0i32;
         let mut wh = 0i32;
         if !ventana.is_null() {
@@ -442,14 +587,32 @@ fn inyectar(clic: &Clic) {
                 VIEWPORT_H.load(Ordering::Relaxed),
             )
         }
+    }
+}
+
+/// Mete el clic en el motor como si fuera el raton.
+fn inyectar_clic(clic: &Clic) {
+    let sdl = match SDL.get() {
+        Some(s) => s,
+        None => return,
     };
+
+    let origen = match crate::stream::Config::desde_entorno() {
+        Some(c) => (c.ancho, c.alto),
+        None => (0, 0),
+    };
+
+    let (ventana, window_id) = obtener_ventana(sdl);
+    let destino = obtener_destino(sdl, ventana);
     let (x, y) = escalar(clic.x, clic.y, origen, destino);
 
     unsafe {
-        // 3. Mover el raton del motor a esa posicion.
-        (sdl.send_mouse_motion)(std::ptr::null_mut(), 0, x, y);
+        // 1. Mover el raton del motor a esa posicion (ventana valida, relative = 0).
+        (sdl.send_mouse_motion)(ventana, 0, 0, x, y);
+        let ev_mov = evento_movimiento(window_id, 0, x, y);
+        (sdl.push_event)(ev_mov.as_ptr() as *const std::ffi::c_void);
 
-        // 4. Mandar el boton.
+        // 2. Mandar el boton con los offsets exactos de SDL_MouseButtonEvent.
         let evento = match clic.accion {
             ACCION_BAJO => Some(evento_boton(
                 SDL_MOUSEBUTTONDOWN,
@@ -498,6 +661,60 @@ fn inyectar(clic: &Clic) {
         "entrada: clic #{n} en ({x},{y}) boton={} accion={}",
         clic.boton, clic.accion
     ));
+}
+
+fn inyectar_tecla(tecla: &Tecla) {
+    let sdl = match SDL.get() {
+        Some(s) => s,
+        None => return,
+    };
+    let (_, window_id) = obtener_ventana(sdl);
+    let (tipo, estado) = if tecla.accion == ACCION_BAJO {
+        (SDL_KEYDOWN, SDL_PRESSED)
+    } else {
+        (SDL_KEYUP, SDL_RELEASED)
+    };
+    let sym = scancode_a_sym(tecla.scancode);
+    let ev = evento_tecla(tipo, window_id, tecla.scancode as u32, sym, estado);
+    unsafe {
+        (sdl.push_event)(ev.as_ptr() as *const std::ffi::c_void);
+    }
+    log::info(&format!(
+        "entrada: tecla scancode={} accion={} (sym={})",
+        tecla.scancode, tecla.accion, sym
+    ));
+}
+
+fn inyectar_rueda(rueda: &Rueda) {
+    let sdl = match SDL.get() {
+        Some(s) => s,
+        None => return,
+    };
+    let (_, window_id) = obtener_ventana(sdl);
+    let ev = evento_rueda(window_id, rueda.x as i32, rueda.y as i32);
+    unsafe {
+        (sdl.push_event)(ev.as_ptr() as *const std::ffi::c_void);
+    }
+    log::info(&format!("entrada: rueda dx={} dy={}", rueda.x, rueda.y));
+}
+
+fn inyectar_movimiento(mov: &Movimiento) {
+    let sdl = match SDL.get() {
+        Some(s) => s,
+        None => return,
+    };
+    let origen = match crate::stream::Config::desde_entorno() {
+        Some(c) => (c.ancho, c.alto),
+        None => (0, 0),
+    };
+    let (ventana, window_id) = obtener_ventana(sdl);
+    let destino = obtener_destino(sdl, ventana);
+    let (x, y) = escalar(mov.x, mov.y, origen, destino);
+    unsafe {
+        (sdl.send_mouse_motion)(ventana, 0, 0, x, y);
+        let ev_mov = evento_movimiento(window_id, 0, x, y);
+        (sdl.push_event)(ev_mov.as_ptr() as *const std::ffi::c_void);
+    }
 }
 
 #[cfg(test)]
@@ -552,9 +769,33 @@ mod tests {
         let e = evento_boton(SDL_MOUSEBUTTONDOWN, 7, BOTON_IZQUIERDO, SDL_PRESSED, 320, 180);
         assert_eq!(&e[0..4], &SDL_MOUSEBUTTONDOWN.to_le_bytes());
         assert_eq!(&e[8..12], &7u32.to_le_bytes());
-        assert_eq!(e[12], BOTON_IZQUIERDO);
-        assert_eq!(e[13], SDL_PRESSED);
-        assert_eq!(&e[16..20], &320i32.to_le_bytes());
-        assert_eq!(&e[20..24], &180i32.to_le_bytes());
+        assert_eq!(e[16], BOTON_IZQUIERDO);
+        assert_eq!(e[17], SDL_PRESSED);
+        assert_eq!(e[18], 1);
+        assert_eq!(&e[20..24], &320i32.to_le_bytes());
+        assert_eq!(&e[24..28], &180i32.to_le_bytes());
+    }
+
+    #[test]
+    fn analiza_tecla_y_rueda() {
+        let mut m_t = Vec::new();
+        m_t.extend_from_slice(&MAGIC.to_le_bytes());
+        m_t.push(TIPO_TECLA);
+        m_t.extend_from_slice(&3u16.to_le_bytes());
+        m_t.extend_from_slice(&26u16.to_le_bytes()); // W
+        m_t.push(ACCION_BAJO);
+        let t = analizar_tecla(&m_t).expect("deberia analizar tecla");
+        assert_eq!(t.scancode, 26);
+        assert_eq!(t.accion, ACCION_BAJO);
+
+        let mut m_r = Vec::new();
+        m_r.extend_from_slice(&MAGIC.to_le_bytes());
+        m_r.push(TIPO_RUEDA);
+        m_r.extend_from_slice(&4u16.to_le_bytes());
+        m_r.extend_from_slice(&0i16.to_le_bytes());
+        m_r.extend_from_slice(&1i16.to_le_bytes()); // Rueda arriba
+        let r = analizar_rueda(&m_r).expect("deberia analizar rueda");
+        assert_eq!(r.x, 0);
+        assert_eq!(r.y, 1);
     }
 }

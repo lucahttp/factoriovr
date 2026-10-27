@@ -44,13 +44,28 @@ case "${1:-iniciar}" in
         echo "instalando la imagen desde $ZIP..."
         mkdir -p "$DEST"
         ( cd "$DEST" && unzip -q -o "$ZIP" )
-        # El zip trae "aosp_atd/arm64-v8a/".  Se comprueba.
-        if [ ! -d "$DEST/aosp_atd/arm64-v8a" ]; then
-            echo "el zip no ha dejado aosp_atd/arm64-v8a en $DEST:" >&2
-            ls -la "$DEST" >&2
+        # El zip de la imagen de ATD trae "arm64-v8a/" en la raiz (sin la
+        # carpeta "aosp_atd"), pero el emulador la busca en
+        # system-images/android-33/aosp_atd/arm64-v8a/.
+        #
+        # OJO: la carpeta destino puede YA existir vacia (la deja el
+        # sdkmanager cuando se corta a medias), asi que no vale con "si no
+        # existe, mover": hay que VACIARLA y meter el contenido dentro.
+        if [ -d "$DEST/arm64-v8a" ]; then
+            mkdir -p "$DEST/aosp_atd/arm64-v8a"
+            for f in "$DEST/arm64-v8a"/*; do
+                [ -e "$f" ] || continue
+                mv "$f" "$DEST/aosp_atd/arm64-v8a/"
+            done
+            rmdir "$DEST/arm64-v8a" 2>/dev/null || true
+        fi
+        if [ ! -f "$DEST/aosp_atd/arm64-v8a/system.img" ]; then
+            echo "la imagen no ha quedado bien en $DEST/aosp_atd/arm64-v8a:" >&2
+            ls -la "$DEST/aosp_atd/arm64-v8a" >&2
             exit 1
         fi
         echo "imagen instalada en $DEST/aosp_atd/arm64-v8a"
+        ls "$DEST/aosp_atd/arm64-v8a" | head
         ;;
     crear_avd)
         # Crea el AVD a mano, sin avdmanager: avdmanager exige que el paquete

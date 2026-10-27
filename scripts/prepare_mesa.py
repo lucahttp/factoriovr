@@ -138,7 +138,10 @@ ESPERADOS = [
     "usr/lib/aarch64-linux-gnu/libvulkan_lvp.so",
     # OpenGL ES 2.0 de Mesa (para el driver "offscreen" de SDL2).
     "usr/lib/aarch64-linux-gnu/libGLESv2.so.2",
-    "usr/share/vulkan/icd.d/lvp_icd.aarch64.json",
+    # OJO: el ICD de lavapipe de Ubuntu se llama "lvp_icd.json" (sin sufijo de
+    # arquitectura).  El que trae el Mesa de contenedores es el
+    # "lvp_icd.aarch64.json".  Se comprueba aparte (AL_MENOS_UNO), porque solo
+    # hace falta uno de los dos.
     # El linker de glibc (Debian lo deja en /lib).
     # La glibc no va en este payload: la aporta el runtime del visor
     # (prepare_glibc.sh), que es mas nueva y no choca con el motor grafico.
@@ -150,6 +153,14 @@ ESPERADOS = [
     "usr/lib/aarch64-linux-gnu/libLLVM.so.20.1",
     # El manifiesto de glvnd: sin el, el despachador no encuentra al vendor.
     "usr/share/glvnd/egl_vendor.d/50_mesa.json",
+]
+
+# Grupos en los que basta con que exista UNO de los ficheros.  El ICD de
+# lavapipe lo llama Ubuntu "lvp_icd.json" y el Mesa de contenedores
+# "lvp_icd.aarch64.json".
+AL_MENOS_UNO = [
+    ("usr/share/vulkan/icd.d/lvp_icd.json",
+     "usr/share/vulkan/icd.d/lvp_icd.aarch64.json"),
 ]
 
 
@@ -363,6 +374,33 @@ def podar_alias_dri(out):
                 pass
     if reemplazados:
         log(f"Convertidos {reemplazados} alias del megadriver en enlaces simbolicos")
+
+    # 3. El megadriver de Ubuntu (25.2) llega con los drivers como enlaces
+    #    simbolicos a "libdril_dri.so" (zink_dri.so -> libdril_dri.so).  El
+    #    paso 1 de esta misma funcion BORRA todos los enlaces simbolicos (para
+    #    limpiar los rotos de una ronda anterior), asi que se lleva por
+    #    delante justamente los nombres que Mesa necesita para elegir driver:
+    #    sin "zink_dri.so" no hay Zink y el cliente grafico no abre contexto.
+    #    Se vuelven a crear los nombres que importan.
+    reales = [f for f in os.listdir(dri)
+              if os.path.isfile(os.path.join(dri, f))
+              and not os.path.islink(os.path.join(dri, f))]
+    if not reales:
+        return reemplazados
+    destino_real = "zink_dri.so" if "zink_dri.so" in reales else reales[0]
+    creados = 0
+    for nombre in ("zink_dri.so", "swrast_dri.so"):
+        p = os.path.join(dri, nombre)
+        if os.path.lexists(p):
+            continue
+        try:
+            os.symlink(destino_real, p)
+            creados += 1
+        except OSError:
+            pass
+    if creados:
+        log(f"Recreados {creados} nombres del megadriver "
+            f"(zink_dri.so / swrast_dri.so -> {destino_real})")
     return reemplazados
 
 
@@ -635,6 +673,14 @@ def main():
     ap.add_argument("--tar", default="build/mesa.tar.gz",
                     help="ruta del .tar.gz que se genera (por defecto "
                          "build/mesa.tar.gz)")
+    ap.add_argument("--sin-contenedor", action="store_true",
+                    help="no superponer el Mesa de contenedores (26.3.0-devel) "
+                         "sobre el de Ubuntu.  El Mesa de contenedores trae "
+                         "zink/gallium de la 26.3.0 pero NO trae lavapipe, que "
+                         "si viene de Ubuntu: el resultado es un zink 26.3 "
+                         "hablando con un lavapipe 25.2, y Zink rechaza el "
+                         "dispositivo con 'failed to choose pdev' (el cliente "
+                         "muerte con 'Could not find a valid EGL device').")
     args = ap.parse_args()
 
     raiz = os.path.abspath(os.path.dirname(os.path.dirname(__file__)))
@@ -676,12 +722,16 @@ def main():
     log("Quitando la glibc de Debian (la del visor es mas nueva)...")
     podar_glibc_debian(out)
 
-    log("Superponiendo el Mesa de contenedores en Android...")
-    try:
-        aplicar_mesa_contenedor(out, cache)
-    except Exception as exc:  # noqa: BLE001
-        log(f"  AVISO: no se pudo aplicar el Mesa de contenedores: {exc}")
-        log("  Sin el, el cliente grafico NO abre contexto EGL en el visor.")
+    if args.sin_contenedor:
+        log("Omitiendo el Mesa de contenedores (--sin-contenedor):")
+        log("  el payload se queda con el Mesa de Ubuntu, todo de la misma version.")
+    else:
+        log("Superponiendo el Mesa de contenedores en Android...")
+        try:
+            aplicar_mesa_contenedor(out, cache)
+        except Exception as exc:  # noqa: BLE001
+            log(f"  AVISO: no se pudo aplicar el Mesa de contenedores: {exc}")
+            log("  Sin el, el cliente grafico NO abre contexto EGL en el visor.")
 
     log("")
     log("Comprobando los ficheros clave:")
@@ -693,6 +743,17 @@ def main():
         log(f"  {'OK     ' if ok else 'AUSENTE'} {rel}  ({tam/1e6:.1f} MB)")
         if not ok:
             faltan.append(rel)
+
+    # El ICD de lavapipe: vale cualquiera de los dos nombres (el de Ubuntu y
+    # el del Mesa de contenedores).  El cliente reescribe el JSON con la ruta
+    # del dispositivo, asi que solo importa que la libreria este.
+    for grupo in AL_MENOS_UNO:
+        presentes = [g for g in grupo if os.path.exists(os.path.join(out, g))]
+        if presentes:
+            log(f"  OK      ICD de lavapipe: {presentes[0]}")
+        else:
+            log(f"  AUSENTE ICD de lavapipe (vale cualquiera de: {', '.join(grupo)})")
+            faltan.append(grupo[0])
 
     log("")
     log("Comprobando las dependencias de las librerias criticas:")

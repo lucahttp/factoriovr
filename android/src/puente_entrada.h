@@ -86,15 +86,33 @@ constexpr size_t PUENTE_ENTRADA_MAX_PENDIENTES = 32;
 
 // Valor magico del protocolo XFCE, en little-endian ("XFCE").
 constexpr uint32_t PUENTE_ENTRADA_MAGIC = 0x45434658u;
-// Tipo de mensaje: clic.
+// Tipos de mensaje del protocolo.
 constexpr uint8_t PUENTE_ENTRADA_TIPO_CLIC = 1;
-// Bytes de la carga de un clic.
+constexpr uint8_t PUENTE_ENTRADA_TIPO_TECLA = 2;
+constexpr uint8_t PUENTE_ENTRADA_TIPO_RUEDA = 3;
+constexpr uint8_t PUENTE_ENTRADA_TIPO_MOVIMIENTO = 4;
+
+// Bytes de la carga por tipo.
 constexpr uint16_t PUENTE_ENTRADA_TAMANO_CARGA = 6;
+constexpr uint16_t PUENTE_ENTRADA_TAMANO_CARGA_CLIC = 6;
+constexpr uint16_t PUENTE_ENTRADA_TAMANO_CARGA_TECLA = 4;
+constexpr uint16_t PUENTE_ENTRADA_TAMANO_CARGA_RUEDA = 4;
+constexpr uint16_t PUENTE_ENTRADA_TAMANO_CARGA_MOV = 4;
+
+// Scancodes comunes de SDL2 para Factorio
+constexpr uint16_t KEY_A = 4;
+constexpr uint16_t KEY_D = 7;
+constexpr uint16_t KEY_E = 8;
+constexpr uint16_t KEY_Q = 20;
+constexpr uint16_t KEY_R = 21;
+constexpr uint16_t KEY_S = 22;
+constexpr uint16_t KEY_W = 26;
+constexpr uint16_t KEY_ESC = 41;
 
 // Acciones del protocolo.
 enum Accion : uint8_t {
-    kAccionAbajo = 1,   // bajar el boton
-    kAccionArriba = 2,  // soltar el boton
+    kAccionAbajo = 1,   // bajar el boton / pulsar tecla
+    kAccionArriba = 2,  // soltar el boton / soltar tecla
     kAccionClic = 3     // clic completo (no recomendado: ver arriba)
 };
 
@@ -105,11 +123,11 @@ enum Boton : uint8_t {
     kBotonDerecho = 3
 };
 
-// Arma (byte a byte) el mensaje XFCE de un clic. Funcion PURA: no toca red ni
-// estado, facil de testear.
-// x e y se ajustan al rango 0..65535 (16 bits); boton se deja 1..3 y accion
-// 1..3; valores fuera de rango se recortan al valor valido mas cercano.
+// Arma (byte a byte) mensajes XFCE. Funciones PURAS: no tocan red ni estado.
 std::vector<uint8_t> puente_entrada_arma_clic(int x, int y, int boton, int accion);
+std::vector<uint8_t> puente_entrada_arma_tecla(uint16_t scancode, int accion);
+std::vector<uint8_t> puente_entrada_arma_rueda(int dx, int dy);
+std::vector<uint8_t> puente_entrada_arma_movimiento(int x, int y);
 
 // Arranca el puente de entrada. Crea el socket de forma NO bloqueante y
 // lanza el hilo de red, que es el que se encarga de conectar y reconectar.
@@ -126,12 +144,16 @@ void puente_entrada_cerrar();
 bool puente_entrada_conectado();
 
 // Envia un clic por el puente de entrada.
-// Devuelve true si el mensaje se ha ACCEPTADO (mandado por el socket o
-// metido en la cola de pendientes); devuelve false si no hay conexion y la
-// cola esta llena (el clic se pierde), o si el modulo no esta iniciado.
-// Si el socket se cae justo al mandar, el mensaje se queda en la cola y el
-// hilo de red lo reintenta cuando vuelva a conectar. NO bloquea al llamante.
 bool puente_entrada_clic(int x, int y, int boton, int accion);
+
+// Envia una pulsacion o soltura de tecla (scancode de SDL2).
+bool puente_entrada_tecla(uint16_t scancode, int accion);
+
+// Envia movimiento de la rueda del raton (zoom in/out en Factorio).
+bool puente_entrada_rueda(int dx, int dy);
+
+// Envia movimiento del cursor del raton (sin clic).
+bool puente_entrada_movimiento(int x, int y);
 
 // FLUJO ARMAR-SOLTAR (recomendado).
 // "arma" manda accion=1 (abajo) y recuerda la posicion; "suelta" manda
@@ -162,6 +184,15 @@ inline void puente_entrada_cerrar() { xfv::puente_entrada_cerrar(); }
 inline bool puente_entrada_conectado() { return xfv::puente_entrada_conectado(); }
 inline bool puente_entrada_clic(int x, int y, int boton, int accion) {
     return xfv::puente_entrada_clic(x, y, boton, accion);
+}
+inline bool puente_entrada_tecla(uint16_t scancode, int accion) {
+    return xfv::puente_entrada_tecla(scancode, accion);
+}
+inline bool puente_entrada_rueda(int dx, int dy) {
+    return xfv::puente_entrada_rueda(dx, dy);
+}
+inline bool puente_entrada_movimiento(int x, int y) {
+    return xfv::puente_entrada_movimiento(x, y);
 }
 inline const char* puente_entrada_ultimo_error() { return xfv::puente_entrada_ultimo_error(); }
 inline std::vector<uint8_t> xfv_arma_clic(int x, int y, int boton, int accion) {

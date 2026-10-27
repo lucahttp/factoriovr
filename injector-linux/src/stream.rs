@@ -84,9 +84,9 @@ impl Config {
         };
         Some(Config {
             destino,
-            ancho: env_u32("XFACTORVR_STREAM_ANCHO", 640),
-            alto: env_u32("XFACTORVR_STREAM_ALTO", 360),
-            fps: env_u32("XFACTORVR_STREAM_FPS", 15),
+            ancho: env_u32("XFACTORVR_STREAM_ANCHO", 1280),
+            alto: env_u32("XFACTORVR_STREAM_ALTO", 720),
+            fps: env_u32("XFACTORVR_STREAM_FPS", 30),
         })
     }
 }
@@ -183,6 +183,8 @@ fn hilo_emisor(destino: &str, rx: Receiver<Vec<u8>>) {
             match TcpStream::connect(destino) {
                 Ok(s) => {
                     let _ = s.set_nodelay(true);
+                    let _ = s.set_write_timeout(Some(Duration::from_millis(150)));
+                    let _ = s.set_read_timeout(Some(Duration::from_millis(150)));
                     log::info(&format!("visor conectado en {destino}"));
                     conexion = Some(s);
                 }

@@ -458,6 +458,9 @@ type GlReadPixels = unsafe extern "C" fn(
 type GlPixelStorei = unsafe extern "C" fn(pname: u32, param: i32);
 type GlFinish = unsafe extern "C" fn();
 type GlGetString = unsafe extern "C" fn(name: u32) -> *const u8;
+/// `glCheckFramebufferStatus`: dice si un framebuffer esta COMPLETO (se puede
+/// leer de el) o por que no.
+type GlCheckFramebufferStatus = unsafe extern "C" fn(target: u32) -> u32;
 
 // Codigos de GL usados.
 const GL_NO_ERROR: u32 = 0;
@@ -484,11 +487,12 @@ const GL_VERSION: u32 = 0x1F02;
 const GL_RENDERER: u32 = 0x1F01;
 const GL_VIEWPORT: u32 = 0x0BA2;
 const GL_UNPACK_ALIGNMENT: u32 = 0x0CF5;
+const GL_PACK_ALIGNMENT: u32 = 0x0D05;
 /// Framebuffer de dibujado actualmente enlazado.
 const GL_DRAW_FRAMEBUFFER_BINDING: u32 = 0x8CA6;
 const GL_READ_FRAMEBUFFER_BINDING: u32 = 0x8CAA;
 /// Objetivo de `glBindFramebuffer` para elegir solo el framebuffer de lectura.
-const GL_READ_FRAMEBUFFER: u32 = 0x8CAA;
+const GL_READ_FRAMEBUFFER: u32 = 0x8CA8;
 /// Objetivo de `glBindFramebuffer` para elegir solo el framebuffer de dibujo.
 const GL_DRAW_FRAMEBUFFER: u32 = 0x8CA9;
 /// Vertex array actualmente enlazado.
@@ -497,6 +501,8 @@ const GL_VERTEX_ARRAY_BINDING: u32 = 0x85B5;
 const GL_ARRAY_BUFFER_BINDING: u32 = 0x8894;
 /// Numero de muestras del framebuffer (multisampling).
 const GL_SAMPLES: u32 = 0x80A9;
+/// El framebuffer esta completo: se puede leer de el.
+const GL_FRAMEBUFFER_COMPLETE: u32 = 0x8CD5;
 
 /// Punteros a las funciones GL del motor.
 ///
@@ -535,6 +541,7 @@ struct Gl {
     pixel_storei: GlPixelStorei,
     finish: GlFinish,
     get_string: GlGetString,
+    check_framebuffer_status: Option<GlCheckFramebufferStatus>,
 }
 
 /// Direcciones de las variables globales del motor que guardan los punteros a
@@ -716,6 +723,42 @@ fn resolver_gl(simbolos: &resolver::Simbolos) -> Option<GlAddr> {
     })
 }
 
+/// Direccion de `SDL_GL_GetProcAddress` del motor (para cargar extensiones GL en runtime).
+static SDL_GET_PROC_ADDRESS: AtomicUsize = AtomicUsize::new(0);
+
+/// Resuelve un simbolo de OpenGL en tiempo de ejecucion usando SDL_GL_GetProcAddress
+/// o dlsym.
+pub fn resolver_proc_gl(nombre: &str) -> *mut c_void {
+    let mut c_nombre = Vec::with_capacity(nombre.len() + 1);
+    c_nombre.extend_from_slice(nombre.as_bytes());
+    c_nombre.push(0);
+
+    let get_proc = SDL_GET_PROC_ADDRESS.load(Ordering::Relaxed);
+    if get_proc != 0 {
+        let f: unsafe extern "C" fn(*const std::os::raw::c_char) -> *mut c_void =
+            unsafe { std::mem::transmute(get_proc) };
+        let ptr = unsafe { f(c_nombre.as_ptr() as *const std::os::raw::c_char) };
+        if !ptr.is_null() {
+            return ptr;
+        }
+    }
+    unsafe {
+        extern "C" {
+            fn dlsym(handle: *mut c_void, symbol: *const std::os::raw::c_char) -> *mut c_void;
+        }
+        dlsym(std::ptr::null_mut(), c_nombre.as_ptr() as *const std::os::raw::c_char)
+    }
+}
+
+/// Consulta si el framebuffer enlazado a `target` esta completo para lectura/dibujo.
+fn check_fb_status(gl: &Gl, target: u32) -> u32 {
+    if let Some(f) = gl.check_framebuffer_status {
+        unsafe { f(target) }
+    } else {
+        GL_FRAMEBUFFER_COMPLETE
+    }
+}
+
 /// Construye los punteros a las funciones GL leyendo las variables globales.
 ///
 /// Se llama en el primer frame con contexto GL, cuando GLAD ya ha cargado los
@@ -737,6 +780,16 @@ fn construir_gl(dir: &GlAddr) -> Option<Gl> {
             unsafe { core::mem::transmute(v) }
         }};
     }
+
+    let check_framebuffer_status: Option<GlCheckFramebufferStatus> = {
+        let ptr = resolver_proc_gl("glCheckFramebufferStatus");
+        if !ptr.is_null() {
+            Some(unsafe { core::mem::transmute(ptr) })
+        } else {
+            None
+        }
+    };
+
     Some(Gl {
         get_integerv: ptr!(get_integerv),
         get_error: ptr!(get_error),
@@ -768,6 +821,7 @@ fn construir_gl(dir: &GlAddr) -> Option<Gl> {
         pixel_storei: ptr!(pixel_storei),
         finish: ptr!(finish),
         get_string: ptr!(get_string),
+        check_framebuffer_status,
     })
 }
 
@@ -1071,6 +1125,10 @@ pub extern "C" fn xfv_hook_take_screenshots(
 type HookBlitTo =
     unsafe extern "C" fn(*mut c_void, *mut c_void, i32, i32, i32, i32, i32, i32);
 
+/// Framebuffers de destino y origen del ultimo blit del motor (donde se compone el GUI).
+static ULTIMO_FB_BLIT_DESTINO: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+static ULTIMO_FB_BLIT_ORIGEN: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
 #[no_mangle]
 pub extern "C" fn xfv_hook_blit_to(
     this: *mut c_void,
@@ -1082,6 +1140,16 @@ pub extern "C" fn xfv_hook_blit_to(
     e: i32,
     f: i32,
 ) {
+    if let Some(gl) = GL.get() {
+        let fb_dib = gl_int(gl, GL_DRAW_FRAMEBUFFER_BINDING) as u32;
+        let fb_lec = gl_int(gl, GL_READ_FRAMEBUFFER_BINDING) as u32;
+        if fb_dib != 0 {
+            ULTIMO_FB_BLIT_DESTINO.store(fb_dib, Ordering::Relaxed);
+        }
+        if fb_lec != 0 {
+            ULTIMO_FB_BLIT_ORIGEN.store(fb_lec, Ordering::Relaxed);
+        }
+    }
     // El framebuffer ACTIVO en este momento es el que se va a blitear.
     capturar_gui_si_pide();
     let tramp = TRAMPOLIN_BLIT.load(Ordering::SeqCst);
@@ -1796,57 +1864,89 @@ fn leer_pixeles(gl: &Gl, w: i32, h: i32, buf: &mut [u8]) {
 }
 
 
-/// Captura el frame COMPLETO y lo manda al visor.
-///
-/// Se llama al principio del frame siguiente: en ese momento el framebuffer
-/// del mundo todavia tiene el frame anterior COMPLETO (el motor lo vacia
-/// despues, cuando empieza a dibujar el siguiente).  Leyendolo en el flush
-/// era un error: el motor dibuja el mundo por trozos y muchas capturas
-/// salian a medio dibujar (el 40 % de los frames).
-///
-/// El ojo es el del frame que se esta capturando (el contador de frames se
-/// incrementa DESPUES de esta llamada).
-pub fn capturar_frame_completo() {
-    // El diagnostico de capas se volca SIEMPRE (aunque no se este
-    // transmitiendo nada): es lo que dice que capa usa el GUI.
+/// Invierte las filas de un buffer RGBA en su sitio (de OpenGL a coordenadas estandar).
+fn voltear_filas_rgba(buf: &mut [u8], w: usize, h: usize) {
+    if w == 0 || h <= 1 {
+        return;
+    }
+    let stride = w * 4;
+    if buf.len() < stride * h {
+        return;
+    }
+    let mitad = h / 2;
+    for y in 0..mitad {
+        let opuesto = h - 1 - y;
+        let fila_a = y * stride;
+        let fila_b = opuesto * stride;
+        let (primera, segunda) = buf.split_at_mut(fila_b);
+        primera[fila_a..fila_a + stride].swap_with_slice(&mut segunda[..stride]);
+    }
+}
+
+/// Captura el frame final COMPLETO (Mundo + GUI nativa) justo en el cierre
+/// del frame (hook de swap) y lo transmite al visor VR.
+pub fn capturar_frame_final() {
     volcar_capas();
     if !crate::stream::toca_enviar() {
         return;
     }
-    let fb = FB_MUNDO.load(Ordering::Relaxed) as u32;
-    if fb == 0 {
-        return;
-    }
+
+    preparar_gl();
     let gl = match GL.get() {
         Some(g) => g,
         None => return,
     };
 
-    // El ancho y el alto del framebuffer del mundo.
-    let mut vp = [0i32; 4];
-    unsafe { (gl.get_integerv)(GL_VIEWPORT, vp.as_mut_ptr()) };
-    let w = vp[2];
-    let h = vp[3];
-    if w <= 0 || h <= 0 || w > 4096 || h > 4096 {
+    // Guardar los framebuffers actuales antes de que toquemos nada
+    let fb_dibujo = gl_int(gl, GL_DRAW_FRAMEBUFFER_BINDING) as u32;
+    let fb_lectura = gl_int(gl, GL_READ_FRAMEBUFFER_BINDING) as u32;
+
+    drenar_errores(gl, "antes de capturar frame final");
+
+    let blit_dst = ULTIMO_FB_BLIT_DESTINO.load(Ordering::Relaxed);
+    let blit_src = ULTIMO_FB_BLIT_ORIGEN.load(Ordering::Relaxed);
+    let fb_mundo = FB_MUNDO.load(Ordering::Relaxed) as u32;
+
+    // Candidatos a leer, en orden de preferencia:
+    // 1. fb_dibujo: donde el motor ha compuesto el frame final antes de swap
+    // 2. fb_lectura: si hay un FBO de lectura activo
+    // 3. blit_dst: FBO destino del ultimo blitTo (GUI)
+    // 4. blit_src: FBO origen del ultimo blitTo
+    // 5. 0: default framebuffer (ventana / pantalla)
+    // 6. fb_mundo: fallback si nada mas funciona
+    let candidatos = [fb_dibujo, fb_lectura, blit_dst, blit_src, 0, fb_mundo];
+
+    let mut fb_elegido: Option<(u32, i32, i32)> = None;
+    for &candidato in &candidatos {
+        unsafe {
+            (gl.bind_framebuffer)(GL_READ_FRAMEBUFFER, candidato);
+        }
+        let estado = check_fb_status(gl, GL_READ_FRAMEBUFFER);
+        if estado != GL_FRAMEBUFFER_COMPLETE {
+            continue;
+        }
+
+        let mut vp = [0i32; 4];
+        unsafe { (gl.get_integerv)(GL_VIEWPORT, vp.as_mut_ptr()) };
+        let w = vp[2];
+        let h = vp[3];
+        if w >= 64 && h >= 64 && w <= 4096 && h <= 4096 {
+            fb_elegido = Some((candidato, w, h));
+            break;
+        }
+    }
+
+    let Some((fb, w, h)) = fb_elegido else {
+        unsafe {
+            (gl.bind_framebuffer)(GL_DRAW_FRAMEBUFFER, fb_dibujo);
+            (gl.bind_framebuffer)(GL_READ_FRAMEBUFFER, fb_lectura);
+        }
         return;
-    }
+    };
 
-    // El tamano real del framebuffer: lo necesita el puente de entrada para
-    // pasar los pixeles del visor a pixeles del motor (ver docs/ADR-013).
-    crate::entrada::fijar_viewport(w as u32, h as u32);
-
-    // Guardar los framebuffers que hay puestos y leer del del mundo.
-    let fb_dibujo = gl_int(gl, GL_DRAW_FRAMEBUFFER_BINDING);
-    let fb_lectura = gl_int(gl, GL_READ_FRAMEBUFFER_BINDING);
-    unsafe {
-        (gl.bind_framebuffer)(GL_DRAW_FRAMEBUFFER, fb);
-        (gl.bind_framebuffer)(GL_READ_FRAMEBUFFER, fb);
-    }
-
-    // Los errores de GL son PEGAJOSOS: puede haber alguno de antes (del
-    // propio motor).  Se limpian antes de leer, para no atribuirlos a la
-    // lectura.
-    drenar_errores(gl, "antes de leer el frame");
+    let mut fb_final = fb;
+    let mut w_final = w;
+    let mut h_final = h;
 
     let bytes = (w as usize) * (h as usize) * 4;
     thread_local! {
@@ -1858,45 +1958,104 @@ pub fn capturar_frame_completo() {
             buf.clear();
             buf.resize(bytes, 0);
         }
-        leer_pixeles(gl, w, h, &mut buf);
-        // Se devuelven los framebuffers como estaban.
+
         unsafe {
-            (gl.bind_framebuffer)(GL_DRAW_FRAMEBUFFER, fb_dibujo as u32);
-            (gl.bind_framebuffer)(GL_READ_FRAMEBUFFER, fb_lectura as u32);
-        }
-        if drenar_errores(gl, "leer el frame completo") {
-            // El frame se manda igual: puede que la lectura haya valido y el
-            // error sea de otra cosa (y perder el frame es peor).
-            log::aviso("hubo un error de GL al leer el frame (se manda igualmente)");
-        }
-        // DIAGNOSTICO: el framebuffer del MUNDO frente a la PANTALLA (FBO 0).
-        //
-        // El motor dibuja el mundo en su framebuffer y compone el GUI
-        // (hotbar, minimapa) en la pantalla.  Comparando los dos se ve si
-        // el GUI esta en la pantalla (pixels que difieren) y donde.
-        if std::env::var("XFACTORVR_DIAG_PANTALLA").ok().as_deref() == Some("1") {
-            comparar_con_la_pantalla(gl, &buf, w, h);
+            (gl.pixel_storei)(GL_PACK_ALIGNMENT, 1);
+            (gl.read_pixels)(
+                0,
+                0,
+                w,
+                h,
+                GL_RGBA,
+                GL_UNSIGNED_BYTE,
+                buf.as_mut_ptr() as *mut c_void,
+            );
+            (gl.finish)();
         }
 
-        if crate::stream::enviar(&buf, w as u32, h as u32, ojo_actual()) {
-            log::info(&format!(
-                "frame completo transmitido: {w}x{h} (enviados={}, perdidos={}, vacias={})",
-                crate::stream::enviados(),
-                crate::stream::perdidos(),
-                crate::stream::vacias()
-            ));
+        // Si se leyo de FBO 0 y salio completamente negro (tipico de offscreen EGL sin surface),
+        // intentar leer del FBO de blit si esta completo y tiene imagen
+        let tiene_color = buf.iter().take(4000).any(|&x| x != 0);
+        if !tiene_color && fb == 0 {
+            for &fallback_fb in &[blit_dst, blit_src, fb_mundo] {
+                if fallback_fb != 0 && fallback_fb != fb {
+                    unsafe {
+                        (gl.bind_framebuffer)(GL_READ_FRAMEBUFFER, fallback_fb);
+                    }
+                    if check_fb_status(gl, GL_READ_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE {
+                        let mut fvp = [0i32; 4];
+                        unsafe { (gl.get_integerv)(GL_VIEWPORT, fvp.as_mut_ptr()) };
+                        let fw = fvp[2];
+                        let fh = fvp[3];
+                        if fw >= 64 && fh >= 64 {
+                            let fbytes = (fw as usize) * (fh as usize) * 4;
+                            if buf.len() != fbytes {
+                                buf.resize(fbytes, 0);
+                            }
+                            unsafe {
+                                (gl.read_pixels)(
+                                    0,
+                                    0,
+                                    fw,
+                                    fh,
+                                    GL_RGBA,
+                                    GL_UNSIGNED_BYTE,
+                                    buf.as_mut_ptr() as *mut c_void,
+                                );
+                                (gl.finish)();
+                            }
+                            if buf.iter().take(4000).any(|&x| x != 0) {
+                                log::info(&format!("fallback exitoso a FBO {fallback_fb} ({fw}x{fh})"));
+                                fb_final = fallback_fb;
+                                w_final = fw;
+                                h_final = fh;
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
         }
 
-        // Y la GEOMETRIA de las entidades visibles (canal del ADR-021): con
-        // ella el visor coloca los modelos 3D en la mesa con la posicion y la
-        // direccion EXACTAS con las que el motor los dibuja, en vez de
-        // estimarlas con el snapshot.
+        crate::entrada::fijar_viewport(w_final as u32, h_final as u32);
+
+        // Restaurar estado de framebuffers
+        unsafe {
+            (gl.bind_framebuffer)(GL_DRAW_FRAMEBUFFER, fb_dibujo);
+            (gl.bind_framebuffer)(GL_READ_FRAMEBUFFER, fb_lectura);
+        }
+
+        drenar_errores(gl, "despues de leer frame final");
+
+        // OpenGL glReadPixels lee de abajo a arriba (fila 0 = fondo de la ventana).
+        // Se invierten las filas en su sitio para que el frame transmitido empiece
+        // en la fila 0 (arriba de la ventana), coincidiendo con SDL y formatos de imagen.
+        voltear_filas_rgba(&mut buf, w_final as usize, h_final as usize);
+
+        if crate::stream::enviar(&buf, w_final as u32, h_final as u32, ojo_actual()) {
+            static LOG_N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let n = LOG_N.fetch_add(1, Ordering::Relaxed);
+            if n % 60 == 0 || n < 5 {
+                log::info(&format!(
+                    "frame final transmitido (FBO {fb_final}): {w_final}x{h_final} (enviados={}, perdidos={}, vacias={})",
+                    crate::stream::enviados(),
+                    crate::stream::perdidos(),
+                    crate::stream::vacias()
+                ));
+            }
+        }
+
+        // Enviar tambien geometria por compatibilidad si hay modelos activos
         crate::stream::enviar_geometria(
             &entidades_visibles(),
             &crate::render3d::nombres_de_prototipos(),
             ojo_actual(),
         );
     });
+}
+
+pub fn capturar_frame_completo() {
+    capturar_frame_final();
 }
 
 /// Inclinacion del cubo respecto al suelo, en radianes (~31 grados).
@@ -2355,6 +2514,7 @@ extern "C" fn hook_bind_uniform_buffer(
 /// mundo se diferencian, lo que se ve ahi es el GUI (hotbar, minimapa...).
 /// Deja constancia de cuantos pixeles difieren y guarda la pantalla como
 /// PNG si se pide (XFACTORVR_CAPTURA_PANTALLA).
+#[allow(dead_code)]
 fn comparar_con_la_pantalla(gl: &Gl, mundo: &[u8], w: i32, h: i32) {
     let fb_dibujo = gl_int(gl, GL_DRAW_FRAMEBUFFER_BINDING);
     let fb_lectura = gl_int(gl, GL_READ_FRAMEBUFFER_BINDING);
@@ -2661,6 +2821,13 @@ pub fn instalar(simbolos: &resolver::Simbolos) {
 
     // Las funciones GL del motor: solo se resuelven sus direcciones; los
     // punteros los carga GLAD mas tarde (ver `preparar_gl`).
+    if let Some(r) = simbolos
+        .resolver_exacto("SDL_GL_GetProcAddress_REAL")
+        .or_else(|| simbolos.resolver("SDL_GL_GetProcAddress"))
+    {
+        SDL_GET_PROC_ADDRESS.store(r.direccion as usize, Ordering::Relaxed);
+        log::info(&format!("SDL_GL_GetProcAddress resuelto en 0x{:x}", r.direccion));
+    }
     match resolver_gl(simbolos) {
         Some(d) => {
             log::info("funciones GL del motor localizadas (los punteros se leen al primer frame)");

@@ -342,6 +342,65 @@ std::vector<uint8_t> puente_entrada_arma_clic(int x, int y, int boton, int accio
     return msg;
 }
 
+std::vector<uint8_t> puente_entrada_arma_tecla(uint16_t scancode, int accion) {
+    const uint8_t au = static_cast<uint8_t>(ajustar(accion, 1, 2));
+    std::vector<uint8_t> msg;
+    msg.reserve(kTamanoCabecera + PUENTE_ENTRADA_TAMANO_CARGA_TECLA);
+    msg.push_back(static_cast<uint8_t>(PUENTE_ENTRADA_MAGIC & 0xFFu));
+    msg.push_back(static_cast<uint8_t>((PUENTE_ENTRADA_MAGIC >> 8) & 0xFFu));
+    msg.push_back(static_cast<uint8_t>((PUENTE_ENTRADA_MAGIC >> 16) & 0xFFu));
+    msg.push_back(static_cast<uint8_t>((PUENTE_ENTRADA_MAGIC >> 24) & 0xFFu));
+    msg.push_back(PUENTE_ENTRADA_TIPO_TECLA);
+    msg.push_back(static_cast<uint8_t>(PUENTE_ENTRADA_TAMANO_CARGA_TECLA & 0xFFu));
+    msg.push_back(static_cast<uint8_t>((PUENTE_ENTRADA_TAMANO_CARGA_TECLA >> 8) & 0xFFu));
+    // Carga: scancode u16, accion u8, relleno u8
+    msg.push_back(static_cast<uint8_t>(scancode & 0xFFu));
+    msg.push_back(static_cast<uint8_t>((scancode >> 8) & 0xFFu));
+    msg.push_back(au);
+    msg.push_back(0);
+    return msg;
+}
+
+std::vector<uint8_t> puente_entrada_arma_rueda(int dx, int dy) {
+    const int16_t dx16 = static_cast<int16_t>(ajustar(dx, -32767, 32767));
+    const int16_t dy16 = static_cast<int16_t>(ajustar(dy, -32767, 32767));
+    std::vector<uint8_t> msg;
+    msg.reserve(kTamanoCabecera + PUENTE_ENTRADA_TAMANO_CARGA_RUEDA);
+    msg.push_back(static_cast<uint8_t>(PUENTE_ENTRADA_MAGIC & 0xFFu));
+    msg.push_back(static_cast<uint8_t>((PUENTE_ENTRADA_MAGIC >> 8) & 0xFFu));
+    msg.push_back(static_cast<uint8_t>((PUENTE_ENTRADA_MAGIC >> 16) & 0xFFu));
+    msg.push_back(static_cast<uint8_t>((PUENTE_ENTRADA_MAGIC >> 24) & 0xFFu));
+    msg.push_back(PUENTE_ENTRADA_TIPO_RUEDA);
+    msg.push_back(static_cast<uint8_t>(PUENTE_ENTRADA_TAMANO_CARGA_RUEDA & 0xFFu));
+    msg.push_back(static_cast<uint8_t>((PUENTE_ENTRADA_TAMANO_CARGA_RUEDA >> 8) & 0xFFu));
+    // Carga: dx i16, dy i16
+    msg.push_back(static_cast<uint8_t>(static_cast<uint16_t>(dx16) & 0xFFu));
+    msg.push_back(static_cast<uint8_t>((static_cast<uint16_t>(dx16) >> 8) & 0xFFu));
+    msg.push_back(static_cast<uint8_t>(static_cast<uint16_t>(dy16) & 0xFFu));
+    msg.push_back(static_cast<uint8_t>((static_cast<uint16_t>(dy16) >> 8) & 0xFFu));
+    return msg;
+}
+
+std::vector<uint8_t> puente_entrada_arma_movimiento(int x, int y) {
+    const uint16_t xu = static_cast<uint16_t>(ajustar(x, 0, 0xFFFF));
+    const uint16_t yu = static_cast<uint16_t>(ajustar(y, 0, 0xFFFF));
+    std::vector<uint8_t> msg;
+    msg.reserve(kTamanoCabecera + PUENTE_ENTRADA_TAMANO_CARGA_MOV);
+    msg.push_back(static_cast<uint8_t>(PUENTE_ENTRADA_MAGIC & 0xFFu));
+    msg.push_back(static_cast<uint8_t>((PUENTE_ENTRADA_MAGIC >> 8) & 0xFFu));
+    msg.push_back(static_cast<uint8_t>((PUENTE_ENTRADA_MAGIC >> 16) & 0xFFu));
+    msg.push_back(static_cast<uint8_t>((PUENTE_ENTRADA_MAGIC >> 24) & 0xFFu));
+    msg.push_back(PUENTE_ENTRADA_TIPO_MOVIMIENTO);
+    msg.push_back(static_cast<uint8_t>(PUENTE_ENTRADA_TAMANO_CARGA_MOV & 0xFFu));
+    msg.push_back(static_cast<uint8_t>((PUENTE_ENTRADA_TAMANO_CARGA_MOV >> 8) & 0xFFu));
+    // Carga: x u16, y u16
+    msg.push_back(static_cast<uint8_t>(xu & 0xFFu));
+    msg.push_back(static_cast<uint8_t>((xu >> 8) & 0xFFu));
+    msg.push_back(static_cast<uint8_t>(yu & 0xFFu));
+    msg.push_back(static_cast<uint8_t>((yu >> 8) & 0xFFu));
+    return msg;
+}
+
 bool puente_entrada_iniciar(const char* host, int puerto) {
     if (host == nullptr) host = "127.0.0.1";
     if (puerto <= 0 || puerto > 65535) {
@@ -403,8 +462,7 @@ bool puente_entrada_conectado() {
     return e.conectado;
 }
 
-bool puente_entrada_clic(int x, int y, int boton, int accion) {
-    std::vector<uint8_t> msg = puente_entrada_arma_clic(x, y, boton, accion);
+static bool enviar_mensaje_o_encolar(const std::vector<uint8_t>& msg, const char* descripcion) {
     Estado& e = estado();
     std::lock_guard<std::mutex> lock(e.mutex);
     if (!e.corriendo) {
@@ -422,7 +480,7 @@ bool puente_entrada_clic(int x, int y, int boton, int accion) {
         } else {
             resto = msg;
             e.conectado = false;
-            registrar_error("no se pudo enviar el clic: %s", strerror(errno));
+            registrar_error("no se pudo enviar %s: %s", descripcion, strerror(errno));
         }
         if (e.pendientes.size() < PUENTE_ENTRADA_MAX_PENDIENTES) {
             e.pendientes.push_back(resto);
@@ -442,7 +500,23 @@ bool puente_entrada_clic(int x, int y, int boton, int accion) {
     e.pendientes.push_back(msg);
     e.hay_pendientes = true;
     e.cv.notify_all();
-    return false;  // no habia conexion: el clic queda encolado
+    return false;  // no habia conexion: el mensaje queda encolado
+}
+
+bool puente_entrada_clic(int x, int y, int boton, int accion) {
+    return enviar_mensaje_o_encolar(puente_entrada_arma_clic(x, y, boton, accion), "clic");
+}
+
+bool puente_entrada_tecla(uint16_t scancode, int accion) {
+    return enviar_mensaje_o_encolar(puente_entrada_arma_tecla(scancode, accion), "tecla");
+}
+
+bool puente_entrada_rueda(int dx, int dy) {
+    return enviar_mensaje_o_encolar(puente_entrada_arma_rueda(dx, dy), "rueda");
+}
+
+bool puente_entrada_movimiento(int x, int y) {
+    return enviar_mensaje_o_encolar(puente_entrada_arma_movimiento(x, y), "movimiento");
 }
 
 bool puente_entrada_arma_soltar(int x, int y, int boton) {

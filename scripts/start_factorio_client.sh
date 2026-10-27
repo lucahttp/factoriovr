@@ -160,7 +160,20 @@ export LIBGL_DRIVERS_PATH="$MESA_LIB/dri"
 # Se respeta el valor que venga puesto de fuera (lo usa el barrido del spike).
 export MESA_LOADER_DRIVER_OVERRIDE="${MESA_LOADER_DRIVER_OVERRIDE:-zink}"
 export ZINK_DESCRIPTORS=auto
-export GALLIUM_DRIVER=zink
+# OJO: GALLIUM_DRIVER=zink obliga a usar Zink DENTRO de libgallium, aunque
+# el driver de DRI que se haya pedido sea otro.  Con swrast (llvmpipe, que no
+# usa Vulkan en absoluto) eso es un error: Zink no encuentra ningun
+# dispositivo Vulkan valido y el motor moria con
+#   "MESA: error: ZINK: failed to choose pdev"
+#   "Could not find a valid EGL device to initialize"
+# Medido en el emulador Android (2026-10-26).  Si el driver de DRI no es
+# zink, GALLIUM_DRIVER tiene que ser el de ese driver.
+if [ "$MESA_LOADER_DRIVER_OVERRIDE" = "zink" ]; then
+    export GALLIUM_DRIVER=zink
+else
+    export GALLIUM_DRIVER="${GALLIUM_DRIVER:-llvmpipe}"
+    log "driver de DRI: $MESA_LOADER_DRIVER_OVERRIDE (gallium: $GALLIUM_DRIVER, sin Vulkan)"
+fi
 export LIBGL_ALWAYS_SOFTWARE=0
 export LD_LIBRARY_PATH="$MESA_LIB:${LD_LIBRARY_PATH:-}"
 
@@ -202,10 +215,18 @@ elif [ "$USE_FABRICANTE" = "1" ]; then
     log "ICD del fabricante: $ICD_SO"
 else
     # Sin ICD de Adreno: lavapipe (Vulkan por software) para que al menos arranque.
-    # El JSON que trae el payload apunta a la ruta del host (/usr/lib/...), que
-    # en el visor no existe: hay que rehacerlo con la ruta de aqui, o Mesa se
-    # queda sin Vulkan y el cliente no puede crear el contexto OpenGL.
-    if [ -f "$MESA_DIR/usr/share/vulkan/icd.d/lvp_icd.aarch64.json" ] && [ -f "$LVP_SO" ]; then
+    # El ICD JSON se ESCRIBE aqui, con la ruta de este dispositivo (el que
+    # trae el payload apunta a la ruta del host, /usr/lib/..., que en Android
+    # no existe), asi que la unica cosa que hace falta es que exista la
+    # libreria.
+    #
+    # Antes se exigia ademas que el payload trajera
+    # "usr/share/vulkan/icd.d/lvp_icd.aarch64.json".  Ubuntu lo llama
+    # "lvp_icd.json" (sin el sufijo de arquitectura), asi que esa comprobacion
+    # hacia fallar y el cliente se quedaba SIN NINGUN ICD: el motor moria con
+    # "Could not find a valid EGL device to initialize" y Zink se quejaba de
+    # "failed to choose pdev" (lavapipe estaba ahi, pero sin ICD no loidia).
+    if [ -f "$LVP_SO" ]; then
         cat > "$LVP_JSON" <<JSON
 {
     "file_format_version": "1.0.0",
@@ -298,7 +319,9 @@ if [ -f "$INJECTOR" ] && [ "${XFACTORVR_USE_INJECTOR:-1}" = "1" ]; then
         export XFACTORVR_STREAM_ANCHO="${XFACTORVR_STREAM_ANCHO:-640}"
         export XFACTORVR_STREAM_ALTO="${XFACTORVR_STREAM_ALTO:-360}"
         export XFACTORVR_STREAM_FPS="${XFACTORVR_STREAM_FPS:-12}"
+        export XFACTORVR_ENTRADA_PUERTO="${XFACTORVR_ENTRADA_PUERTO:-27021}"
         log "render real al visor: $XFACTORVR_STREAM (${XFACTORVR_STREAM_ANCHO}x${XFACTORVR_STREAM_ALTO})"
+        log "puente de entrada: 127.0.0.1:$XFACTORVR_ENTRADA_PUERTO"
     fi
 fi
 
@@ -467,6 +490,15 @@ for _p in /proc/[0-9]*; do
     esac
 done
 sleep 1
+
+if [ "${MODO_MENU:-0}" = "1" ]; then
+    log "Arrancando directamente en el MENU PRINCIPAL (Home Menu) de Factorio..."
+    exec env LD_LIBRARY_PATH="$LIB_PATH" LD_PRELOAD="$PRELOAD" "$LOADER" --library-path "$LIB_PATH" "$GAME_BIN" \
+        --config "$CLIENT_CONFIG" \
+        --window-size "${WIDTH}x${HEIGHT}" \
+        --disable-audio \
+        --fullscreen $STDIN_MOTOR
+fi
 
 if [ -n "${SERVER_ADDR:-}" ]; then
     # Modo campana: el juego corre en dos procesos del mismo arbol. El

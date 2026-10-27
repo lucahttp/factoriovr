@@ -57,6 +57,18 @@ SEGUNDOS_PROBE="${SEGUNDOS_PROBE:-45}"
 # XFACTORVR_USE_TURNIP=1 / VK_ICD_FILENAMES a mano.
 export XFACTORVR_USE_TURNIP="${XFACTORVR_USE_TURNIP:-0}"
 
+# El driver de DRI del motor.
+#
+# "swrast" es llvmpipe: OpenGL por software SIN Vulkan (no usa Zink ni ningun
+# ICD).  Es el que funciona en el emulador: con Zink el motor moria con
+# "ZINK: failed to choose pdev" / "Could not find a valid EGL device to
+# initialize" (medido el 2026-10-26), porque lavapipe no le vale a Zink y
+# GALLIUM_DRIVER=zink lo forzaba igualmente.
+#
+# "zink" deja el camino de Vulkan (lavapipe o turnip) para probar el driver
+# de verdad.
+export MESA_LOADER_DRIVER_OVERRIDE="${MESA_LOADER_DRIVER_OVERRIDE:-swrast}"
+
 say() { echo "[banco-emu] $*"; }
 die() { echo "[banco-emu] ERROR: $*" >&2; exit 1; }
 
@@ -75,14 +87,17 @@ desplegar() {
     say "subiendo los payloads al emulador (esto tarda: el cliente grafico pesa 1,6 GB)..."
 
     say "[1/6] runtime de glibc"
-    adbx shell "mkdir -p $REMOTE_GLIBC"
-    "$ADB" -s "$SERIAL" push "$PROJECT_ROOT/build/glibc.tar.gz" "$REMOTE_GLIBC/glibc.tar.gz" >/dev/null
-    adbx shell "cd $REMOTE_GLIBC && tar -xzf glibc.tar.gz && chmod 755 lib/ld-linux-aarch64.so.1 && ls -la lib/ld-linux-aarch64.so.1"
+    # OJO: el tar trae "glibc/lib/..." y el motor busca el linker en
+    # /data/local/tmp/glibc/lib/ld-linux-aarch64.so.1.  Si se extrae DENTRO
+    # de /data/local/tmp/glibc sale /data/local/tmp/glibc/glibc/lib/... y el
+    # motor no lo encuentra.  Se extrae en /data/local/tmp.
+    "$ADB" -s "$SERIAL" push "$PROJECT_ROOT/build/glibc.tar.gz" "$REMOTE_TMP/glibc.tar.gz" >/dev/null
+    adbx shell "cd $REMOTE_TMP && tar -xzf glibc.tar.gz && rm -f glibc.tar.gz && chmod 755 glibc/lib/ld-linux-aarch64.so.1 && ls -la glibc/lib/ld-linux-aarch64.so.1"
 
     say "[2/6] payload de Mesa (zink + lavapipe)"
     adbx shell "mkdir -p $REMOTE_MESA"
     "$ADB" -s "$SERIAL" push "$PROJECT_ROOT/build/mesa.tar.gz" "$REMOTE_MESA/mesa.tar.gz" >/dev/null
-    adbx shell "cd $REMOTE_TMP && tar -xzf mesa/mesa.tar.gz && chmod 755 mesa/lib/ld-linux-aarch64.so.1 && ls mesa/usr/lib/aarch64-linux-gnu/dri/ | head"
+    adbx shell "cd $REMOTE_TMP && tar -xzf mesa/mesa.tar.gz && rm -f mesa/mesa.tar.gz && chmod 755 mesa/usr/lib/aarch64-linux-gnu/ld-linux-aarch64.so.1 && ls mesa/usr/lib/aarch64-linux-gnu/dri/ | head"
 
     say "[3/6] servidor headless"
     adbx shell "mkdir -p $REMOTE_SERVER"
@@ -90,9 +105,11 @@ desplegar() {
     adbx shell "cd $REMOTE_SERVER && tar -xf payload.tar && rm -f payload.tar && chmod 755 bin/arm64/factorio && mkdir -p mods"
 
     say "[4/6] cliente grafico"
-    adbx shell "mkdir -p $REMOTE_CLIENT"
-    "$ADB" -s "$SERIAL" push "$PROJECT_ROOT/build/client_grafico.tar" "$REMOTE_CLIENT/client.tar" >/dev/null
-    adbx shell "cd $REMOTE_TMP && rm -rf factorio && tar -xf factorio/client.tar && rm -f factorio/client.tar && chmod 755 factorio/bin/arm64/factorio && mkdir -p factorio/mods factorio/config factorio/saves"
+    # OJO: el tar NO puede meterse dentro de /data/local/tmp/factorio, porque
+    # el paso siguiente borra ese directorio para dejar el cliente limpio y se
+    # llevaria el tar por delante ("tar: factorio/client.tar: No such file").
+    "$ADB" -s "$SERIAL" push "$PROJECT_ROOT/build/client_grafico.tar" "$REMOTE_TMP/client.tar" >/dev/null
+    adbx shell "cd $REMOTE_TMP && rm -rf factorio && tar -xf client.tar && rm -f client.tar && chmod 755 factorio/bin/arm64/factorio && mkdir -p factorio/mods factorio/config factorio/saves && ls factorio/bin/arm64/"
 
     say "[5/6] inyector + resolutor + lista de mods"
     "$ADB" -s "$SERIAL" push \
@@ -127,7 +144,15 @@ arrancar() {
     adbx shell "cd $REMOTE_TMP && nohup env XFACTORVR_RESOLVER=$REMOTE_TMP/libxfactorvr_resolver.so \
         sh $REMOTE_TMP/start_factorio_standalone.sh > $REMOTE_TMP/srv.log 2>&1 &"
     sleep 3
+    say "servidor lanzado. Log: $REMOTE_TMP/srv.log"
+}
 
+# El CLIENTE grafico.  El inyector se CONECTA al visor una sola vez, asi que
+# el probe tiene que estar ESCUCHANDO antes de que arranque el motor: por
+# eso el cliente se lanza desde 'probar' (que abre el probe antes), no desde
+# 'arrancar'.
+arrancar_cliente() {
+    require_emulador
     say "arrancando el CLIENTE grafico (lavapipe, sin Turnip)..."
     # El cliente se conecta al servidor local del propio emulador y manda los
     # frames al probe del Mac por 10.0.2.2.
@@ -141,6 +166,7 @@ arrancar() {
     #   XFACTORVR_CAPTURA_GUI=1     engancha la captura del motor (ADR-022 §9).
     adbx shell "cd $REMOTE_TMP && nohup env \
         XFACTORVR_USE_TURNIP=$XFACTORVR_USE_TURNIP \
+        MESA_LOADER_DRIVER_OVERRIDE=$MESA_LOADER_DRIVER_OVERRIDE \
         SERVER_ADDR=127.0.0.1 \
         GAME_DIR=$REMOTE_CLIENT \
         CLIENT_DIR=$REMOTE_CLIENT_DIR \
@@ -152,7 +178,7 @@ arrancar() {
         WIDTH=640 HEIGHT=360 \
         sh $REMOTE_TMP/start_factorio_client.sh > $REMOTE_TMP/cli_juego.log 2>&1 &"
     sleep 2
-    say "cliente lanzado. Logs: $REMOTE_TMP/cli_juego.log y $REMOTE_TMP/srv.log"
+    say "cliente lanzado. Log: $REMOTE_TMP/cli_juego.log"
 }
 
 # ---------------------------------------------------------------------------
@@ -160,20 +186,23 @@ arrancar() {
 # ---------------------------------------------------------------------------
 probar() {
     require_emulador
-    say "esperando a que el motor entre en juego..."
-    adbx shell "grep -aE 'to\(InGame\)|PlayerJoinGame|Factorio initialised|error|Error' $REMOTE_TMP/cli_juego.log | tail -20" || true
-
-    say "lanzando el probe XFV1 en el Mac ($PROBE_PUERTO) durante ${SEGUNDOS_PROBE}s..."
+    # El probe se abre ANTES de arrancar el motor: el inyector se conecta al
+    # visor una sola vez y, si no hay nadie escuchando, se queda sin mandar
+    # ningun frame.
+    say "abriendo el probe XFV1 en el Mac ($PROBE_PUERTO) durante ${SEGUNDOS_PROBE}s..."
     rm -f /tmp/probe_emu.log /tmp/frame_emu.png
     nohup python3 "$PROJECT_ROOT/scripts/probe_xfv1.py" \
         --puerto "$PROBE_PUERTO" --segundos "$SEGUNDOS_PROBE" \
         --guardar /tmp/frame_emu.png > /tmp/probe_emu.log 2>&1 &
     PROBE_PID=$!
+    sleep 2
+
+    arrancar_cliente
 
     # El motor tarda en arrancar (lavapipe es software: va lento).
-    sleep 20
+    sleep 25
     say "--- estado del motor ---"
-    adbx shell "tail -30 $REMOTE_TMP/cli_juego.log"
+    adbx shell "tail -25 $REMOTE_TMP/cli_juego.log"
     wait $PROBE_PID
     say "--- probe ---"
     cat /tmp/probe_emu.log
@@ -195,6 +224,7 @@ estado() {
 case "${1:-banco}" in
     desplegar) desplegar ;;
     arrancar)  arrancar ;;
+    cliente)   arrancar_cliente ;;
     probar)    probar ;;
     estado)    estado ;;
     banco)

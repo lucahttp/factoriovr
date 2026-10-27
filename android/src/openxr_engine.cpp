@@ -501,22 +501,69 @@ static float s_table_model_mat[16];
 // traslacion fija de STAGE).
 static bool  s_ancla_activa = false;      // hay un ancla valida y trackeada
 static float s_ancla_mat[16];             // pose del ancla en STAGE
-static bool  s_juego_click_armado = false; // el gatillo esta pulsado sobre el motor
 static float s_ancla_yaw = 0.0f;          // yaw (en STAGE) del ancla
 static float s_table_yaw_local = 0.0f;    // yaw del usuario respecto a la base
 static bool  s_ancla_preparado = false;   // ya se pidio detectar la mesa
+static bool  s_juego_click_armado = false; // el gatillo esta pulsado sobre el motor
+static int   s_juego_click_x = 0;
+static int   s_juego_click_y = 0;
+static bool  s_juego_right_click_armado = false; // grip derecho / gatillo izq pulsado sobre motor
+static int   s_juego_right_click_x = 0;
+static int   s_juego_right_click_y = 0;
 
-// --- Panel tumbado del motor (clic XFCE) -----------------------------------
-// Ultima matriz del panel tumbado (en el espacio del mundo) y el tamano de
-// la imagen que hay en la textura.  La usa el rayo de la mano para saber en
-// que pixel del motor ha caido el puntero (clic XFCE).
+// --- Pantalla Virtual 2D Flotante (ADR-027 / Modo Pantalla Virtual + Passthrough) ---
 static float s_game_panel_mat[16];
 static int   s_game_panel_w = 0;
 static int   s_game_panel_h = 0;
-/// Pixel del motor donde se armo el ultimo clic XFCE (se suelta en el MISMO
-/// punto: el motor necesita ver pulsacion y soltura).
-static int   s_juego_click_x = 0;
-static int   s_juego_click_y = 0;
+static XrVector3f s_screen_pos = { 0.0f, 1.25f, -1.70f };
+static float s_screen_yaw = 0.0f;
+static bool s_screen_placed = false;
+
+static void update_screen_matrix(int img_w, int img_h) {
+    const float ancho_m = 1.60f;
+    float alto_m = (img_w > 0 && img_h > 0) ? (ancho_m * (float)img_h / (float)img_w) : 0.90f;
+
+    const float cos_y = cosf(s_screen_yaw);
+    const float sin_y = sinf(s_screen_yaw);
+    const float sx = ancho_m * 0.5f;
+    const float sy = alto_m * 0.5f;
+
+    s_game_panel_mat[0]  =  cos_y * sx;
+    s_game_panel_mat[1]  =  0.0f;
+    s_game_panel_mat[2]  = -sin_y * sx;
+    s_game_panel_mat[3]  =  0.0f;
+
+    s_game_panel_mat[4]  =  0.0f;
+    s_game_panel_mat[5]  =  sy;
+    s_game_panel_mat[6]  =  0.0f;
+    s_game_panel_mat[7]  =  0.0f;
+
+    s_game_panel_mat[8]  =  sin_y;
+    s_game_panel_mat[9]  =  0.0f;
+    s_game_panel_mat[10] =  cos_y;
+    s_game_panel_mat[11] =  0.0f;
+
+    s_game_panel_mat[12] =  s_screen_pos.x;
+    s_game_panel_mat[13] =  s_screen_pos.y;
+    s_game_panel_mat[14] =  s_screen_pos.z;
+    s_game_panel_mat[15] =  1.0f;
+
+    s_game_panel_w = img_w;
+    s_game_panel_h = img_h;
+}
+
+static void recentrar_pantalla(const XrPosef& head_pose) {
+    float fx = 0.0f, fz = -1.0f;
+    yawForwardFromQuat(head_pose.orientation, &fx, &fz);
+    const float dist = 1.70f;
+    s_screen_pos.x = head_pose.position.x + fx * dist;
+    s_screen_pos.y = head_pose.position.y - 0.05f;
+    s_screen_pos.z = head_pose.position.z + fz * dist;
+    s_screen_yaw = atan2f(-fx, -fz);
+    s_screen_placed = true;
+    LOGI("Pantalla virtual 2D recentrada: pos=(%.2f, %.2f, %.2f), yaw=%.2f rad",
+         s_screen_pos.x, s_screen_pos.y, s_screen_pos.z, s_screen_yaw);
+}
 
 // Modo Observador a escala humana 1:1 (XrWorld::observer)
 static bool s_observer_mode = false;
@@ -1170,6 +1217,54 @@ static void add_box_textured(std::vector<DioramaVertex>& out,
     out.push_back({x + hw, y - hh, z - hd, 1, 0, 0, 0, 0, r * 0.85f, g * 0.85f, b * 0.85f, a});
     out.push_back({x + hw, y + hh, z + hd, 1, 0, 0, u_scale, v_scale, r * 0.85f, g * 0.85f, b * 0.85f, a});
     out.push_back({x + hw, y - hh, z + hd, 1, 0, 0, u_scale, 0, r * 0.85f, g * 0.85f, b * 0.85f, a});
+}
+
+static void add_ray_beam(std::vector<DioramaVertex>& out,
+                         float x0, float y0, float z0,
+                         float x1, float y1, float z1,
+                         float radius,
+                         float r, float g, float b, float a) {
+    float vx = x1 - x0, vy = y1 - y0, vz = z1 - z0;
+    float len = sqrtf(vx * vx + vy * vy + vz * vz);
+    if (len < 1e-4f) return;
+    vx /= len; vy /= len; vz /= len;
+
+    float px = 0.0f, py = 1.0f, pz = 0.0f;
+    if (fabsf(vy) > 0.95f) { px = 1.0f; py = 0.0f; pz = 0.0f; }
+    float ux = vy * pz - vz * py;
+    float uy = vz * px - vx * pz;
+    float uz = vx * py - vy * px;
+    float ulen = sqrtf(ux * ux + uy * uy + uz * uz);
+    if (ulen < 1e-4f) return;
+    ux /= ulen; uy /= ulen; uz /= ulen;
+
+    float wx = uy * vz - uz * vy;
+    float wy = uz * vx - ux * vz;
+    float wz = ux * vy - uy * vx;
+
+    const int SEG = 4;
+    for (int i = 0; i < SEG; ++i) {
+        float a0 = (float)i * 6.2831853f / SEG;
+        float a1 = (float)(i + 1) * 6.2831853f / SEG;
+        float c0 = cosf(a0) * radius, s0 = sinf(a0) * radius;
+        float c1 = cosf(a1) * radius, s1 = sinf(a1) * radius;
+
+        float p0x = ux * c0 + wx * s0;
+        float p0y = uy * c0 + wy * s0;
+        float p0z = uz * c0 + wz * s0;
+
+        float p1x = ux * c1 + wx * s1;
+        float p1y = uy * c1 + wy * s1;
+        float p1z = uz * c1 + wz * s1;
+
+        out.push_back({x0 + p0x, y0 + p0y, z0 + p0z, 0, 1, 0, 0, 0, r, g, b, a});
+        out.push_back({x1 + p0x, y1 + p0y, z1 + p0z, 0, 1, 0, 1, 0, r, g, b, a});
+        out.push_back({x1 + p1x, y1 + p1y, z1 + p1z, 0, 1, 0, 1, 1, r, g, b, a});
+
+        out.push_back({x0 + p0x, y0 + p0y, z0 + p0z, 0, 1, 0, 0, 0, r, g, b, a});
+        out.push_back({x1 + p1x, y1 + p1y, z1 + p1z, 0, 1, 0, 1, 1, r, g, b, a});
+        out.push_back({x0 + p1x, y0 + p1y, z0 + p1z, 0, 1, 0, 0, 1, r, g, b, a});
+    }
 }
 
 static void add_cylinder_textured(std::vector<DioramaVertex>& out,
@@ -1957,6 +2052,139 @@ static void draw_tabletop_scene(const float* vp_mat,
                                 XrSession session = XR_NULL_HANDLE,
                                 XrAction haptic_action = XR_NULL_HANDLE) {
     if (s_program == 0) return;
+
+    constexpr bool s_activar_diorama_3d = false;
+    if (!s_activar_diorama_3d) {
+        // Modo Pantalla Virtual 2D + Passthrough (ADR-027)
+        // Se dibuja únicamente el panel flotante de Factorio y el rayo láser
+        draw_game_panel(vp_mat, nullptr, is_primary_eye);
+
+        // Rayo láser 6DoF desde el mando derecho hacia la pantalla virtual
+        if (right_aim_valid) {
+            float rx = right_aim_pose.position.x;
+            float ry = right_aim_pose.position.y;
+            float rz = right_aim_pose.position.z;
+
+            float qx = right_aim_pose.orientation.x;
+            float qy = right_aim_pose.orientation.y;
+            float qz = right_aim_pose.orientation.z;
+            float qw = right_aim_pose.orientation.w;
+            float dx = -2.0f * (qx * qz + qw * qy);
+            float dy = -2.0f * (qy * qz - qw * qx);
+            float dz = -(1.0f - 2.0f * (qx * qx + qy * qy));
+
+            float ray_len = 1.8f;
+            bool has_panel_hit = false;
+            if (s_game_panel_w > 0 && s_game_panel_h > 0) {
+                const float origen_rayo[3] = { rx, ry, rz };
+                const float dir_rayo[3] = { dx, dy, dz };
+                int px = 0, py = 0;
+                if (panel_mesa_rayo_a_pixel(origen_rayo, dir_rayo, s_game_panel_mat,
+                                            s_game_panel_w, s_game_panel_h, &px, &py)) {
+                    const float* mm = s_game_panel_mat;
+                    const float nx = mm[8], ny = mm[9], nz = mm[10];
+                    const float den = nx * dir_rayo[0] + ny * dir_rayo[1] + nz * dir_rayo[2];
+                    if (fabsf(den) > 1e-6f) {
+                        const float num = nx * (mm[12] - origen_rayo[0]) + ny * (mm[13] - origen_rayo[1])
+                                         + nz * (mm[14] - origen_rayo[2]);
+                        const float t = num / den;
+                        if (t > 0.0f) {
+                            ray_len = t;
+                            has_panel_hit = true;
+                        }
+                    }
+                }
+            }
+
+            float end_x = rx + dx * ray_len;
+            float end_y = ry + dy * ray_len;
+            float end_z = rz + dz * ray_len;
+            float l_r = has_panel_hit ? 0.20f : 0.95f;
+            float l_g = has_panel_hit ? 0.90f : 0.35f;
+            float l_b = has_panel_hit ? 1.00f : 0.15f;
+
+            std::vector<DioramaVertex> laser_verts;
+            // Haz láser 3D visible y luminoso (Generals XR style)
+            add_ray_beam(laser_verts, rx, ry, rz, end_x, end_y, end_z, 0.0035f, l_r, l_g, l_b, 0.95f);
+
+            if (has_panel_hit) {
+                // Retículo 3D circular pulsante en el punto de impacto sobre la pantalla
+                float ret_rad = 0.026f + sinf(anim_time * 6.5f) * 0.004f;
+                const float* mm = s_game_panel_mat;
+                float u_axis[3] = { mm[0], mm[1], mm[2] };
+                float v_axis[3] = { mm[4], mm[5], mm[6] };
+                float len_u = sqrtf(u_axis[0]*u_axis[0] + u_axis[1]*u_axis[1] + u_axis[2]*u_axis[2]);
+                float len_v = sqrtf(v_axis[0]*v_axis[0] + v_axis[1]*v_axis[1] + v_axis[2]*v_axis[2]);
+                if (len_u > 1e-4f) { u_axis[0] /= len_u; u_axis[1] /= len_u; u_axis[2] /= len_u; }
+                if (len_v > 1e-4f) { v_axis[0] /= len_v; v_axis[1] /= len_v; v_axis[2] /= len_v; }
+
+                float n_axis[3] = { mm[8], mm[9], mm[10] };
+                float len_n = sqrtf(n_axis[0]*n_axis[0] + n_axis[1]*n_axis[1] + n_axis[2]*n_axis[2]);
+                if (len_n > 1e-4f) { n_axis[0] /= len_n; n_axis[1] /= len_n; n_axis[2] /= len_n; }
+                float c_hit[3] = { end_x + n_axis[0] * 0.003f, end_y + n_axis[1] * 0.003f, end_z + n_axis[2] * 0.003f };
+
+                for (int s = 0; s < 24; ++s) {
+                    float a0 = (float)s * 6.2831853f / 24.0f;
+                    float a1 = (float)(s + 1) * 6.2831853f / 24.0f;
+                    float p0[3] = { c_hit[0] + (u_axis[0] * cosf(a0) + v_axis[0] * sinf(a0)) * ret_rad,
+                                    c_hit[1] + (u_axis[1] * cosf(a0) + v_axis[1] * sinf(a0)) * ret_rad,
+                                    c_hit[2] + (u_axis[2] * cosf(a0) + v_axis[2] * sinf(a0)) * ret_rad };
+                    float p1[3] = { c_hit[0] + (u_axis[0] * cosf(a1) + v_axis[0] * sinf(a1)) * ret_rad,
+                                    c_hit[1] + (u_axis[1] * cosf(a1) + v_axis[1] * sinf(a1)) * ret_rad,
+                                    c_hit[2] + (u_axis[2] * cosf(a1) + v_axis[2] * sinf(a1)) * ret_rad };
+                    add_ray_beam(laser_verts, p0[0], p0[1], p0[2], p1[0], p1[1], p1[2], 0.0022f, 1.0f, 0.85f, 0.15f, 0.95f);
+                }
+                // Mira en cruz en el centro del impacto
+                add_ray_beam(laser_verts, c_hit[0] - u_axis[0]*0.007f, c_hit[1] - u_axis[1]*0.007f, c_hit[2] - u_axis[2]*0.007f,
+                                          c_hit[0] + u_axis[0]*0.007f, c_hit[1] + u_axis[1]*0.007f, c_hit[2] + u_axis[2]*0.007f, 0.0020f, 1.0f, 1.0f, 1.0f, 1.0f);
+                add_ray_beam(laser_verts, c_hit[0] - v_axis[0]*0.007f, c_hit[1] - v_axis[1]*0.007f, c_hit[2] - v_axis[2]*0.007f,
+                                          c_hit[0] + v_axis[0]*0.007f, c_hit[1] + v_axis[1]*0.007f, c_hit[2] + v_axis[2]*0.007f, 0.0020f, 1.0f, 1.0f, 1.0f, 1.0f);
+            }
+
+            // 5. Tooltips Holográficos 3D en Mandos Pico (Generals XR pattern - Ver los controles)
+            // Flotando 6cm encima del mando derecho mirando hacia el jugador
+            float cx = rx;
+            float cy = ry + 0.055f;
+            float cz = rz;
+
+            // Placa base holográfica flotante (#0e141a translúcido)
+            add_box_textured(laser_verts, cx, cy, cz, 0.12f, 0.050f, 0.002f, 1.0f, 1.0f, 0.06f, 0.09f, 0.14f, 0.90f);
+            // Borde superior cian Factorio
+            add_box_textured(laser_verts, cx, cy + 0.023f, cz + 0.002f, 0.116f, 0.003f, 0.001f, 1.0f, 1.0f, 0.20f, 0.85f, 1.00f, 0.95f);
+
+            // Badge 1 (Superior Izq): Trigger -> Clic Izq (Cian)
+            add_box_textured(laser_verts, cx - 0.030f, cy + 0.010f, cz + 0.002f, 0.048f, 0.012f, 0.001f, 1.0f, 1.0f, 0.15f, 0.75f, 0.95f, 0.95f);
+            // Badge 2 (Superior Der): Grip -> Clic Der (Naranja)
+            add_box_textured(laser_verts, cx + 0.030f, cy + 0.010f, cz + 0.002f, 0.048f, 0.012f, 0.001f, 1.0f, 1.0f, 0.95f, 0.55f, 0.15f, 0.95f);
+            // Badge 3 (Inferior Izq): Botón B -> ESC / Menú (Rojo)
+            add_box_textured(laser_verts, cx - 0.030f, cy - 0.008f, cz + 0.002f, 0.048f, 0.012f, 0.001f, 1.0f, 1.0f, 0.95f, 0.25f, 0.25f, 0.95f);
+            // Badge 4 (Inferior Der): Botón A -> E / Inventario (Verde)
+            add_box_textured(laser_verts, cx + 0.030f, cy - 0.008f, cz + 0.002f, 0.048f, 0.012f, 0.001f, 1.0f, 1.0f, 0.25f, 0.85f, 0.35f, 0.95f);
+
+            glUseProgram(s_program);
+            float ident_mat[16];
+            matIdentity(ident_mat);
+            glUniformMatrix4fv(s_model_loc, 1, GL_FALSE, ident_mat);
+            glUniformMatrix4fv(s_mvp_loc, 1, GL_FALSE, vp_mat);
+            glUniform1f(s_enable_clipping_loc, 0.0f);
+            glUniform1f(s_use_tex_loc, 0.0f);
+            glUniform1f(s_lit_loc, 0.0f);
+            glUniform3f(s_emissive_loc, l_r * 0.8f, l_g * 0.8f, l_b * 0.8f);
+
+            glEnable(GL_BLEND);
+            glBlendFunc(GL_SRC_ALPHA, GL_ONE);
+            glDepthMask(GL_FALSE);
+            glBindVertexArray(s_dynamic_vao);
+            glBindBuffer(GL_ARRAY_BUFFER, s_dynamic_vbo);
+            glBufferSubData(GL_ARRAY_BUFFER, 0, laser_verts.size() * sizeof(DioramaVertex), laser_verts.data());
+            glDrawArrays(GL_TRIANGLES, 0, (GLsizei)laser_verts.size());
+            glDepthMask(GL_TRUE);
+            glDisable(GL_BLEND);
+            glBindVertexArray(0);
+            glBindBuffer(GL_ARRAY_BUFFER, 0);
+        }
+        return;
+    }
 
     glUseProgram(s_program);
     glEnable(GL_DEPTH_TEST);
@@ -3416,74 +3644,41 @@ static void dibujar_puntero(const float* vp_mat, const float* m_panel,
                             const PanelMesaConfig* cfg);
 
 static void draw_game_panel(const float* vp_mat, const float* model_mesa, bool ojo_primario) {
-    // En modo observador el mundo esta a escala 1:1 (x25) y el panel de la
-    // mesa no tiene sentido ahi.
     if (s_observer_mode) return;
-    const int ojo = ojo_primario ? 0 : 1;
+    const int ojo = (s_juego_estereo && !ojo_primario) ? 1 : 0;
     subir_frame_juego(ojo);
     if (s_tex_juego[ojo] == 0) return;
     construir_panel_juego();
     if (s_vao_juego == 0) return;
 
-    // Posicion: el quad tumbado sobre la mesa (la fabrica "en la mesa").
-    // El tamaño sale de la imagen que llega y de la escala 1:1 del juego
-    // (1 casilla = 32 px del motor = 0,04 m de mesa).
-    PanelMesaConfig cfg;
-    panel_mesa_config_inicial(&cfg);
-    cfg.img_w = s_tex_juego_w[ojo];
-    cfg.img_h = s_tex_juego_h[ojo];
-    cfg.px_por_casilla = panel_mesa_px_por_casilla_recibida(
-        cfg.img_w, JUEGO_ANCHO_PX, JUEGO_PX_POR_CASILLA);
-    cfg.m_por_casilla = JUEGO_M_POR_CASILLA;
-    cfg.altura_m = JUEGO_PANEL_ALTURA;
-    cfg.offset_x_m = JUEGO_PANEL_OFFSET_X;
-    cfg.offset_z_m = JUEGO_PANEL_OFFSET_Z;
+    // Actualizar matriz de la pantalla virtual flotante frente al usuario
+    update_screen_matrix(s_tex_juego_w[ojo], s_tex_juego_h[ojo]);
 
-    float m_panel[16];
-    panel_mesa_matriz_tumbado(model_mesa, &cfg, m_panel);
-
-    // La matriz y el tamano de la imagen se guardan para el rayo de la mano:
-    // con ellos se calcula el pixel del motor donde ha caido el puntero.
-    memcpy(s_game_panel_mat, m_panel, sizeof(s_game_panel_mat));
     static bool log_panel = false;
     if (!log_panel) {
         log_panel = true;
-        LOGI("Panel del motor: textura %dx%d (imagen %dx%d)",
-             cfg.img_w, cfg.img_h, s_game_panel_w, s_game_panel_h);
+        LOGI("Pantalla virtual Factorio: textura %dx%d activa",
+             s_game_panel_w, s_game_panel_h);
     }
-    s_game_panel_w = cfg.img_w;
-    s_game_panel_h = cfg.img_h;
 
     float mvp[16];
-    mat4_multiply(vp_mat, m_panel, mvp);
+    mat4_multiply(vp_mat, s_game_panel_mat, mvp);
 
     glUseProgram(s_program);
-    glUniformMatrix4fv(s_model_loc, 1, GL_FALSE, m_panel);
+    glUniformMatrix4fv(s_model_loc, 1, GL_FALSE, s_game_panel_mat);
     glUniformMatrix4fv(s_mvp_loc, 1, GL_FALSE, mvp);
     glUniform1f(s_use_tex_loc, 1.0f);
     glUniform1f(s_lit_loc, 0.0f);
-    // OJO: el emisivo tiene que ser NEGRO.  Con (1,1,1) el shader hacia
-    // "textura + blanco" y el panel salia BLANCO: se veia la maqueta de la
-    // mesa pero NO la imagen del motor.  La imagen se ve tal cual.
+    // OJO: el emisivo tiene que ser NEGRO para no quemar a blanco la textura.
     glUniform3f(s_emissive_loc, 0.0f, 0.0f, 0.0f);
     glUniform1f(s_enable_clipping_loc, 0.0f);
-    // Con el motor mandando DOS vistas (estereo real) no hay que desplazar
-    // nada: el paralaje ya viene en la imagen.  Si solo llega una vista
-    // (el motor no puede desplazar la camara), se desplaza la UV un poco,
-    // que es el efecto "TV 3D" de antes.
-    const float desfase = s_juego_estereo ? 0.0f : (ojo_primario ? -JUEGO_PARALAJE : JUEGO_PARALAJE);
-    glUniform2f(s_uv_offset_loc, desfase, 0.0f);
+    glUniform2f(s_uv_offset_loc, 0.0f, 0.0f);
     glActiveTexture(GL_TEXTURE0);
     glBindTexture(GL_TEXTURE_2D, s_tex_juego[ojo]);
     glUniform1i(s_tex_loc, 0);
 
     glEnable(GL_BLEND);
-    if (s_blend_aditivo) {
-        // La camara esta detras: lo que pintamos se SUMA.
-        glBlendFunc(GL_SRC_ALPHA, GL_ONE);
-    } else {
-        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
-    }
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
     glDepthMask(GL_FALSE);
     glBindVertexArray(s_vao_juego);
     glDrawArrays(GL_TRIANGLES, 0, s_juego_vertices);
@@ -3493,31 +3688,22 @@ static void draw_game_panel(const float* vp_mat, const float* model_mesa, bool o
     glBindVertexArray(0);
     glBindBuffer(GL_ARRAY_BUFFER, 0);
 
-    // El puntero, encima del panel (se dibuja despues para que el blend
-    // del panel no se lo coma).
-    dibujar_puntero(vp_mat, m_panel, &cfg);
+    dibujar_puntero(vp_mat, s_game_panel_mat, nullptr);
 }
 
-/// Dibuja el puntero: un anillo tumbado en el punto donde ha caido el rayo
-/// de la mano, ENCIMA del panel del juego.
-///
-/// Se dibuja con la MISMA matriz del panel (los vertices van en su espacio
-/// local), asi que el anillo sale tumbado y del tamaño pedido sin tener que
-/// recalcular nada.  El recorte de mesa se desactiva: el puntero ya esta
-/// dentro del panel, que esta dentro de la mesa.
 static void dibujar_puntero(const float* vp_mat, const float* m_panel,
-                            const PanelMesaConfig* cfg) {
+                            const PanelMesaConfig* /*cfg*/) {
     if (!s_puntero_visible.load()) return;
     if (s_game_panel_w <= 0 || s_game_panel_h <= 0) return;
 
-    float ancho_m = 0.0f, fondo_m = 0.0f;
-    panel_mesa_tamano(cfg, &ancho_m, &fondo_m);
-    if (ancho_m < 0.01f || fondo_m < 0.01f) return;
+    const float ancho_m = 1.60f;
+    const float alto_m = (s_game_panel_w > 0 && s_game_panel_h > 0) ?
+                         (ancho_m * (float)s_game_panel_h / (float)s_game_panel_w) : 0.90f;
 
-    // 2,5 cm de radio: se ve bien a un brazo de distancia y no tapa el juego.
-    const float radio_m = 0.025f;
+    // 2 cm de radio: retículo preciso para apuntar a la interfaz
+    const float radio_m = 0.020f;
     const float rx = radio_m / (ancho_m * 0.5f);
-    const float ry = radio_m / (fondo_m * 0.5f);
+    const float ry = radio_m / (alto_m * 0.5f);
 
     PanelMesaVertice pv[PANEL_MESA_PUNTERO_VERTICES];
     const int n = panel_mesa_vertices_puntero(s_puntero_local_x, s_puntero_local_y,
@@ -3690,12 +3876,18 @@ struct EntradaMando {
     bool trigger_clicked = false;
     bool grip_clicked = false;
     XrActionStateVector2f stick{};
+    XrActionStateVector2f leftStick{};
     XrActionStateFloat grip{};
     XrActionStateFloat leftGrip{};
+    XrActionStateFloat leftTrig{};
+    bool btn_a = false;
+    bool btn_b = false;
+    bool btn_x = false;
+    bool btn_y = false;
+    bool rightStickClick = false;
 };
 
-/// Lee el mando: sincroniza las acciones, consulta puntero y botones, aplica
-/// el gesto diferido (armar/soltar) y mueve el centro de vista con el stick.
+/// Lee el mando: sincroniza las acciones, consulta puntero, sticks y botones.
 static EntradaMando leer_entrada_mando(
     XrSession session,
     XrActionSet actionSet,
@@ -3708,6 +3900,12 @@ static EntradaMando leer_entrada_mando(
     XrAction rightStickAction,
     XrAction leftStickAction,
     XrAction leftGripAction,
+    XrAction leftTrigAction,
+    XrAction btnAAction,
+    XrAction btnBAction,
+    XrAction btnXAction,
+    XrAction btnYAction,
+    XrAction rightStickClickAction,
     bool& prev_trigger,
     bool& prev_grip,
     float dt_seconds) {
@@ -3722,95 +3920,247 @@ static EntradaMando leer_entrada_mando(
     };
     xrSyncActions(session, &syncInfo);
 
-    // Consultar puntero 6DoF
+    // Consultar punteros 6DoF
     xrLocateSpace(rightAimSpace, appSpace, predictedDisplayTime, &e.rightAimLoc);
     e.rightAimValid = (e.rightAimLoc.locationFlags & XR_SPACE_LOCATION_POSITION_VALID_BIT) &&
-                       (e.rightAimLoc.locationFlags & XR_SPACE_LOCATION_ORIENTATION_VALID_BIT);
+                      (e.rightAimLoc.locationFlags & XR_SPACE_LOCATION_ORIENTATION_VALID_BIT);
 
-    // Consultar botones del mando
+    xrLocateSpace(leftAimSpace, appSpace, predictedDisplayTime, &e.leftAimLoc);
+    e.leftAimValid = (e.leftAimLoc.locationFlags & XR_SPACE_LOCATION_POSITION_VALID_BIT);
+
+    // Gatillo derecho
     XrActionStateFloat trigState = { .type = XR_TYPE_ACTION_STATE_FLOAT };
     XrActionStateGetInfo getTrig = { .type = XR_TYPE_ACTION_STATE_GET_INFO, .action = rightTrigAction };
     xrGetActionStateFloat(session, &getTrig, &trigState);
     e.trigger_pressed = (trigState.currentState > 0.5f);
     e.trigger_clicked = e.trigger_pressed && !prev_trigger;
-    const bool trigger_released = !e.trigger_pressed && prev_trigger;
     prev_trigger = e.trigger_pressed;
 
+    // Grip derecho
     XrActionStateFloat gripState = { .type = XR_TYPE_ACTION_STATE_FLOAT };
     XrActionStateGetInfo getGrip = { .type = XR_TYPE_ACTION_STATE_GET_INFO, .action = rightGripAction };
     xrGetActionStateFloat(session, &getGrip, &gripState);
     e.grip = gripState;
     e.grip_clicked = (gripState.currentState > 0.5f) && !prev_grip;
-    const bool grip_released = !(gripState.currentState > 0.5f) && prev_grip;
     prev_grip = (gripState.currentState > 0.5f);
 
-    // GESTO DIFERIDO (patron de Generals-Zero-Hour-XR): al apretar el
-    // gatillo la accion se ARMA (eso lo hace el motor de VR cuando dibuja),
-    // y aqui, cuando el dedo se levanta, se EJECUTA.
-    //
-    // Asi un roce o un movimiento de la mano no hacen nada por error, y el
-    // usuario ve la accion preparada antes de que ocurra.
-    if (s_vr_hand_release) {
-        if (trigger_released) s_vr_hand_release(0u);
-        if (grip_released) s_vr_hand_release(1u);
-    }
-
-    // SOLTAR el clic XFCE: se suelta en la MISMA posicion donde se armo
-    // (el motor necesita ver pulsacion y soltura del raton en el mismo
-    // punto para aplicar sus reglas de seleccion, fantasma y rotacion).
-    if (trigger_released && s_juego_click_armado) {
-        s_juego_click_armado = false;
-        // SOLTAR: accion = 2 (boton arriba).  El modulo reutiliza la
-        // posicion armada, asi que se le pasa la misma.
-        xfv::puente_entrada_suelta(s_juego_click_x, s_juego_click_y, 1);
-        LOGI("Clic XFCE SOLTADO en pixel (%d, %d) del motor",
-             s_juego_click_x, s_juego_click_y);
-    }
-
-    XrActionStateVector2f stickState = { .type = XR_TYPE_ACTION_STATE_VECTOR2F };
-    XrActionStateGetInfo getStick = { .type = XR_TYPE_ACTION_STATE_GET_INFO, .action = rightStickAction };
-    xrGetActionStateVector2f(session, &getStick, &stickState);
-    e.stick = stickState;
-
-    // Desplazamiento de la ventana de mapa con el joystick izquierdo.
-    // Permite explorar la fabrica mas alla de las casillas iniciales.
-    // El stick derecho queda para la altura de la mesa y el giro de colocacion.
-    XrActionStateVector2f leftStickState = { .type = XR_TYPE_ACTION_STATE_VECTOR2F };
-    XrActionStateGetInfo getLeftStick = { .type = XR_TYPE_ACTION_STATE_GET_INFO, .action = leftStickAction };
-    xrGetActionStateVector2f(session, &getLeftStick, &leftStickState);
-
-    if (s_pan_view) {
-        const float deadzone = 0.18f;
-        float stick_len = sqrtf(leftStickState.currentState.x * leftStickState.currentState.x +
-                                leftStickState.currentState.y * leftStickState.currentState.y);
-        if (stick_len > deadzone) {
-            // El desplazamiento se escala por el tiempo real del frame para
-            // que la velocidad de exploracion sea igual a 60 y 90 Hz.
-            float pan_speed = 9.0f * dt_seconds;
-            s_pan_view(leftStickState.currentState.x * pan_speed,
-                       leftStickState.currentState.y * pan_speed);
-        }
-    }
-
-    // El centro de vista vive en Rust (lo usa el radio del snapshot RCON).
-    // Se relee para que el render y la consulta al motor nunca divergan.
-    if (s_get_view_center) {
-        float cx = 0.0f, cy = 0.0f;
-        if (s_get_view_center(&cx, &cy)) {
-            s_view_pan_x = cx;
-            s_view_pan_y = cy;
-        }
-    }
-
+    // Grip izquierdo
     XrActionStateFloat leftGripState = { .type = XR_TYPE_ACTION_STATE_FLOAT };
     XrActionStateGetInfo getLeftGrip = { .type = XR_TYPE_ACTION_STATE_GET_INFO, .action = leftGripAction };
     xrGetActionStateFloat(session, &getLeftGrip, &leftGripState);
     e.leftGrip = leftGripState;
 
-    xrLocateSpace(leftAimSpace, appSpace, predictedDisplayTime, &e.leftAimLoc);
-    e.leftAimValid = (e.leftAimLoc.locationFlags & XR_SPACE_LOCATION_POSITION_VALID_BIT);
+    // Gatillo izquierdo
+    XrActionStateFloat leftTrigState = { .type = XR_TYPE_ACTION_STATE_FLOAT };
+    XrActionStateGetInfo getLeftTrig = { .type = XR_TYPE_ACTION_STATE_GET_INFO, .action = leftTrigAction };
+    xrGetActionStateFloat(session, &getLeftTrig, &leftTrigState);
+    e.leftTrig = leftTrigState;
+
+    // Thumbsticks
+    XrActionStateVector2f stickState = { .type = XR_TYPE_ACTION_STATE_VECTOR2F };
+    XrActionStateGetInfo getStick = { .type = XR_TYPE_ACTION_STATE_GET_INFO, .action = rightStickAction };
+    xrGetActionStateVector2f(session, &getStick, &stickState);
+    e.stick = stickState;
+
+    XrActionStateVector2f leftStickState = { .type = XR_TYPE_ACTION_STATE_VECTOR2F };
+    XrActionStateGetInfo getLeftStick = { .type = XR_TYPE_ACTION_STATE_GET_INFO, .action = leftStickAction };
+    xrGetActionStateVector2f(session, &getLeftStick, &leftStickState);
+    e.leftStick = leftStickState;
+
+    // Botones A, B, X, Y
+    XrActionStateBoolean aState = { .type = XR_TYPE_ACTION_STATE_BOOLEAN };
+    XrActionStateGetInfo getA = { .type = XR_TYPE_ACTION_STATE_GET_INFO, .action = btnAAction };
+    xrGetActionStateBoolean(session, &getA, &aState);
+    e.btn_a = (aState.isActive && aState.currentState);
+
+    XrActionStateBoolean bState = { .type = XR_TYPE_ACTION_STATE_BOOLEAN };
+    XrActionStateGetInfo getB = { .type = XR_TYPE_ACTION_STATE_GET_INFO, .action = btnBAction };
+    xrGetActionStateBoolean(session, &getB, &bState);
+    e.btn_b = (bState.isActive && bState.currentState);
+
+    XrActionStateBoolean xState = { .type = XR_TYPE_ACTION_STATE_BOOLEAN };
+    XrActionStateGetInfo getX = { .type = XR_TYPE_ACTION_STATE_GET_INFO, .action = btnXAction };
+    xrGetActionStateBoolean(session, &getX, &xState);
+    e.btn_x = (xState.isActive && xState.currentState);
+
+    XrActionStateBoolean yState = { .type = XR_TYPE_ACTION_STATE_BOOLEAN };
+    XrActionStateGetInfo getY = { .type = XR_TYPE_ACTION_STATE_GET_INFO, .action = btnYAction };
+    xrGetActionStateBoolean(session, &getY, &yState);
+    e.btn_y = (yState.isActive && yState.currentState);
+
+    // Click del thumbstick derecho
+    XrActionStateBoolean stickClickState = { .type = XR_TYPE_ACTION_STATE_BOOLEAN };
+    XrActionStateGetInfo getStickClick = { .type = XR_TYPE_ACTION_STATE_GET_INFO, .action = rightStickClickAction };
+    xrGetActionStateBoolean(session, &getStickClick, &stickClickState);
+    e.rightStickClick = (stickClickState.isActive && stickClickState.currentState);
 
     return e;
+}
+
+/// Mapea los controles VR (OpenXR) al cliente gráfico de Factorio (XFCE / SDL).
+static void procesar_entrada_factorio(const EntradaMando& e, float dt_seconds, const XrPosef& head_pose) {
+    // 1. Recentrado automático en el primer frame o manteniendo ambos grips > 0.5s
+    if (!s_screen_placed) {
+        recentrar_pantalla(head_pose);
+    }
+
+    static float s_dual_grip_timer = 0.0f;
+    static bool s_dual_grip_recentered = false;
+    if (e.leftGrip.currentState > 0.5f && e.grip.currentState > 0.5f) {
+        s_dual_grip_timer += dt_seconds;
+        if (s_dual_grip_timer > 0.5f && !s_dual_grip_recentered) {
+            recentrar_pantalla(head_pose);
+            s_dual_grip_recentered = true;
+        }
+    } else {
+        s_dual_grip_timer = 0.0f;
+        s_dual_grip_recentered = false;
+    }
+
+    // 2. Thumbstick izquierdo -> Teclas W, A, S, D (mover al personaje)
+    static bool s_key_w = false, s_key_a = false, s_key_s = false, s_key_d = false;
+    const float deadzone = 0.30f;
+    bool want_w = (e.leftStick.currentState.y > deadzone);
+    bool want_s = (e.leftStick.currentState.y < -deadzone);
+    bool want_a = (e.leftStick.currentState.x < -deadzone);
+    bool want_d = (e.leftStick.currentState.x > deadzone);
+
+    if (want_w != s_key_w) { s_key_w = want_w; xfv::puente_entrada_tecla(xfv::KEY_W, s_key_w ? 1 : 0); }
+    if (want_s != s_key_s) { s_key_s = want_s; xfv::puente_entrada_tecla(xfv::KEY_S, s_key_s ? 1 : 0); }
+    if (want_a != s_key_a) { s_key_a = want_a; xfv::puente_entrada_tecla(xfv::KEY_A, s_key_a ? 1 : 0); }
+    if (want_d != s_key_d) { s_key_d = want_d; xfv::puente_entrada_tecla(xfv::KEY_D, s_key_d ? 1 : 0); }
+
+    // 3. Thumbstick derecho (Arriba/Abajo) -> Mouse Wheel Up / Down (Zoom del mapa)
+    static float s_wheel_timer = 0.0f;
+    if (fabsf(e.stick.currentState.y) > 0.40f) {
+        s_wheel_timer -= dt_seconds;
+        if (s_wheel_timer <= 0.0f) {
+            s_wheel_timer = 0.16f;
+            int dy = (e.stick.currentState.y > 0.0f) ? 1 : -1;
+            xfv::puente_entrada_rueda(0, dy);
+        }
+    } else {
+        s_wheel_timer = 0.0f;
+    }
+
+    // 4. Thumbstick derecho (Izquierda/Derecha o Click) -> Tecla R (Rotar entidad)
+    static bool s_prev_stick_r = false;
+    bool stick_r = (fabsf(e.stick.currentState.x) > 0.65f) || e.rightStickClick;
+    if (stick_r && !s_prev_stick_r) {
+        xfv::puente_entrada_tecla(xfv::KEY_R, 1);
+        xfv::puente_entrada_tecla(xfv::KEY_R, 0);
+    }
+    s_prev_stick_r = stick_r;
+
+    // 5. Botón A / X -> Tecla E (Abrir/cerrar inventario y crafteo)
+    static bool s_prev_btn_e = false;
+    bool btn_e = e.btn_a || e.btn_x;
+    if (btn_e && !s_prev_btn_e) {
+        xfv::puente_entrada_tecla(xfv::KEY_E, 1);
+        xfv::puente_entrada_tecla(xfv::KEY_E, 0);
+        LOGI("Botón A/X: enviado E (inventario)");
+    }
+    s_prev_btn_e = btn_e;
+
+    // 6. Botón B (Mando derecho) -> Tecla ESC (Menú del sistema / Pausa / Cancelar)
+    static bool s_prev_btn_b = false;
+    if (e.btn_b && !s_prev_btn_b) {
+        xfv::puente_entrada_tecla(xfv::KEY_ESC, 1);
+        xfv::puente_entrada_tecla(xfv::KEY_ESC, 0);
+        LOGI("Botón B: enviado ESC (menú / cancelar)");
+    }
+    s_prev_btn_b = e.btn_b;
+
+    // 6b. Botón Y (Mando izquierdo) -> Tecla Q (Pipeta / limpiar cursor)
+    static bool s_prev_btn_y = false;
+    if (e.btn_y && !s_prev_btn_y) {
+        xfv::puente_entrada_tecla(xfv::KEY_Q, 1);
+        xfv::puente_entrada_tecla(xfv::KEY_Q, 0);
+        LOGI("Botón Y: enviado Q (pipeta)");
+    }
+    s_prev_btn_y = e.btn_y;
+
+    // 7. Puntero Láser contra la Pantalla Virtual 2D (PanelMesa raycast)
+    bool has_panel_hit = false;
+    int panel_px = 0, panel_py = 0;
+    if (e.rightAimValid && s_game_panel_w > 0 && s_game_panel_h > 0) {
+        float rx = e.rightAimLoc.pose.position.x;
+        float ry = e.rightAimLoc.pose.position.y;
+        float rz = e.rightAimLoc.pose.position.z;
+
+        float qx = e.rightAimLoc.pose.orientation.x;
+        float qy = e.rightAimLoc.pose.orientation.y;
+        float qz = e.rightAimLoc.pose.orientation.z;
+        float qw = e.rightAimLoc.pose.orientation.w;
+        float dx = -2.0f * (qx * qz + qw * qy);
+        float dy = -2.0f * (qy * qz - qw * qx);
+        float dz = -(1.0f - 2.0f * (qx * qx + qy * qy));
+
+        const float origen_rayo[3] = { rx, ry, rz };
+        const float dir_rayo[3] = { dx, dy, dz };
+        int px = 0, py = 0;
+        if (panel_mesa_rayo_a_pixel(origen_rayo, dir_rayo, s_game_panel_mat,
+                                    s_game_panel_w, s_game_panel_h, &px, &py)) {
+            has_panel_hit = true;
+            panel_px = px;
+            panel_py = py;
+            s_puntero_local_x = ((float)px + 0.5f) / (float)s_game_panel_w * 2.0f - 1.0f;
+            s_puntero_local_y = 1.0f - ((float)py + 0.5f) / (float)s_game_panel_h * 2.0f;
+            s_puntero_visible.store(true);
+        } else {
+            s_puntero_visible.store(false);
+        }
+    } else {
+        s_puntero_visible.store(false);
+    }
+
+    // 8. Ratón (Movimiento y Clics)
+    static int s_prev_mouse_x = -1;
+    static int s_prev_mouse_y = -1;
+    if (has_panel_hit) {
+        if (panel_px != s_prev_mouse_x || panel_py != s_prev_mouse_y) {
+            xfv::puente_entrada_movimiento(panel_px, panel_py);
+            s_prev_mouse_x = panel_px;
+            s_prev_mouse_y = panel_py;
+        }
+
+        // Trigger Derecho -> Clic Izquierdo (botón 1)
+        if (e.trigger_clicked) {
+            s_juego_click_x = panel_px;
+            s_juego_click_y = panel_py;
+            s_juego_click_armado = true;
+            xfv::puente_entrada_arma_soltar(panel_px, panel_py, 1);
+        }
+
+        // Grip Derecho o Trigger Izquierdo -> Clic Derecho (botón 3)
+        bool right_click_pressed = (e.grip.currentState > 0.5f) || (e.leftTrig.currentState > 0.5f);
+        static bool s_prev_right_click = false;
+        if (right_click_pressed && !s_prev_right_click) {
+            s_juego_right_click_x = panel_px;
+            s_juego_right_click_y = panel_py;
+            s_juego_right_click_armado = true;
+            xfv::puente_entrada_arma_soltar(panel_px, panel_py, 3);
+        } else if (!right_click_pressed && s_prev_right_click) {
+            if (s_juego_right_click_armado) {
+                s_juego_right_click_armado = false;
+                xfv::puente_entrada_suelta(s_juego_right_click_x, s_juego_right_click_y, 3);
+            }
+        }
+        s_prev_right_click = right_click_pressed;
+    }
+
+    // Soltar clic izquierdo si se soltó el gatillo fuera o dentro del panel
+    if (!e.trigger_pressed && s_juego_click_armado) {
+        s_juego_click_armado = false;
+        xfv::puente_entrada_suelta(s_juego_click_x, s_juego_click_y, 1);
+    }
+
+    // Soltar clic derecho si se soltó fuera del panel
+    bool right_click_pressed = (e.grip.currentState > 0.5f) || (e.leftTrig.currentState > 0.5f);
+    if (!right_click_pressed && s_juego_right_click_armado) {
+        s_juego_right_click_armado = false;
+        xfv::puente_entrada_suelta(s_juego_right_click_x, s_juego_right_click_y, 3);
+    }
 }
 
 /// Aplica los gestos que mueven la mesa: zoom y giro con las dos manos,
@@ -4229,6 +4579,41 @@ static void* openxr_thread_main(void* arg) {
     XrAction rightHapticAction = XR_NULL_HANDLE;
     xrCreateAction(actionSet, &hapticInfo, &rightHapticAction);
 
+    // Gatillo Izquierdo (Clic Derecho / Minar)
+    XrActionCreateInfo leftTrigInfo = { .type = XR_TYPE_ACTION_CREATE_INFO, .actionType = XR_ACTION_TYPE_FLOAT_INPUT };
+    strncpy(leftTrigInfo.actionName, "left_trigger", XR_MAX_ACTION_NAME_SIZE);
+    strncpy(leftTrigInfo.localizedActionName, "Left Trigger", XR_MAX_LOCALIZED_ACTION_NAME_SIZE);
+    XrAction leftTrigAction = XR_NULL_HANDLE;
+    xrCreateAction(actionSet, &leftTrigInfo, &leftTrigAction);
+
+    // Botones A, B, X, Y
+    XrActionCreateInfo btnInfo = { .type = XR_TYPE_ACTION_CREATE_INFO, .actionType = XR_ACTION_TYPE_BOOLEAN_INPUT };
+    strncpy(btnInfo.actionName, "button_a", XR_MAX_ACTION_NAME_SIZE);
+    strncpy(btnInfo.localizedActionName, "Button A", XR_MAX_LOCALIZED_ACTION_NAME_SIZE);
+    XrAction btnAAction = XR_NULL_HANDLE;
+    xrCreateAction(actionSet, &btnInfo, &btnAAction);
+
+    strncpy(btnInfo.actionName, "button_b", XR_MAX_ACTION_NAME_SIZE);
+    strncpy(btnInfo.localizedActionName, "Button B", XR_MAX_LOCALIZED_ACTION_NAME_SIZE);
+    XrAction btnBAction = XR_NULL_HANDLE;
+    xrCreateAction(actionSet, &btnInfo, &btnBAction);
+
+    strncpy(btnInfo.actionName, "button_x", XR_MAX_ACTION_NAME_SIZE);
+    strncpy(btnInfo.localizedActionName, "Button X", XR_MAX_LOCALIZED_ACTION_NAME_SIZE);
+    XrAction btnXAction = XR_NULL_HANDLE;
+    xrCreateAction(actionSet, &btnInfo, &btnXAction);
+
+    strncpy(btnInfo.actionName, "button_y", XR_MAX_ACTION_NAME_SIZE);
+    strncpy(btnInfo.localizedActionName, "Button Y", XR_MAX_LOCALIZED_ACTION_NAME_SIZE);
+    XrAction btnYAction = XR_NULL_HANDLE;
+    xrCreateAction(actionSet, &btnInfo, &btnYAction);
+
+    // Click del thumbstick derecho
+    strncpy(btnInfo.actionName, "right_stick_click", XR_MAX_ACTION_NAME_SIZE);
+    strncpy(btnInfo.localizedActionName, "Right Stick Click", XR_MAX_LOCALIZED_ACTION_NAME_SIZE);
+    XrAction rightStickClickAction = XR_NULL_HANDLE;
+    xrCreateAction(actionSet, &btnInfo, &rightStickClickAction);
+
     // Bindings de interacción
     XrPath simpleProfile = XR_NULL_PATH, oculusProfile = XR_NULL_PATH, picoProfile = XR_NULL_PATH;
     XrPath pico4sProfile = XR_NULL_PATH;
@@ -4249,6 +4634,18 @@ static void* openxr_thread_main(void* arg) {
     xrStringToPath(instance, "/user/hand/left/input/squeeze/value", &leftGripPath);
     xrStringToPath(instance, "/user/hand/left/input/thumbstick", &leftStickPath);
     xrStringToPath(instance, "/user/hand/right/output/haptic", &rightHapticPath);
+
+    XrPath leftTrigPath = XR_NULL_PATH;
+    xrStringToPath(instance, "/user/hand/left/input/trigger/value", &leftTrigPath);
+
+    XrPath btnAPath = XR_NULL_PATH, btnBPath = XR_NULL_PATH;
+    XrPath btnXPath = XR_NULL_PATH, btnYPath = XR_NULL_PATH;
+    XrPath rightStickClickPath = XR_NULL_PATH;
+    xrStringToPath(instance, "/user/hand/right/input/a/click", &btnAPath);
+    xrStringToPath(instance, "/user/hand/right/input/b/click", &btnBPath);
+    xrStringToPath(instance, "/user/hand/left/input/x/click", &btnXPath);
+    xrStringToPath(instance, "/user/hand/left/input/y/click", &btnYPath);
+    xrStringToPath(instance, "/user/hand/right/input/thumbstick/click", &rightStickClickPath);
 
     XrPath simpleClickPath = XR_NULL_PATH;
     xrStringToPath(instance, "/user/hand/right/input/select/click", &simpleClickPath);
@@ -4273,12 +4670,19 @@ static void* openxr_thread_main(void* arg) {
         { leftAimAction, leftAimPath },
         { leftGripAction, leftGripPath },
         { leftStickAction, leftStickPath },
-        { rightHapticAction, rightHapticPath }
+        { rightHapticAction, rightHapticPath },
+        { leftTrigAction, leftTrigPath },
+        { btnAAction, btnAPath },
+        { btnBAction, btnBPath },
+        { btnXAction, btnXPath },
+        { btnYAction, btnYPath },
+        { rightStickClickAction, rightStickClickPath },
     };
+    const uint32_t numTouchBindings = (uint32_t)(sizeof(touchBindings) / sizeof(touchBindings[0]));
     XrInteractionProfileSuggestedBinding touchSuggested = {
         .type = XR_TYPE_INTERACTION_PROFILE_SUGGESTED_BINDING,
         .interactionProfile = oculusProfile,
-        .countSuggestedBindings = 8,
+        .countSuggestedBindings = numTouchBindings,
         .suggestedBindings = touchBindings,
     };
     xrSuggestInteractionProfileBindings(instance, &touchSuggested);
@@ -4286,7 +4690,7 @@ static void* openxr_thread_main(void* arg) {
     XrInteractionProfileSuggestedBinding picoSuggested = {
         .type = XR_TYPE_INTERACTION_PROFILE_SUGGESTED_BINDING,
         .interactionProfile = picoProfile,
-        .countSuggestedBindings = 8,
+        .countSuggestedBindings = numTouchBindings,
         .suggestedBindings = touchBindings,
     };
     xrSuggestInteractionProfileBindings(instance, &picoSuggested);
@@ -4297,7 +4701,7 @@ static void* openxr_thread_main(void* arg) {
         XrInteractionProfileSuggestedBinding pico4sSuggested = {
             .type = XR_TYPE_INTERACTION_PROFILE_SUGGESTED_BINDING,
             .interactionProfile = pico4sProfile,
-            .countSuggestedBindings = 8,
+            .countSuggestedBindings = numTouchBindings,
             .suggestedBindings = touchBindings,
         };
         XrResult bindRes = xrSuggestInteractionProfileBindings(instance, &pico4sSuggested);
@@ -4580,15 +4984,17 @@ static void* openxr_thread_main(void* arg) {
                  s_table_pos.x, s_table_pos.y, s_table_pos.z, s_table_yaw);
         }
 
-        // Leer el mando y aplicar los gestos que mueven la mesa.
+        // Leer el mando y mapear los controles a Factorio (XFCE / SDL)
         EntradaMando entrada = leer_entrada_mando(
             session, actionSet,
             rightAimSpace, leftAimSpace, appSpace,
             frameState.predictedDisplayTime,
             rightTrigAction, rightGripAction, rightStickAction,
             leftStickAction, leftGripAction,
+            leftTrigAction, btnAAction, btnBAction,
+            btnXAction, btnYAction, rightStickClickAction,
             prev_trigger, prev_grip, dt_seconds);
-        aplicar_gestos_mesa(entrada);
+        procesar_entrada_factorio(entrada, dt_seconds, views[0].pose);
 
         anim_time += dt_seconds;
 
@@ -4615,10 +5021,9 @@ static void* openxr_thread_main(void* arg) {
                 glViewport(0, 0, swapchains[i].width, swapchains[i].height);
             }
 
-            // Negro opaco: en modo ADDITIVE (el del passthrough de Pico OS)
-            // lo que se pinta se SUMA sobre la camara, asi que el fondo tiene
-            // que ser negro (nada que sumar).
-            glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+            // Fondo negro transparente: en modo Passthrough (ADDITIVE o ALPHA_BLEND)
+            // los píxeles (0,0,0,0) muestran la cámara del entorno sin taparla.
+            glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
             glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
 
             float proj[16], viewMat[16], vp_mat[16];

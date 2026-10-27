@@ -25,6 +25,8 @@ static TRAMPOLIN: AtomicUsize = AtomicUsize::new(0);
 static TRAMPOLIN_APP: AtomicUsize = AtomicUsize::new(0);
 /// Trampolin de `MainLoop::processEvents(bool)`.
 static TRAMPOLIN_EVENTS: AtomicUsize = AtomicUsize::new(0);
+/// Trampolin de `SDL_GL_SwapWindow` / `swapRenderBuffers`.
+static TRAMPOLIN_SWAP: AtomicUsize = AtomicUsize::new(0);
 
 /// Cada cuantos frames se imprime el "pull" de depuracion.
 static CADA: AtomicU64 = AtomicU64::new(60);
@@ -38,6 +40,28 @@ static NOCALL: AtomicU64 = AtomicU64::new(0);
 
 /// Traza de cada entrada al hook (diagnostico).
 static TRACE: AtomicU64 = AtomicU64::new(0);
+
+/// Hook de `SDL_GL_SwapWindow` o `swapRenderBuffers` (cierre del frame).
+///
+/// En este punto el mundo y toda la GUI nativa de Factorio estan dibujados
+/// en el framebuffer compuesto, justo antes de presentar el frame.
+#[no_mangle]
+pub extern "C" fn xfv_hook_swap_window(window_or_this: *mut c_void) {
+    hook_swap_window(window_or_this);
+}
+
+extern "C" fn hook_swap_window(window_or_this: *mut c_void) {
+    // Captura del frame final COMPLETO (mundo + GUI) antes del swap
+    crate::modelo3d::capturar_frame_final();
+
+    let tramp = TRAMPOLIN_SWAP.load(Ordering::Relaxed);
+    if tramp != 0 {
+        unsafe {
+            let f: extern "C" fn(*mut c_void) = std::mem::transmute(tramp);
+            f(window_or_this);
+        }
+    }
+}
 
 /// Funcion hooked: `GameRenderer::render()`.
 ///
@@ -95,15 +119,8 @@ pub extern "C" fn xfv_hook_process_events(this: *mut c_void, in_game: u8) -> u8 
 
 /// Cuerpo del hook.
 extern "C" fn hook_render(this: *mut c_void) {
-    // El frame COMPLETO del juego se manda aqui: en este momento (antes de
-    // que el motor vacie el framebuffer del mundo) todavia esta el frame
-    // anterior entero.  Leyendolo en el flush salia a medio dibujar, porque
-    // el motor dibuja el mundo por trozos.
-    crate::modelo3d::capturar_frame_completo();
-
     // Un frame nuevo: el desplazamiento de camara (estereo real) alterna de
-    // signo en cada frame.  Va DESPUES de la captura, para que la vista
-    // capturada sea la del ojo que le toca.
+    // signo en cada frame.
     crate::modelo3d::nuevo_frame();
 
     // Traza minima de la entrada (diagnostico): se escribe con write(2) para
@@ -280,6 +297,9 @@ pub fn instalar() {
     // --- envio de la imagen real del juego al visor VR ---
     // Se activa con `XFACTORVR_STREAM=host:puerto`. Si no esta, no hace nada.
     crate::stream::configurar();
+
+    // --- captura del frame completo al cierre (swap de buffers) ---
+    instalar_hook_swap(&simbolos);
 
     // --- puente de Lua: hablar con el motor POR DENTRO, sin RCON ---
     // Engancha `lua_pcallk` (y `lua_pushstring`/`lua_rawgeti`/`lua_gettable`,
@@ -501,3 +521,48 @@ fn instalar_hook_app_manager(simbolos: &resolver::Simbolos) {
         }
     }
 }
+
+/// Instala el detour sobre el cierre de frame (swap de buffers).
+///
+/// Prueba candidatos en orden de prioridad:
+/// 1. `SDL_GL_SwapWindow_REAL`
+/// 2. `SDL_GL_SwapWindow`
+/// 3. `GlobalContext::swapRenderBuffers()`
+/// 4. `GraphicsInterfaceOpenGL::swapBuffers()`
+fn instalar_hook_swap(simbolos: &resolver::Simbolos) {
+    let candidatos = [
+        "SDL_GL_SwapWindow_REAL",
+        "SDL_GL_SwapWindow",
+        "_ZN13GlobalContext17swapRenderBuffersEv",
+        "_ZN23GraphicsInterfaceOpenGL11swapBuffersEv",
+    ];
+    for &cand in &candidatos {
+        let encontrado = match simbolos.resolver_exacto(cand).or_else(|| simbolos.resolver(cand)) {
+            Some(r) => r,
+            None => continue,
+        };
+        log::info(&format!("hook swap resuelto: {} -> 0x{:x}", cand, encontrado.direccion));
+        let hook_addr = match direccion_de_ejecucion_de("xfv_hook_swap_window") {
+            Some(a) => a,
+            None => {
+                log::aviso("dlsym no devolvio el hook de swap; se usa direccion de enlace");
+                xfv_hook_swap_window as *const () as u64
+            }
+        };
+        match detour::instalar(encontrado.direccion, hook_addr, None, encontrado.tamano) {
+            Ok(d) => {
+                TRAMPOLIN_SWAP.store(d.trampolin as usize, Ordering::SeqCst);
+                log::info(&format!(
+                    "detour instalado sobre {cand}: trampolin en 0x{:x}",
+                    d.trampolin
+                ));
+                return;
+            }
+            Err(e) => {
+                log::error(&format!("no se pudo instalar el detour de {cand}: {e}"));
+            }
+        }
+    }
+    log::error("no se pudo instalar ningun hook de swap (SDL_GL_SwapWindow / swapRenderBuffers)");
+}
+

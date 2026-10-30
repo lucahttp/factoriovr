@@ -54,10 +54,10 @@ El sistema integra las tres mejores soluciones del ecosistema en una única apli
 | **T1** | Analizar e importar el runtime y parches de Pocket Foundry (`glibc`, `Mesa`, `SDL3`) | 🟢 Completado | P0 (Crítico) | APK debug compila con éxito (34MB) con runtime Turnip+Zink |
 | **T2** | Construir puente de Gamepad Xbox + Audio `FAB1` + Frame Hook | 🟢 Completado | P0 (Crítico) | Integrado nativo en Pocket Foundry (`Bridges.kt` + `SDL_pocketfoundry.c`) |
 | **T3** | Integrar cargador OpenXR Pico 4 Ultra (`libopenxr_loader.so`) y perfiles `pico4s_controller` | 🟢 Completado | P1 (Alto) | Empaquetado en `jniLibs/arm64-v8a`, queries y permisos en AndroidManifest |
-| **T4** | Implementar la Mesa Espacial (Tabletop) en Passthrough con gestos bimanuales (Pan, Scale, Rotate) | 🟡 En progreso | P1 (Alto) | Enlazando `SurfaceTexture` de `LorieView` con `openxr_engine.cpp` |
+| **T4** | Implementar la Mesa Espacial (Tabletop) en Passthrough con gestos bimanuales, mandos 3D Pico 4/Ultra y puntero láser C&C XR | 🟢 Completado | P1 (Alto) | Mandos 3D PICO 4 Ultra interactivos, puntero ribbon camera-facing y `SurfaceTexture` OES enlazado |
 | **T5** | Integrar los modelos GLB de `factorio-3d-mod` en la grilla espacial de la mesa | 🟢 Completado | P2 (Medio) | 26 modelos GLB + metadatos y shaders empaquetados en `assets/` |
-| **T6** | Implementar la transición fluida a Primera Persona (FPV) al hacer zoom máximo | ⚪ Pendiente | P2 (Medio) | Navegación 1:1 dentro de la fábrica |
-| **T7** | Empaquetar el APK Standalone All-In-One para Pico 4 Ultra y desplegar | 🟡 En progreso | P1 (Alto) | APK debug listo en `/Volumes/X10Pro/Projects/pocket-foundry/app/build/outputs/apk/debug/app-debug.apk` |
+| **T6** | Implementar la transición fluida a Primera Persona (FPV) al hacer zoom máximo | 🟡 En progreso | P2 (Medio) | Navegación 1:1 dentro de la fábrica, toggle con botón Y implementado |
+| **T7** | Empaquetar el APK Standalone All-In-One para Pico 4 Ultra y desplegar | 🟢 Completado | P1 (Alto) | APK debug compilado con éxito (35MB) en `pocket-foundry/app/build/outputs/apk/debug/app-debug.apk` |
 
 ---
 
